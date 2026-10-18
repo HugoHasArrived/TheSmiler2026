@@ -1,14 +1,141 @@
 from flask import Flask, Response, jsonify, request, session
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime, timezone
+import json
 import os
+import re
 import secrets
 
+try:
+    from pymongo import MongoClient, DESCENDING
+except ImportError:
+    MongoClient = None
+    DESCENDING = -1
+
 app = Flask(__name__)
-app.secret_key = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
-app.config['SESSION_COOKIE_HTTPONLY'] = True
-app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
-app.config['SESSION_COOKIE_SECURE'] = bool(os.environ.get('RENDER'))
-TEST_STAFF_USERNAME = os.environ.get('TEST_STAFF_USERNAME', '26-0054')
-TEST_STAFF_PASSWORD = os.environ.get('TEST_STAFF_PASSWORD', 'Hugo@091413')
+app.config.update(
+    SECRET_KEY=os.environ.get('SECRET_KEY') or secrets.token_hex(32),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SECURE=(os.environ.get('COOKIE_SECURE', '').lower() == 'true' or bool(os.environ.get('RENDER_EXTERNAL_URL', '').startswith('https://'))),
+    MAX_CONTENT_LENGTH=120_000,
+)
+_mongo_client = None
+_mongo_database = None
+_mongo_indexes_ready = False
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def mongo_configured():
+    return bool((os.environ.get('MONGODB_URI') or os.environ.get('MONGO_URI') or '').strip())
+
+
+def get_database():
+    global _mongo_client, _mongo_database, _mongo_indexes_ready
+    uri = (os.environ.get('MONGODB_URI') or os.environ.get('MONGO_URI') or '').strip()
+    if not uri:
+        raise RuntimeError('MongoDB is not configured. Add MONGODB_URI in the hosting environment.')
+    if MongoClient is None:
+        raise RuntimeError('The MongoDB driver is missing. Install the current requirements.txt.')
+    if _mongo_database is None:
+        client = MongoClient(uri, serverSelectionTimeoutMS=3500, connectTimeoutMS=3500, appname='FloridaShadows')
+        client.admin.command('ping')
+        db_name = (os.environ.get('MONGODB_DATABASE') or os.environ.get('MONGODB_DB') or 'florida_shadows').strip()
+        _mongo_client = client
+        _mongo_database = client[db_name]
+    if not _mongo_indexes_ready:
+        _mongo_database['leaderboard'].create_index([('score', DESCENDING), ('wins', DESCENDING), ('updated_at', DESCENDING)])
+        _mongo_database['achievements'].create_index([('username_key', 1), ('unlocked_at', DESCENDING)])
+        _mongo_indexes_ready = True
+    return _mongo_database
+
+
+def api_database_error(exc):
+    message = str(exc) if isinstance(exc, RuntimeError) else 'The database could not be reached. Check the MongoDB environment variables and Atlas network access.'
+    return jsonify(ok=False, error=message, databaseConfigured=mongo_configured()), 503
+
+
+def current_account(db=None):
+    account_key = session.get('account_key')
+    if not account_key:
+        return None
+    db = db or get_database()
+    user = db['accounts'].find_one({'_id': account_key})
+    if not user:
+        session.pop('account_key', None)
+    return user
+
+
+def safe_number(value, default=0, low=0, high=1000000):
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(low, min(high, number))
+
+
+def clean_save_snapshot(raw):
+    if not isinstance(raw, dict):
+        raise ValueError('The save payload is invalid.')
+    try:
+        if len(json.dumps(raw, separators=(',', ':'))) > 60000:
+            raise ValueError('The save is too large. Try saving after a little more progress.')
+    except (TypeError, ValueError):
+        raise ValueError('The save payload is invalid.')
+    allowed_top = {'version', 'character', 'elapsed', 'missionClock', 'location', 'resources', 'progress', 'foundObjectIds', 'caseRecords', 'survivors'}
+    cleaned = {key: raw[key] for key in allowed_top if key in raw}
+    if cleaned.get('character') not in ('hugo', 'yumi'):
+        cleaned['character'] = 'hugo'
+    cleaned['version'] = 1
+    cleaned['elapsed'] = safe_number(cleaned.get('elapsed'), 0, 0, 200000)
+    cleaned['missionClock'] = safe_number(cleaned.get('missionClock'), 137, 0, 100000)
+    for key in ('location', 'resources', 'progress'):
+        if not isinstance(cleaned.get(key), dict):
+            cleaned[key] = {}
+    location = cleaned['location']
+    cleaned['location'] = {
+        'floor': 'inside' if location.get('floor') == 'inside' else 'outside',
+        'roomId': str(location.get('roomId') or '')[:40],
+        'x': safe_number(location.get('x'), 500, 0, 3200),
+        'y': safe_number(location.get('y'), 500, 0, 2500),
+        'angle': max(-7.0, min(7.0, float(location.get('angle', 0) or 0))) if isinstance(location.get('angle', 0), (int, float)) else 0,
+    }
+    resource_bounds = {'hp': (100, 1, 150), 'stamina': (100, 0, 200), 'ammo': (6, 0, 200), 'reserve': (24, 0, 500), 'medkits': (1, 0, 50), 'batteryCells': (1, 0, 50), 'flashlightBattery': (100, 0, 100)}
+    cleaned['resources'] = {key: safe_number(cleaned['resources'].get(key), default, low, high) for key, (default, low, high) in resource_bounds.items()}
+    progress = cleaned['progress']
+    bool_fields = ('keysFound', 'witnessInterviewed', 'stationComplete', 'anchorsDisabled', 'trueEnding')
+    numeric_fields = ('discovered', 'rescued', 'witnessTrust', 'stationQueuePosition', 'stationThreat', 'stationCorrect', 'stationProcessed', 'exploredRooms', 'kills', 'shots', 'saves', 'missingCount', 'exploredBuildings')
+    cleaned_progress = {key: bool(progress.get(key)) for key in bool_fields}
+    cleaned_progress.update({key: safe_number(progress.get(key), 0, 0, 100000) for key in numeric_fields})
+    list_fields = ('exploredRoomIds', 'caseComparisons', 'missingIds', 'disappearanceLog', 'anchorsDestroyed')
+    for key in list_fields:
+        val = progress.get(key, [])
+        cleaned_progress[key] = [str(item)[:180] for item in val[:80]] if isinstance(val, list) else []
+    for key in ('stationDecisions', 'stationChecks', 'stationChats', 'stationTopics', 'roomItemStates'):
+        val = progress.get(key, {})
+        cleaned_progress[key] = val if isinstance(val, dict) and len(json.dumps(val)) < 15000 else {}
+    cleaned_progress['caseTheory'] = str(progress.get('caseTheory') or '')[:80]
+    cleaned_progress['pendingTheory'] = str(progress.get('pendingTheory') or '')[:80]
+    cleaned_progress['stationStage'] = str(progress.get('stationStage') or 'idle')[:24]
+    cleaned['progress'] = cleaned_progress
+    cleaned['foundObjectIds'] = [str(item)[:120] for item in raw.get('foundObjectIds', [])[:100]] if isinstance(raw.get('foundObjectIds', []), list) else []
+    cleaned['caseRecords'] = []
+    if isinstance(raw.get('caseRecords'), list):
+        for record in raw['caseRecords'][:120]:
+            if not isinstance(record, dict):
+                continue
+            cleaned['caseRecords'].append({key: str(record.get(key, ''))[:1800] for key in ('id', 'name', 'detail', 'analysis', 'kind')} | {'studied': bool(record.get('studied'))})
+    cleaned['survivors'] = []
+    if isinstance(raw.get('survivors'), list):
+        for survivor in raw['survivors'][:4]:
+            if not isinstance(survivor, dict):
+                continue
+            cleaned['survivors'].append({'id': str(survivor.get('id', ''))[:24], 'x': safe_number(survivor.get('x'), 500, 0, 3200), 'y': safe_number(survivor.get('y'), 500, 0, 2500), 'found': bool(survivor.get('found')), 'following': bool(survivor.get('following')), 'delivered': bool(survivor.get('delivered'))})
+    return cleaned
+
 
 HTML = r'''<!doctype html>
 <html lang="en">
@@ -1245,15 +1372,31 @@ body.hunting #survivorLocator{opacity:0}
 @media(max-width:650px){#huntBanner{top:8px;font-size:9px;padding:8px 9px;max-width:94vw}#huntBanner small{font-size:8px}.radio-breach-choices{grid-template-columns:1fr}.radio-breach-choices button{min-height:56px}}
 
 
-.staff-auth-form{display:grid;gap:12px;margin-top:18px}
-.staff-auth-form label{display:grid;gap:6px;color:#c9d2c3;font-size:12px;letter-spacing:.5px}
-.staff-auth-form input{width:100%;padding:12px 13px;border:1px solid #536750;border-radius:3px;background:#050906;color:#f0f0df;outline:none}
-.staff-auth-form input:focus{border-color:#d4bc80;box-shadow:0 0 0 2px #d4bc8020}
-.staff-auth-message{min-height:48px;padding:11px 12px;margin-top:14px;background:#080d09;border:1px solid #3e4a3a;color:#bec9b8;font-size:12px;line-height:1.6;white-space:pre-wrap}
-.staff-auth-message.success{border-color:#647f59;color:#d9e8c8}
-.staff-auth-message.error{border-color:#954e4e;color:#f1aaa4}
-#staffLoginModal{z-index:60000}
-.staff-auth-note{font-size:11px;line-height:1.7;color:#8f9d8d}
+.account-panel { width:min(760px,96vw); }
+.account-form { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:16px 0; }
+.account-field { display:flex; flex-direction:column; gap:6px; color:#c4cebf; font-size:10px; letter-spacing:.8px; }
+.account-field.full { grid-column:1 / -1; }
+.account-field input { width:100%; min-width:0; padding:12px; color:#f1efdf; background:#050906; border:1px solid #52634f; outline:none; text-transform:none; letter-spacing:0; }
+.account-field input:focus { border-color:#d4bc80; box-shadow:0 0 0 1px #d4bc8044; }
+.account-status { margin:12px 0; padding:11px 12px; border:1px solid #3b4a3a; background:#080e09; color:#b9c9b5; font-size:11px; line-height:1.7; white-space:pre-wrap; overflow-wrap:anywhere; }
+.account-status.error { border-color:#813b3d; color:#f0aaa1; }
+.account-status.good { border-color:#556d48; color:#d5e7c3; }
+.account-signed { padding:13px; margin:12px 0; border:1px solid #526349; background:#0a120c; }
+.leaderboard-list { display:flex; flex-direction:column; gap:7px; margin:15px 0; }
+.leaderboard-row { display:grid; grid-template-columns:38px minmax(0,1fr) 90px 65px; align-items:center; gap:8px; padding:10px 11px; border:1px solid #303e31; background:#090f0b; color:#c7d0c1; font-size:11px; }
+.leaderboard-row:first-child { border-color:#8a774a; background:#19170f; }
+.leaderboard-rank { color:#d9c384; font-size:14px; font-weight:bold; }
+.leaderboard-name { overflow-wrap:anywhere; }
+.leaderboard-score { text-align:right; color:#e6d5a5; font-weight:bold; }
+.leaderboard-wins { text-align:right; color:#92ad88; font-size:10px; }
+.achievement-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px; margin:10px 0; }
+.achievement-item { padding:9px; border:1px solid #344333; background:#080e09; color:#9ca999; font-size:10px; line-height:1.55; }
+.achievement-item.unlocked { border-color:#88764a; color:#e0d1a7; background:#15150d; }
+.prayer-panel { margin-top:12px; padding:13px 15px; border:1px solid #6e6248; border-left:3px solid #d4bc80; background:linear-gradient(120deg,#19180f,#070b08); color:#d4cfba; font-size:11px; line-height:1.85; }
+.prayer-panel b { display:block; color:#e5d4a2; margin-bottom:5px; letter-spacing:1px; }
+.memorial-home p { font-size:11px; line-height:1.85; }
+#partnerChat, #driveLaneHUD { display:none !important; }
+@media(max-width:650px){.account-form{grid-template-columns:1fr}.account-field.full{grid-column:auto}.leaderboard-row{grid-template-columns:28px minmax(0,1fr) 72px}.leaderboard-wins{display:none}.achievement-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -1362,14 +1505,19 @@ body.hunting #survivorLocator{opacity:0}
           <button id="controlsBtn">Control mode</button>
           <button id="howBtn">How to play</button>
           <button id="creditsBtn">Credits</button>
-          <button id="staffLoginBtn">Staff test account</button>
+          <button id="accountBtn">Login / Account</button>
+          <button id="leaderboardBtn">Leaderboard</button>
           <button id="disclaimerBtn">Horror & privacy disclaimer</button>
         </div>
         <section class="memorial-home" aria-label="In loving memory of Yumi's grandfather">
           <div class="memorial-home-head"><span class="memorial-mark" aria-hidden="true">✦</span><div><strong class="memorial-home-title">IN LOVING MEMORY</strong><small class="memorial-home-date">Yumi’s grandfather · October 16, 2026</small></div></div>
           <div class="memorial-icons" aria-label="His loves"><span>✈ PLANES</span><span>▰ CARS</span><span>▣ PHOTOGRAPHY</span></div>
-          <p>He was a great man who lived a long, full life. His passing came suddenly in the early morning, but the things he loved and the memories he leaves behind will continue to matter. May the journeys he admired, the photographs he treasured, and the stories he shared bring comfort to everyone who loves him.</p>
-          <span class="memorial-signoff">With heartfelt sympathy to Yumi and her family. May he rest in peace.</span>
+          <p>In loving memory of Yumi’s lolo, who passed away suddenly in the early morning of October 16, 2026. His goodbye came far too unexpectedly, but it does not erase the long life he lived or the place he holds in the hearts of the people who love him.</p>
+          <p>He loved planes, cars, and photographs: the wonder of looking up at a plane crossing the sky, the character and stories carried by a car, and the power of a photograph to keep a moment close even after time has moved on. Those simple loves tell us something beautiful about a life that was full of things worth noticing and remembering. He was a great man who lived a long life, and the memories connected to him are worth keeping with tenderness.</p>
+          <p>To Yumi and her family: you do not have to be strong every moment. There is room for tears, silence, stories, laughter at old memories, and days when the loss feels new again. Grief is not something you have to finish on a schedule. May the people around you be patient with you, listen when you need to talk, sit beside you when words are difficult, and help you carry the heavy days one at a time.</p>
+          <span class="memorial-signoff">With heartfelt sympathy to Yumi and her family. May his memory remain a blessing, and may he rest in peace.</span>
+          <div class="prayer-panel"><b>A PRAYER FOR YUMI’S LOLO</b>Heavenly Father, receive with mercy the soul of Yumi’s beloved lolo. Thank You for the long life he lived, for the love he gave, for the memories he leaves behind, and for all the ordinary moments that became precious. Grant him peace and everlasting rest. Bring comfort to Yumi and her family in the shock of this sudden goodbye. When sadness feels too heavy, surround them with kindness; when memories bring tears, let those tears be met with patience; and when the house feels quieter than before, remind them that love is not measured by the length of a goodbye. Amen.</div>
+          <div class="prayer-panel"><b>A PRAYER FOR STRENGTH AND COMFORT</b>Lord, please stay close to Yumi and everyone who misses him. Give them rest when they are exhausted, courage for the difficult mornings, and gentle people who will listen without asking them to hurry through their grief. May the planes he loved remind them of wonder, the cars he admired remind them of journeys shared, and the photographs he treasured keep family stories alive. Bless his memory, comfort those who mourn, and let peace slowly find its way into their hearts. Amen.</div>
         </section>
         <div class="pc-hint">THE SEVENTH ARRIVAL · SCREAM JAM 2026 · HEADPHONES RECOMMENDED</div>
       </div>
@@ -1378,25 +1526,6 @@ body.hunting #survivorLocator{opacity:0}
         <div class="info-card"><b>INCIDENT REPORT / 02:17 AM</b><br>Last transmission: “It's standing between the trees.”<br><span class="danger">UNIT 14 — SIGNAL LOST</span></div>
       </div>
     </div>
-  </div>
-</div>
-<div id="staffLoginModal" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="staffLoginTitle">
-  <div class="panel" style="width:min(560px,96vw)">
-    <div class="kicker">Restricted access · Test credentials</div>
-    <h2 id="staffLoginTitle" class="section-title">Staff Test Account</h2>
-    <p class="intro">Sign in using the server-side test account. Credentials are checked by Flask and are not embedded in the browser page.</p>
-    <form id="staffLoginForm" class="staff-auth-form" autocomplete="on">
-      <label for="staffUsernameInput">USERNAME
-        <input id="staffUsernameInput" name="username" autocomplete="username" maxlength="80" required spellcheck="false">
-      </label>
-      <label for="staffPasswordInput">PASSWORD
-        <input id="staffPasswordInput" name="password" type="password" autocomplete="current-password" maxlength="200" required>
-      </label>
-      <button type="submit" id="staffLoginSubmit">Sign in</button>
-    </form>
-    <div id="staffLoginMessage" class="staff-auth-message" role="status" aria-live="polite">Not signed in.</div>
-    <p class="staff-auth-note">This is a code-configured test account for the current app. It is not automatically stored in MongoDB, and it does not yet create a staff database record.</p>
-    <div class="page-buttons"><button id="staffLogoutBtn" class="hidden" type="button">Sign out</button><button id="closeStaffLogin" type="button">Return to menu</button></div>
   </div>
 </div>
 <div id="characterPanel" class="overlay hidden">
@@ -1441,7 +1570,7 @@ body.hunting #survivorLocator{opacity:0}
       <div class="rule"><b>08 / BREAK THE SIGNAL</b>Optional: destroy the black signal seals in the County Police Station, Pine Rest Motel, and St. Mercy Chapel. They weaken the mimic network and unlock a true-ending variation.</div>
       <div class="rule"><b>09 / SEARCH BUILDINGS</b>Press E at doors. Search five different buildings, and check rooms again: items may vanish when you look away. Important mission keys remain recoverable.</div>
       <div class="rule"><b>10 / ESCAPE</b>Rescue both survivors, recover and study six clues, generate four distinct cross-reference reports, defend the theory, recover the relay override key, search five buildings, save Silas Venn’s statement, then survive the 30-second extraction defense.</div>
-      <div class="rule"><b>11 / A MOMENT OF REMEMBRANCE</b>Optional: inside the County Police Station, look for the framed tribute along the east side of the room. Press E to read it. This quiet memorial is separate from the investigation objectives.</div>
+      <div class="rule"><b>11 / A MOMENT OF REMEMBRANCE</b>Optional: the County Police Station has a framed tribute, and St. Mercy Chapel has a small memorial tombstone for Yumi’s lolo. Approach either remembrance and press E to open the quiet memorial, which includes the longer tribute and prayers. These memorials are separate from the investigation and never trigger a scare.</div>
     </div>
     <p class="intro">Search buildings for ammunition, bandages, batteries, and clues. Press J to study collected evidence, compare contradictory details, and submit a supported case theory. Inside the County Police Station, chat with six visitors, inspect their ID cards, compare their explanations with the roster, and decide who should be admitted or detained. At least five decisions must be correct; flagged files can be re-audited after studying four clues. Extraction requires both survivors, six collected and studied clues, four distinct cross-reference reports, the accepted case theory, a corroborated witness statement, a completed intake audit, the relay override key, five different buildings searched, and a 30-second holdout under attack.</p>
     <div class="page-buttons"><button id="backHow">Return to menu</button></div>
@@ -1456,6 +1585,9 @@ body.hunting #survivorLocator{opacity:0}
       <div><b>FLORIDA SHADOWS</b><span>STATE TROOPER HORROR FILES</span><small>Pixel horror project · Scream Jam 2026</small></div>
     </div>
     <div class="credits-lines"><b>WITH APPRECIATION TO</b><br><strong class="credit-name">Mayumi Alingarog</strong><br><span class="credit-alias">Also known as Yumi, Mimi, and Yumimi</span><p>To Mayumi Alingarog, my classmate and fellow developer: thank you for being such a helpful, kind, and respectful person. Your support, encouragement, and willingness to share this creative journey mean a lot. Your kindness makes collaboration better, and I am grateful to have you as a classmate and fellow developer.</p><p>This project is a little more special because of the people who offer encouragement along the way. Thank you for being one of them.</p></div>
+    <div class="credits-lines"><b>IN LOVING MEMORY OF YUMI’S LOLO</b><p>This game also carries a quiet dedication to Yumi’s grandfather, who passed away suddenly in the early morning of October 16, 2026. He loved planes, cars, and photography, and he lived a long life as a great man. Those interests are more than objects on a list: they are little windows into the things that caught his attention and made life meaningful. A plane crossing the sky, a car with its own story, or a photograph holding a moment still can all become reminders of a person who mattered.</p><p>Though his passing was sudden, the life that came before it was long and deserving of honour. The love he gave, the memories made with him, and the stories people tell about him do not disappear with one difficult morning. This tribute cannot lessen the pain of losing him, but it can make room to remember that he was here, that his life mattered, and that he will continue to be remembered with love.</p><p>Heavenly Father, please welcome him into peace and give him eternal rest. Comfort Yumi and her family as they grieve. Give them patience with their own feelings, people who will sit beside them without judgement, and strength for the days when the loss feels especially close. May the memories of his life become a source of warmth in time. Amen.</p></div>
+    <div class="credits-lines"><b>TO MAYUMI ALINGAROG — WITH CARE AND SUPPORT</b><p>Yumi, thank you for being one of the people who inspired this project. Your kindness, creativity, help, and the respect you show others matter. You do not owe anyone a brave face, and you do not have to turn sadness into something productive. It is okay to cry. It is okay to need quiet. It is okay to remember your lolo in your own way, at your own pace. This little dedication is offered with care, not to make you feel watched or singled out, but to say that you and your family deserve compassion. May you be surrounded by people who listen, check in gently, and keep showing up after the first days of condolences have passed.</p></div>
+    <div class="credits-lines"><b>A PRAYER FOR COMFORT</b><p>God of compassion, hold Yumi and her family close in their grief. Bring peace to her lolo, and let him rest in Your care. Give the family strength for difficult moments, gentleness with one another, and comfort in the stories and photographs that keep his memory near. May the things he loved—planes, cars, and photographs—continue to bring them smiles alongside the tears. Amen.</p></div>
     <div class="credits-lines"><b>TO EVERYONE WHO PLAYS</b><br>Thank you for stepping into the swamp, investigating the case, and helping bring this horror story to life. Keep exploring, keep creating, and never ignore strange sounds on the radio.</div>
     <div class="info-card credits-quote">“Every mystery leaves a trace. Every crime leaves a shadow. And some shadows are always watching.”</div>
     <div class="page-buttons"><button id="backCredits">Return to menu</button></div>
@@ -1471,12 +1603,52 @@ body.hunting #survivorLocator{opacity:0}
       <div class="memorial-photo"><strong>▣</strong><span>THE MOMENTS HE SAVED</span></div>
     </div>
     <div class="memorial-letter">
-      <p>Dedicated to Yumi’s grandfather, who passed away suddenly in the early morning of October 16, 2026.</p>
-      <p>He loved planes, cars, and photographs—the journeys they represented, the details worth noticing, and the moments worth keeping. He lived a long life and was a great man. A sudden goodbye cannot take away the years he lived, the memories he made, or the love that remains.</p>
-      <p>May every photograph bring back a story, every passing plane remind those who loved him of the wonder he saw in the world, and every memory make the loss a little gentler with time. May he rest in peace.</p>
+      <p><strong>In loving memory of Yumi’s lolo</strong>, who passed away suddenly in the early morning of October 16, 2026.</p>
+      <p>Some goodbyes arrive so suddenly that the world seems to pause before the heart can understand what has happened. This memorial is offered in honour of a great man who lived a long life and whose memory deserves more than a single line on a screen. His passing is deeply sad, but it does not reduce his life to the moment he left. There were years before that morning: days lived, places seen, people loved, stories collected, and ordinary moments that may now feel priceless.</p>
+      <p>He loved planes, cars, and photographs. A plane can remind us that the world is wide and full of wonder. A car can carry memories of journeys, destinations, and the people beside us. A photograph can hold a little piece of time: a face, a smile, a family gathering, or a day that seemed ordinary until it became a memory. May these things continue to bring Yumi and her family stories to share, reasons to smile through tears, and reminders of the life he lived.</p>
+      <p>To Yumi: you were one of the inspirations behind this game, and this corner is here to honour someone important to you. You do not need to be okay right away. You do not have to hide your tears or apologise for missing him. Grief can arrive in waves, sometimes when you expect it and sometimes in the middle of an ordinary day. Please give yourself the kindness you would offer someone else who was hurting. May your family and friends be patient, may they listen when you want to speak, and may they sit with you quietly when there are no words.</p>
+      <p>May every photograph bring a story back to life, every plane in the sky stir a memory of what he loved, and every journey remind those who miss him that a life is measured not only by its final day but by all the days that came before. May the good he shared keep travelling forward through the people who remember him. Rest peacefully, Yumi’s lolo. You are remembered with respect, gratitude, and love.</p>
     </div>
-    <p class="memorial-note">This is a quiet tribute offered with respect and sympathy to Yumi and her family. It is not evidence in the case, and nothing here is meant to turn their loss into a scare.</p>
+    <div class="prayer-panel"><b>A PRAYER FOR HIS ETERNAL REST</b>Heavenly Father, we commend Yumi’s beloved lolo into Your loving care. Thank You for his long life and for the memories that remain with his family. Forgive his faults, receive him with mercy, and grant him eternal rest and peace. May perpetual light shine upon him. Comfort everyone who mourns him, especially Yumi and those who are feeling the suddenness of this loss. When sorrow is overwhelming, give them strength for this day; when they are tired, grant them rest; and when they remember him, let love be stronger than despair. Amen.</div>
+    <div class="prayer-panel"><b>A PRAYER FOR YUMI AND HER FAMILY</b>Lord, stay close to Yumi and her family in the days ahead. Help them take grief one day at a time. Send kind people to check in, patient people to listen, and gentle moments that let them breathe again. Bless their memories of the planes, cars, and photographs he loved. Let stories be shared without pressure and tears be shed without shame. May his life be honoured, may his family feel supported, and may peace slowly find room beside the sadness. Amen.</div>
+    <p class="memorial-note">This is a quiet tribute offered with respect to Yumi and her family. It is not evidence in the case and will never trigger a jumpscare. May this space remain a peaceful place for remembrance and prayer.</p>
     <div class="page-buttons"><button id="closeMemorial">Leave the memory in peace</button></div>
+  </div>
+</div>
+
+<div id="accountPanel" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="accountTitle">
+  <div class="panel account-panel">
+    <div class="kicker">Persistent records · MongoDB account</div>
+    <h2 id="accountTitle" class="section-title">Login / Game Account</h2>
+    <p class="intro">Create an account to keep your case saves, achievements, and leaderboard score across sessions. Passwords are stored as secure hashes; credentials are never written into the source code.</p>
+    <div id="accountStatus" class="account-status" role="status">Checking account service…</div>
+    <div id="accountSignedOut">
+      <form id="accountForm" class="account-form" autocomplete="on">
+        <label class="account-field">USERNAME<input id="accountUsername" name="username" minlength="3" maxlength="20" pattern="[A-Za-z0-9_]+" autocomplete="username" required></label>
+        <label class="account-field">PASSWORD<input id="accountPassword" name="password" type="password" minlength="8" maxlength="128" autocomplete="current-password" required></label>
+        <label class="account-field full">DISPLAY NAME (OPTIONAL)<input id="accountDisplayName" name="display_name" maxlength="24" autocomplete="nickname" placeholder="How your name appears on the leaderboard"></label>
+        <div class="page-buttons account-field full"><button type="button" id="accountLogin">Log in</button><button type="button" id="accountRegister">Create account</button></div>
+      </form>
+      <p class="memorial-note">Account access requires MongoDB configuration in the server environment. Add <b>MONGODB_URI</b> and a stable <b>SECRET_KEY</b> in Render’s Environment settings. Never paste database credentials into game chat or source code.</p>
+    </div>
+    <div id="accountSignedIn" class="hidden">
+      <div class="account-signed"><div class="micro">SIGNED IN AS</div><strong id="accountIdentity">PLAYER</strong><div class="memorial-note" id="accountStatsLine">Cloud account connected.</div></div>
+      <div class="page-buttons"><button type="button" id="saveCloudButton">Save current case</button><button type="button" id="loadCloudButton">Load saved case</button><button type="button" id="refreshAchievements">Refresh achievements</button><button type="button" id="accountLogout">Log out</button></div>
+      <div id="cloudSaveStatus" class="account-status">Your saved case has not been checked yet.</div>
+      <h3 class="section-title" style="font-size:17px;margin-top:20px">My achievements</h3>
+      <div id="achievementGrid" class="achievement-grid"></div>
+    </div>
+    <div class="page-buttons"><button type="button" id="backAccount">Return to menu</button></div>
+  </div>
+</div>
+<div id="leaderboardPanel" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="leaderboardTitle">
+  <div class="panel account-panel">
+    <div class="kicker">Survivors · Case files · Recorded results</div>
+    <h2 id="leaderboardTitle" class="section-title">Global Leaderboard</h2>
+    <p class="intro">Scores are submitted when a logged-in player finishes a run. The leaderboard stores each account’s best score, run count, and victories.</p>
+    <div id="leaderboardStatus" class="account-status">Loading leaderboard…</div>
+    <div class="leaderboard-list" id="leaderboardList" aria-live="polite"></div>
+    <div class="page-buttons"><button id="refreshLeaderboard" type="button">Refresh leaderboard</button><button id="leaderboardAccount" type="button">Login / Account</button><button id="backLeaderboard" type="button">Return to menu</button></div>
   </div>
 </div>
 <div id="objectivePanel" class="overlay hidden">
@@ -1619,7 +1791,7 @@ Awaiting database query.</div>
     <div class="kicker">Patrol interrupted</div>
     <h2 class="section-title">Paused</h2>
     <p class="intro">The swamp is still there when you return.</p>
-    <div class="page-buttons"><button id="resume">Resume patrol</button><button id="pauseObjectives">Case file</button><button id="pauseMenu">Abandon patrol</button></div>
+    <div class="page-buttons"><button id="resume">Resume patrol</button><button id="pauseObjectives">Case file</button><button id="pauseAccount">Account / Cloud Save</button><button id="pauseMenu">Abandon patrol</button></div>
   </div>
 </div>
 
@@ -1831,8 +2003,12 @@ const state={
   realityPulseCooldown:0,
   realityPulseCount:0,
   lastRealityRoom:'',
-  memorialTributeViewed:false
+  memorialTributeViewed:false,
+  lastMemorialId:''
 };
+let currentAccount = null;
+let cloudRunSubmitted = false;
+let accountReturnToGame = false;
 let W=innerWidth;
 let H=innerHeight;
 let dpr=1;
@@ -1927,6 +2103,8 @@ function setScreen(name){
     controls:'controlsPanel',
     how:'howPanel',
     credits:'creditsPanel',
+    account:'accountPanel',
+    leaderboard:'leaderboardPanel',
     objectives:'objectivePanel',
     memorial:'memorialPanel',
     inventory:'inventoryPanel',
@@ -1939,7 +2117,7 @@ function setScreen(name){
   for(const id of Object.values(mapping))$(id).classList.add('hidden');
   const suspectZoom=$('suspectZoomPanel');if(suspectZoom)suspectZoom.classList.add('hidden');
   if(mapping[name])$(mapping[name]).classList.remove('hidden');
-  if(name==='menu'||name==='character'||name==='controls'||name==='how'||name==='credits'){
+  if(name==='menu'||name==='character'||name==='controls'||name==='how'||name==='credits'||name==='account'||name==='leaderboard'){
     state.running=false;
     document.body.classList.remove('game-active');
   }
@@ -2434,7 +2612,7 @@ function makeRoom(name){
   rooms.church.title='ST. MERCY CHAPEL';
   rooms.church.w=860;rooms.church.h=620;rooms.church.spawn={x:430,y:520};rooms.church.exit={x:430,y:574};
   rooms.church.props=[{x:430,y:150,w:190,h:60,t:'table'},{x:200,y:250,w:70,h:120,t:'cabinet'},{x:660,y:250,w:70,h:120,t:'cabinet'},{x:430,y:360,w:220,h:45,t:'table'}];
-  rooms.church.items=[{x:430,y:185,type:'loot',name:'Chapel first-aid kit',loot:'medkit',found:false},{x:660,y:315,type:'loot',name:'Chapel emergency batteries',loot:'battery',found:false}];
+  rooms.church.items=[{x:430,y:185,type:'loot',name:'Chapel first-aid kit',loot:'medkit',found:false},{x:660,y:315,type:'loot',name:'Chapel emergency batteries',loot:'battery',found:false},{id:'yumi-lolo-tombstone',x:430,y:455,type:'memorial',style:'tombstone',name:'Memorial stone for Yumi’s lolo',detail:'A quiet stone of remembrance with prayers for his eternal rest and for comfort for Yumi and her family.',found:false}];
   rooms.warehouse=structuredClone(rooms.gas);
   rooms.warehouse.title='FLOOD CONTROL WAREHOUSE';
   rooms.warehouse.w=960;rooms.warehouse.h=640;rooms.warehouse.spawn={x:480,y:540};rooms.warehouse.exit={x:480,y:594};
@@ -2461,6 +2639,8 @@ function makeRoom(name){
   return result;
 }
 function resetGame(){
+  cloudRunSubmitted=false;
+  state.lastMemorialId='';
   const spec=specs[state.selectedCharacter];
   player={x:310,y:330,r:10,angle:0,speed:spec.speed,hp:spec.hp,maxHp:spec.hp,stamina:spec.stamina,maxStamina:spec.stamina,step:0,moving:false,hidden:false,invulnerable:0,flash:0,footstep:0};
   health=player.hp;
@@ -2542,8 +2722,8 @@ function resetGame(){
   bullets=[];
   particles=[];
   crawlers=[];
-  for(let i=0;i<5;i++){
-    crawlers.push({x:760+i*410,y:420+(i%3)*450,r:9,hp:2,speed:70+Math.random()*15,phase:Math.random()*8,alert:false,attack:0,dead:false,hiddenUntil:14});
+  for(let i=0;i<2;i++){
+    crawlers.push({x:980+i*1120,y:730+(i%2)*710,r:9,hp:2,speed:66+Math.random()*10,phase:Math.random()*8,alert:false,attack:0,dead:false,hiddenUntil:18});
   }
   monster={x:2800,y:2080,r:15,stun:0,phase:0,active:false,spotted:false,attack:0,lastMove:0,warpCooldown:0,hidden:false,vanishTimer:0,vanishCooldown:4.5+Math.random()*3.4,activeTime:0,pendingX:0,pendingY:0,reappearGlow:0,blinkCount:0};
   makeObjects();
@@ -2651,7 +2831,7 @@ function applyControlMode(){
   $('mobileMode').classList.toggle('selected',state.pendingMode==='mobile');
 }
 function activeOverlay(){
-  return ['menu','character','controls','how','credits','objectives','inventory','pause','ending','radio'].includes(state.screen);
+  return ['menu','character','controls','how','credits','account','leaderboard','objectives','inventory','pause','ending','radio'].includes(state.screen);
 }
 function setPrologueStage(stage){
   state.prologueStage=stage;
@@ -3464,6 +3644,7 @@ function interact(){
   }
   if(target.type==='memorial'){
     state.memorialTributeViewed=true;
+    state.lastMemorialId=target.id||'';
     enterScreen('memorial');
     return;
   }
@@ -3636,9 +3817,10 @@ function activateMonster(){
 function spawnCrawlerWave(count=2,minRadius=180,speedBase=92,hp=2){
   if(state.floor!=='outside'||!player)return 0;
   if(state.anchorsDisabled&&state.extractionStarted)count=Math.max(1,count-1);
+  count=Math.min(count,2);
   let alive=crawlers.filter(c=>!c.dead).length;
   let made=0;
-  for(let i=0;i<count&&alive<10;i++){
+  for(let i=0;i<count&&alive<6;i++){
     const angle=(Math.PI*2*i/Math.max(1,count))+Math.random()*.55;
     const radius=minRadius+Math.random()*70;
     let x=clamp(player.x+Math.cos(angle)*radius,70,WORLD.w-70);
@@ -4207,6 +4389,7 @@ function completeExtraction(){
   finishGame(true);
 }
 function finishGame(success){
+  submitFinishedRun(success);
   state.gameOver=true;
   state.running=false;
   state.won=success;
@@ -4231,7 +4414,7 @@ function closeOverlay(){
   state.paused=false;
   state.running=true;
   state.screen='game';
-  for(const id of ['objectivePanel','inventoryPanel','pausePanel','radioPanel','interviewPanel','stationIntakePanel','suspectZoomPanel','memorialPanel'])$(id).classList.add('hidden');
+  for(const id of ['objectivePanel','inventoryPanel','pausePanel','radioPanel','interviewPanel','stationIntakePanel','suspectZoomPanel','memorialPanel','accountPanel','leaderboardPanel'])$(id).classList.add('hidden');
   $('hud').style.display='block';
   document.body.classList.add('game-active');
   state.lastFrame=performance.now();
@@ -6531,14 +6714,24 @@ function drawInterior(){
     }else if(item.type==='memorial'){
       const halo=.42+.22*Math.sin(state.elapsed*1.15);
       ctx.save();ctx.globalCompositeOperation='screen';
-      const memorialGlow=ctx.createRadialGradient(x,y,2,x,y,42);
+      const memorialGlow=ctx.createRadialGradient(x,y,2,x,y,48);
       memorialGlow.addColorStop(0,'rgba(213,190,126,'+halo+')');memorialGlow.addColorStop(1,'rgba(0,0,0,0)');
-      ctx.fillStyle=memorialGlow;ctx.fillRect(x-44,y-44,88,88);ctx.restore();
-      px(x-23,y-27,46,48,'#2a281f');px(x-20,y-24,40,42,'#a18b5e');px(x-17,y-21,34,36,'#111811');
-      px(x-14,y-18,12,11,'#7f8b78');px(x-12,y-16,8,2,'#c4b88e');px(x-8,y-14,2,6,'#c4b88e');px(x-15,y-12,14,2,'#c4b88e');
-      px(x+3,y-18,12,11,'#464a3c');px(x+5,y-15,8,4,'#b3a477');px(x+4,y-10,3,3,'#080a08');px(x+12,y-10,3,3,'#080a08');
-      px(x-14,y-3,28,2,'#655b3e');px(x-13,y+1,26,2,'#8f8057');px(x-9,y+5,18,2,'#cabb91');
-      ctx.fillStyle='#e6d4a8';ctx.font='bold 7px monospace';ctx.textAlign='center';ctx.fillText('REMEMBER',x,y+31);
+      ctx.fillStyle=memorialGlow;ctx.fillRect(x-50,y-50,100,100);ctx.restore();
+      if(item.style==='tombstone'){
+        px(x-23,y-29,46,53,'#171b17');px(x-20,y-32,40,50,'#4d584d');
+        px(x-17,y-29,34,44,'#89907e');px(x-14,y-26,28,39,'#1a211a');
+        px(x-11,y-23,22,2,'#cabb91');px(x-9,y-16,18,2,'#d8ceb5');
+        px(x-8,y-9,16,2,'#9f997e');px(x-11,y-2,22,2,'#8c866d');
+        px(x-15,y+7,30,3,'#8e927c');px(x-20,y+17,40,5,'#394237');
+        ctx.fillStyle='#e3d3a9';ctx.font='bold 6px monospace';ctx.textAlign='center';ctx.fillText('IN MEMORY',x,y+2);
+        ctx.fillStyle='#c8c6ae';ctx.font='5px monospace';ctx.fillText('REST IN PEACE',x,y+12);
+      }else{
+        px(x-23,y-27,46,48,'#2a281f');px(x-20,y-24,40,42,'#a18b5e');px(x-17,y-21,34,36,'#111811');
+        px(x-14,y-18,12,11,'#7f8b78');px(x-12,y-16,8,2,'#c4b88e');px(x-8,y-14,2,6,'#c4b88e');px(x-15,y-12,14,2,'#c4b88e');
+        px(x+3,y-18,12,11,'#464a3c');px(x+5,y-15,8,4,'#b3a477');px(x+4,y-10,3,3,'#080a08');px(x+12,y-10,3,3,'#080a08');
+        px(x-14,y-3,28,2,'#655b3e');px(x-13,y+1,26,2,'#8f8057');px(x-9,y+5,18,2,'#cabb91');
+        ctx.fillStyle='#e6d4a8';ctx.font='bold 7px monospace';ctx.textAlign='center';ctx.fillText('REMEMBER',x,y+31);
+      }
     }else if(item.type==='witness'){
       px(x-8,y-14,16,14,'#080b08');
       px(x-6,y-22,12,10,'#8b8064');
@@ -7293,86 +7486,259 @@ function drawPortraits(){
     }
   });
 }
-function setStaffAuthMessage(message,kind=''){
-  const box=$('staffLoginMessage');
-  if(!box)return;
-  box.textContent=message;
-  box.classList.toggle('success',kind==='success');
-  box.classList.toggle('error',kind==='error');
+let accountAchievementsCache=[];
+const ACHIEVEMENT_CATALOG=[
+  ['first_case','First Case','Finish your first investigation.'],
+  ['survivor_saver','Bring Them Home','Successfully extract both survivors.'],
+  ['forensic_mind','Forensic Mind','Study six clues and file four distinct comparisons.'],
+  ['identity_guard','Identity Guard','Screen the station visitors and detain the duplicate.'],
+  ['signal_breaker','Signal Breaker','Destroy all three signal anchors.'],
+  ['nightmare_survivor','Nightmare Survivor','Win after surviving at least three hunts.'],
+  ['true_ending','Signal Silenced','Complete the true ending.'],
+  ['photographic_memory','Nothing Forgotten','Study eight or more case records.']
+];
+function setAccountStatus(message,kind=''){
+  const el=$('accountStatus');
+  if(!el)return;
+  el.textContent=message;
+  el.className='account-status'+(kind?' '+kind:'');
 }
-async function refreshStaffSession(){
+function setCloudSaveStatus(message,kind=''){
+  const el=$('cloudSaveStatus');
+  if(!el)return;
+  el.textContent=message;
+  el.className='account-status'+(kind?' '+kind:'');
+}
+async function apiJson(url,options={}){
+  const headers=Object.assign({},options.headers||{});
+  if(options.body&&!headers['Content-Type'])headers['Content-Type']='application/json';
+  const response=await fetch(url,Object.assign({credentials:'same-origin',headers},options));
+  let payload={};
+  try{payload=await response.json();}catch(_){payload={error:'The server returned an unreadable response.'};}
+  if(!response.ok)throw new Error(payload.error||'Request failed ('+response.status+').');
+  return payload;
+}
+function openAccount(fromGame=false){
+  accountReturnToGame=!!fromGame;
+  setScreen('account');
+  refreshAccountState();
+}
+async function refreshAccountState(){
+  setAccountStatus('Checking account service…');
   try{
-    const response=await fetch('/api/staff/session',{credentials:'same-origin',headers:{'Accept':'application/json'}});
-    const data=await response.json();
-    if(data.authenticated){
-      setStaffAuthMessage('AUTHENTICATED\nAccount: '+data.username+'\nRole: STAFF\n\nThe test account is accepted by the Flask server. MongoDB persistence is not configured by this test-login feature.','success');
-      $('staffLogoutBtn').classList.remove('hidden');
+    const result=await apiJson('/api/auth/me');
+    currentAccount=result.authenticated?result.account:null;
+    $('accountSignedOut').classList.toggle('hidden',!!currentAccount);
+    $('accountSignedIn').classList.toggle('hidden',!currentAccount);
+    if(currentAccount){
+      $('accountIdentity').textContent=currentAccount.displayName+' (@'+currentAccount.username+')';
+      $('accountStatsLine').textContent='Runs recorded: '+(currentAccount.runs||0)+' · Wins: '+(currentAccount.wins||0)+' · Best score: '+(currentAccount.bestScore||0);
+      setAccountStatus('Account connected. Cloud saves and achievements are available.','good');
+      await refreshAchievements();
+      await checkCloudSave();
     }else{
-      setStaffAuthMessage('Not signed in.');
-      $('staffLogoutBtn').classList.add('hidden');
+      $('achievementGrid').replaceChildren();
+      setAccountStatus(result.databaseConfigured?'You are signed out. Log in or create an account.':'MongoDB is not configured on the server. Set MONGODB_URI and SECRET_KEY in Render Environment settings.',''+(result.databaseConfigured?'':'error'));
     }
   }catch(error){
-    setStaffAuthMessage('Could not contact the server. Check that the Flask app is deployed, then try again.','error');
+    currentAccount=null;
+    $('accountSignedOut').classList.remove('hidden');
+    $('accountSignedIn').classList.add('hidden');
+    setAccountStatus(error.message,'error');
   }
 }
-async function submitStaffLogin(event){
-  event.preventDefault();
-  const username=$('staffUsernameInput').value.trim();
-  const password=$('staffPasswordInput').value;
-  const button=$('staffLoginSubmit');
-  button.disabled=true;
-  button.textContent='Checking credentials…';
-  setStaffAuthMessage('Checking the test account…');
+async function accountAction(action){
+  const username=$('accountUsername').value.trim();
+  const password=$('accountPassword').value;
+  const displayName=$('accountDisplayName').value.trim();
+  if(!/^[A-Za-z0-9_]{3,20}$/.test(username)){setAccountStatus('Username must be 3–20 characters and use only letters, numbers, or underscores.','error');return;}
+  if(password.length<8||password.length>128){setAccountStatus('Password must be 8–128 characters.','error');return;}
+  setAccountStatus(action==='register'?'Creating account…':'Signing in…');
   try{
-    const response=await fetch('/api/staff/login',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify({username,password})});
-    const data=await response.json();
-    if(response.ok&&data.authenticated){
-      setStaffAuthMessage('SIGN-IN SUCCESSFUL\nAccount: '+data.username+'\nRole: STAFF\n\nThis is a code-configured test account. No MongoDB record was created.','success');
-      $('staffLogoutBtn').classList.remove('hidden');
-      $('staffPasswordInput').value='';
-      tone(640,.09,'sine',.045,80);
-    }else{
-      setStaffAuthMessage(data.error||'Login failed. Check the username and password.','error');
-      tone(165,.12,'triangle',.035,-30);
+    const result=await apiJson('/api/auth/'+action,{method:'POST',body:JSON.stringify({username,password,displayName})});
+    currentAccount=result.account;
+    $('accountPassword').value='';
+    await refreshAccountState();
+    setAccountStatus(result.message||'Account ready.','good');
+  }catch(error){setAccountStatus(error.message,'error');}
+}
+async function accountLogout(){
+  try{await apiJson('/api/auth/logout',{method:'POST',body:'{}'});currentAccount=null;await refreshAccountState();setAccountStatus('You have logged out. Your cloud save remains in your account.','good');}
+  catch(error){setAccountStatus(error.message,'error');}
+}
+function createCloudSaveSnapshot(){
+  const roomId=state.floor==='inside'&&state.room?state.room.id:'';
+  const records=caseRecords.slice(0,120).map(record=>({id:record.id,name:record.name,detail:record.detail,analysis:record.analysis,kind:record.kind,studied:!!record.studied}));
+  return {
+    version:1,
+    character:state.selectedCharacter,
+    elapsed:Math.floor(state.elapsed||0),
+    missionClock:Math.floor(state.missionClock||137),
+    location:{floor:roomId?'inside':'outside',roomId,x:Math.round(player?player.x:520),y:Math.round(player?player.y:500),angle:Number(player&&player.angle||0)},
+    resources:{hp:Math.round(player?player.hp:100),stamina:Math.round(stamina),ammo:Math.round(ammo),reserve:Math.round(reserve),medkits:Math.round(medkits),batteryCells:Math.round(batteryCells),flashlightBattery:Math.round(flashlightBattery)},
+    foundObjectIds:objects.filter(object=>object.found&&object.id).map(object=>object.id),
+    caseRecords:records,
+    survivors:survivors.map(survivor=>({id:survivor.id,x:Math.round(survivor.x),y:Math.round(survivor.y),found:!!survivor.found,following:!!survivor.following,delivered:!!survivor.delivered})),
+    progress:{
+      discovered:state.discovered,rescued:state.rescued,keysFound:state.keysFound,witnessInterviewed:state.witnessInterviewed,witnessTrust:state.witnessTrust,
+      stationStage:state.stationStage,stationQueuePosition:state.stationQueuePosition,stationThreat:state.stationThreat,stationCorrect:state.stationCorrect,stationProcessed:state.stationProcessed,stationComplete:state.stationComplete,
+      stationDecisions:state.stationDecisions,stationChecks:state.stationChecks,stationChats:state.stationChats,stationTopics:state.stationTopics,
+      exploredRooms:state.exploredRooms,exploredRoomIds:state.exploredRoomIds,caseComparisons:state.caseComparisons,pendingTheory:state.pendingTheory,caseTheory:state.caseTheory,theoryAttempts:state.theoryAttempts,
+      missingCount:state.missingCount,missingIds:state.missingIds,roomItemStates:state.roomItemStates,disappearanceLog:state.disappearanceLog,kills:state.kills,shots:state.shots,saves:state.saves,
+      anchorsDestroyed:state.anchorsDestroyed,anchorsDisabled:state.anchorsDisabled,trueEnding:state.trueEnding
     }
-  }catch(error){
-    setStaffAuthMessage('The server could not be reached. Check the Render deployment and try again.','error');
-  }finally{
-    button.disabled=false;
-    button.textContent='Sign in';
-  }
+  };
 }
-async function logoutStaff(){
+async function saveCloudGame(){
+  if(!currentAccount){setCloudSaveStatus('Log in first to save your case to MongoDB.','error');return;}
+  if(!player||state.gameOver||state.prologueStage!=='swamp'){setCloudSaveStatus('Start the patrol and enter the forest before saving your case.','error');return;}
+  if(state.extractionStarted){setCloudSaveStatus('The extraction defense is active. Finish or survive it before saving.','error');return;}
+  setCloudSaveStatus('Uploading case progress…');
   try{
-    const response=await fetch('/api/staff/logout',{method:'POST',credentials:'same-origin',headers:{'Accept':'application/json'}});
-    const data=await response.json();
-    if(response.ok&&data.ok){
-      setStaffAuthMessage('Signed out.');
-      $('staffLogoutBtn').classList.add('hidden');
-      $('staffUsernameInput').value='';
-      $('staffPasswordInput').value='';
-    }else setStaffAuthMessage('Could not sign out. Please retry.','error');
-  }catch(error){setStaffAuthMessage('The server could not be reached.','error');}
+    const result=await apiJson('/api/save',{method:'POST',body:JSON.stringify({snapshot:createCloudSaveSnapshot()})});
+    setCloudSaveStatus('CASE SAVED · '+new Date(result.updatedAt).toLocaleString()+'\nYour evidence, inventory, mission flags, and survivor status are stored in the cloud.','good');
+  }catch(error){setCloudSaveStatus(error.message,'error');}
 }
-function openStaffLogin(){
-  $('staffLoginModal').classList.remove('hidden');
-  refreshStaffSession();
-  setTimeout(()=>{const field=$('staffUsernameInput');if(field)field.focus();},0);
+async function checkCloudSave(){
+  if(!currentAccount)return;
+  try{
+    const result=await apiJson('/api/save');
+    setCloudSaveStatus(result.exists?'Cloud save found · Last updated '+new Date(result.updatedAt).toLocaleString()+'.':'No cloud save yet. Start a patrol, then save from the pause menu.');
+  }catch(error){setCloudSaveStatus(error.message,'error');}
 }
-function closeStaffLogin(){
-  $('staffLoginModal').classList.add('hidden');
+function applyCloudSave(snapshot){
+  if(!snapshot||snapshot.version!==1)throw new Error('This save version is not supported.');
+  const wantedCharacter=snapshot.character==='yumi'?'yumi':'hugo';
+  state.selectedCharacter=wantedCharacter;
+  state.pendingCharacter=wantedCharacter;
+  resetGame();
+  const pr=snapshot.progress||{};
+  const loc=snapshot.location||{};
+  const res=snapshot.resources||{};
+  state.elapsed=Math.max(0,Number(snapshot.elapsed)||0);
+  state.missionClock=Math.max(0,Number(snapshot.missionClock)||137);
+  state.discovered=Number(pr.discovered)||0;
+  state.rescued=Number(pr.rescued)||0;
+  state.keysFound=!!pr.keysFound;
+  state.witnessInterviewed=!!pr.witnessInterviewed;
+  state.witnessTrust=Number(pr.witnessTrust)||0;
+  state.stationStage=String(pr.stationStage||'idle');
+  state.stationQueuePosition=Number(pr.stationQueuePosition)||0;
+  state.stationThreat=Number(pr.stationThreat)||0;
+  state.stationCorrect=Number(pr.stationCorrect)||0;
+  state.stationProcessed=Number(pr.stationProcessed)||0;
+  state.stationComplete=!!pr.stationComplete;
+  state.stationDecisions=pr.stationDecisions&&typeof pr.stationDecisions==='object'?pr.stationDecisions:{};
+  state.stationChecks=pr.stationChecks&&typeof pr.stationChecks==='object'?pr.stationChecks:{};
+  state.stationChats=pr.stationChats&&typeof pr.stationChats==='object'?pr.stationChats:{};
+  state.stationTopics=pr.stationTopics&&typeof pr.stationTopics==='object'?pr.stationTopics:{};
+  state.exploredRooms=Number(pr.exploredRooms)||0;
+  state.exploredRoomIds=Array.isArray(pr.exploredRoomIds)?pr.exploredRoomIds:[];
+  state.caseComparisons=Array.isArray(pr.caseComparisons)?pr.caseComparisons:[];
+  state.pendingTheory=String(pr.pendingTheory||'');
+  state.caseTheory=String(pr.caseTheory||'');
+  state.theoryAttempts=Number(pr.theoryAttempts)||0;
+  state.missingCount=Number(pr.missingCount)||0;
+  state.missingIds=Array.isArray(pr.missingIds)?pr.missingIds:[];
+  state.roomItemStates=pr.roomItemStates&&typeof pr.roomItemStates==='object'?pr.roomItemStates:{};
+  state.disappearanceLog=Array.isArray(pr.disappearanceLog)?pr.disappearanceLog:[];
+  state.kills=Number(pr.kills)||0;state.shots=Number(pr.shots)||0;state.saves=Number(pr.saves)||0;
+  state.anchorsDestroyed=Array.isArray(pr.anchorsDestroyed)?pr.anchorsDestroyed:[];
+  state.anchorsDisabled=!!pr.anchorsDisabled;state.trueEnding=!!pr.trueEnding;
+  caseRecords=Array.isArray(snapshot.caseRecords)?snapshot.caseRecords:[];
+  evidence=caseRecords.length;
+  const foundIds=new Set(Array.isArray(snapshot.foundObjectIds)?snapshot.foundObjectIds:[]);
+  for(const object of objects){if(object.id&&foundIds.has(object.id))object.found=true;}
+  if(Array.isArray(snapshot.survivors))for(const survivor of survivors){const saved=snapshot.survivors.find(item=>item.id===survivor.id);if(saved){survivor.x=Number(saved.x)||survivor.x;survivor.y=Number(saved.y)||survivor.y;survivor.found=!!saved.found;survivor.following=!!saved.following;survivor.delivered=!!saved.delivered;}}
+  ammo=Math.max(0,Number(res.ammo)||0);reserve=Math.max(0,Number(res.reserve)||0);medkits=Math.max(0,Number(res.medkits)||0);batteryCells=Math.max(0,Number(res.batteryCells)||0);flashlightBattery=clamp(Number(res.flashlightBattery)||0,0,100);stamina=clamp(Number(res.stamina)||0,0,200);
+  if(player){player.hp=clamp(Number(res.hp)||player.maxHp,1,player.maxHp);health=player.hp;player.stamina=stamina;}
+  state.floor='outside';state.room=null;
+  if(loc.floor==='inside'&&typeof loc.roomId==='string'&&loc.roomId&&objects.some(o=>o.type==='building'&&o.room===loc.roomId)){
+    state.floor='inside';state.room=makeRoom(loc.roomId);
+    player.x=clamp(Number(loc.x)||state.room.spawn.x,24,state.room.w-24);player.y=clamp(Number(loc.y)||state.room.spawn.y,24,state.room.h-24);
+    state.lastBuildingExit={x:objects.find(o=>o.type==='building'&&o.room===loc.roomId).x,y:objects.find(o=>o.type==='building'&&o.room===loc.roomId).y+objects.find(o=>o.type==='building'&&o.room===loc.roomId).h/2+16};
+  }else{
+    player.x=clamp(Number(loc.x)||520,80,WORLD.w-80);player.y=clamp(Number(loc.y)||500,80,WORLD.h-80);
+    if(blockedAt(player.x,player.y,player.r)){player.x=520;player.y=500;}
+  }
+  player.angle=Number(loc.angle)||0;camera.x=clamp(player.x-W/2,0,WORLD.w-W);camera.y=clamp(player.y-H/2,0,WORLD.h-H);
+  state.prologueStage='swamp';state.prologueTimer=0;state.running=true;state.paused=false;state.gameOver=false;state.won=false;state.extractionStarted=false;state.extractionHold=0;
+  document.body.classList.add('game-active');document.body.classList.remove('prologue-mode','prologue-call','prologue-drive','prologue-arrival');
+  $('hud').style.display='block';setScreen('game');updateHUD();updateObjectives();updateInventory();state.lastFrame=performance.now();
+  toast('CLOUD CASE RESTORED. YOUR LAST INVESTIGATION HAS RESUMED.',3.2);
 }
+async function loadCloudGame(){
+  if(!currentAccount){setCloudSaveStatus('Log in first to load your case.','error');return;}
+  setCloudSaveStatus('Loading saved case…');
+  try{const result=await apiJson('/api/save');if(!result.exists)throw new Error('No saved case exists for this account yet.');applyCloudSave(result.snapshot);accountReturnToGame=false;setCloudSaveStatus('Saved case loaded.');}
+  catch(error){setCloudSaveStatus(error.message,'error');}
+}
+async function refreshAchievements(){
+  if(!currentAccount)return;
+  try{
+    const result=await apiJson('/api/achievements');
+    accountAchievementsCache=Array.isArray(result.achievements)?result.achievements:[];
+    const unlocked=new Set(accountAchievementsCache.map(item=>item.id));
+    $('achievementGrid').replaceChildren();
+    for(const [id,title,description] of ACHIEVEMENT_CATALOG){
+      const div=document.createElement('div');div.className='achievement-item'+(unlocked.has(id)?' unlocked':'');
+      const heading=document.createElement('strong');heading.textContent=(unlocked.has(id)?'★ ':'□ ')+title;
+      const copy=document.createElement('div');copy.textContent=description;
+      div.append(heading,copy);$('achievementGrid').appendChild(div);
+    }
+  }catch(error){$('achievementGrid').textContent=error.message;}
+}
+async function renderLeaderboard(){
+  const list=$('leaderboardList');list.replaceChildren();
+  $('leaderboardStatus').textContent='Loading leaderboard…';
+  try{
+    const result=await apiJson('/api/leaderboard');
+    if(!result.entries.length){$('leaderboardStatus').textContent='No results yet. Log in and complete a patrol to post the first score.';return;}
+    $('leaderboardStatus').textContent='BEST SCORES · '+result.entries.length+' ACCOUNT(S) · UPDATED FROM MONGODB';
+    result.entries.forEach((entry,index)=>{
+      const row=document.createElement('div');row.className='leaderboard-row';
+      const rank=document.createElement('div');rank.className='leaderboard-rank';rank.textContent=String(index+1).padStart(2,'0');
+      const name=document.createElement('div');name.className='leaderboard-name';name.textContent=entry.displayName||entry.username||'Unknown officer';
+      const score=document.createElement('div');score.className='leaderboard-score';score.textContent=Number(entry.score||0).toLocaleString()+' PTS';
+      const wins=document.createElement('div');wins.className='leaderboard-wins';wins.textContent=String(entry.wins||0)+' WINS';
+      row.append(rank,name,score,wins);list.appendChild(row);
+    });
+  }catch(error){$('leaderboardStatus').textContent=error.message+' Configure MONGODB_URI to enable global scores.';}
+}
+async function submitFinishedRun(success){
+  if(cloudRunSubmitted)return;
+  cloudRunSubmitted=true;
+  const stats={
+    success:!!success,trueEnding:!!(success&&state.anchorsDisabled),elapsed:Math.floor(state.elapsed||0),health:Math.floor(player?player.hp:0),
+    clues:collectedClueCount(),studied:studyCount(),reports:validCrossReferenceCount(),survivors:survivors.filter(s=>s.delivered||s.found||s.following).length,
+    kills:state.kills,shots:state.shots,buildings:state.exploredRoomIds.length,anchors:state.anchorsDestroyed.length,huntsSurvived:state.huntsSurvived,
+    stationCorrect:state.stationCorrect,stationProcessed:state.stationProcessed,duplicateDetained:state.stationDecisions&&state.stationDecisions['5']==='detain',records:caseRecords.length
+  };
+  try{
+    const result=await apiJson('/api/run/finish',{method:'POST',body:JSON.stringify({stats})});
+    if(currentAccount&&result.achievements&&result.achievements.length){setAccountStatus('RUN RECORDED · '+result.score+' points. New achievements: '+result.achievements.join(', '),'good');}
+  }catch(_error){}
+}
+
 function bindEvents(){
-  const staffForm=$('staffLoginForm');
-  if(staffForm)staffForm.addEventListener('submit',submitStaffLogin);
-  $('staffLoginBtn').addEventListener('click',openStaffLogin);
-  $('closeStaffLogin').addEventListener('click',closeStaffLogin);
-  $('staffLogoutBtn').addEventListener('click',logoutStaff);
-  $('staffLoginModal').addEventListener('click',e=>{if(e.target===$('staffLoginModal'))closeStaffLogin();});
   const partnerComposer=$('partnerComposer');
   if(partnerComposer)partnerComposer.addEventListener('submit',e=>{e.preventDefault();sendPartnerChat();});
   $('radioBreachPanel').addEventListener('click',e=>{const choice=e.target.closest('[data-radio-breach-choice]');if(choice)resolveRadioBreach(choice.dataset.radioBreachChoice);});
   $('start').addEventListener('click',()=>{audioStart();resetGame();});
+  $('accountBtn').addEventListener('click',()=>openAccount(false));
+  $('leaderboardBtn').addEventListener('click',()=>{setScreen('leaderboard');renderLeaderboard();});
+  $('accountForm').addEventListener('submit',e=>e.preventDefault());
+  $('accountLogin').addEventListener('click',()=>accountAction('login'));
+  $('accountRegister').addEventListener('click',()=>accountAction('register'));
+  $('accountLogout').addEventListener('click',accountLogout);
+  $('saveCloudButton').addEventListener('click',saveCloudGame);
+  $('loadCloudButton').addEventListener('click',loadCloudGame);
+  $('refreshAchievements').addEventListener('click',refreshAchievements);
+  $('refreshLeaderboard').addEventListener('click',renderLeaderboard);
+  $('leaderboardAccount').addEventListener('click',()=>openAccount(false));
+  $('backAccount').addEventListener('click',()=>{if(accountReturnToGame){accountReturnToGame=false;closeOverlay();}else setScreen('menu');});
+  $('backLeaderboard').addEventListener('click',()=>setScreen('menu'));
+  $('pauseAccount').addEventListener('click',()=>openAccount(true));
   $('characterBtn').addEventListener('click',()=>{
     state.pendingCharacter=state.selectedCharacter;
     setScreen('character');
@@ -7424,7 +7790,27 @@ function bindEvents(){
   $('enableVoiceWhispers').addEventListener('change',e=>state.options.voiceWhispers=e.target.checked);
   $('objectiveToggle').addEventListener('click',openObjectives);
   $('closeObjectives').addEventListener('click',closeOverlay);
-  $('closeMemorial').addEventListener('click',closeOverlay);
+  $('closeMemorial').addEventListener('click',()=>{
+    const isGrandfatherMemorial=state.lastMemorialId==='yumi-lolo-tombstone';
+    closeOverlay();
+    if(isGrandfatherMemorial&&!state.horrorEventFlags.loloCondolence){
+      state.horrorEventFlags.loloCondolence=true;
+      const officer=state.selectedCharacter==='yumi'?'Yumi':'Hugo';
+      setTimeout(()=>{
+        if(!state.running||state.paused||state.gameOver)return;
+        triggerWhisper("How's life, "+officer+"? I hope you and your family are being looked after.",'center','THE SMILER // QUIET CHANNEL');
+      },850);
+      setTimeout(()=>{
+        if(!state.running||state.paused||state.gameOver)return;
+        triggerWhisper("I heard about your lolo's passing. I offer my condolences.",'center','THE SMILER // QUIET CHANNEL');
+      },6200);
+      setTimeout(()=>{
+        if(!state.running||state.paused||state.gameOver)return;
+        triggerWhisper('He loved planes, cars, and photographs. May those memories bring your family comfort.','center','THE SMILER // QUIET CHANNEL');
+      },11600);
+    }
+    state.lastMemorialId='';
+  });
   $('evidenceBoard').addEventListener('click',e=>{
     const button=e.target.closest('[data-study-id]');
     if(button)studyEvidence(button.dataset.studyId);
@@ -7546,7 +7932,6 @@ function toggleFlashlight(){
   toast(flashlight?'FLASHLIGHT ON. STAY ALERT.':'FLASHLIGHT OFF. MOVE QUIETLY.',1.3);
 }
 function onKeyDown(e){
-  if(e.key==='Escape'&&!$('staffLoginModal').classList.contains('hidden')){e.preventDefault();closeStaffLogin();return;}
   if(e.target&&e.target.id==='partnerInput'){
     if(e.key==='Enter'){e.preventDefault();sendPartnerChat();}
     if(e.key==='Escape'){e.preventDefault();e.target.blur();}
@@ -7630,38 +8015,222 @@ boot();
 </body>
 </html>'''
 
-@app.post('/api/staff/login')
-def staff_login():
-    payload = request.get_json(silent=True) or {}
-    username = str(payload.get('username', '')).strip()
-    password = str(payload.get('password', ''))
-    valid_username = secrets.compare_digest(username, TEST_STAFF_USERNAME)
-    valid_password = secrets.compare_digest(password, TEST_STAFF_PASSWORD)
-    if not (valid_username and valid_password):
-        return jsonify(authenticated=False, error='Incorrect username or password.'), 401
-    session.clear()
-    session['staff_account'] = {'username': TEST_STAFF_USERNAME, 'role': 'staff'}
-    return jsonify(authenticated=True, username=TEST_STAFF_USERNAME, role='staff')
-
-@app.get('/api/staff/session')
-def staff_session_status():
-    account = session.get('staff_account')
-    if not account or account.get('role') != 'staff':
-        return jsonify(authenticated=False)
-    return jsonify(authenticated=True, username=account.get('username'), role='staff')
-
-@app.post('/api/staff/logout')
-def staff_logout():
-    session.pop('staff_account', None)
-    return jsonify(ok=True, authenticated=False)
-
 @app.get('/')
 def index():
     return Response(HTML, mimetype='text/html')
 
 @app.get('/health')
 def health():
-    return jsonify(status='ok', game='Florida Shadows: The Living Nightmare', version='The Definitive Nightmare Edition')
+    return jsonify(status='ok', game='Florida Shadows: The Living Nightmare', version='The Definitive Nightmare Edition', databaseConfigured=mongo_configured(), database='MongoDB', secretKeyConfigured=bool(os.environ.get('SECRET_KEY')))
+
+@app.get('/api/auth/me')
+def api_auth_me():
+    if not session.get('account_key'):
+        return jsonify(authenticated=False, databaseConfigured=mongo_configured())
+    try:
+        db = get_database()
+        account = current_account(db)
+        if not account:
+            return jsonify(authenticated=False, databaseConfigured=True)
+        leaderboard = db['leaderboard'].find_one({'_id': account['_id']}) or {}
+        return jsonify(authenticated=True, databaseConfigured=True, account={
+            'username': account.get('username', ''),
+            'displayName': account.get('display_name') or account.get('username', ''),
+            'runs': int(account.get('runs', leaderboard.get('runs', 0)) or 0),
+            'wins': int(account.get('wins', leaderboard.get('wins', 0)) or 0),
+            'bestScore': int(leaderboard.get('score', account.get('best_score', 0)) or 0),
+        })
+    except Exception as exc:
+        return api_database_error(exc)
+
+
+@app.post('/api/auth/register')
+def api_auth_register():
+    data = request.get_json(silent=True) or {}
+    username = str(data.get('username', '')).strip()
+    password = data.get('password', '')
+    display_name = str(data.get('displayName') or username).strip()
+    if not re.fullmatch(r'[A-Za-z0-9_]{3,20}', username):
+        return jsonify(ok=False, error='Username must be 3–20 characters and use only letters, numbers, or underscores.'), 400
+    if not isinstance(password, str) or len(password) < 8 or len(password) > 128:
+        return jsonify(ok=False, error='Password must be 8–128 characters.'), 400
+    display_name = re.sub(r'\s+', ' ', display_name)[:24] or username
+    key = username.lower()
+    try:
+        db = get_database()
+        if db['accounts'].find_one({'_id': key}):
+            return jsonify(ok=False, error='That username is already registered. Try logging in instead.'), 409
+        document = {
+            '_id': key,
+            'username': username,
+            'display_name': display_name,
+            'password_hash': generate_password_hash(password, method='scrypt'),
+            'created_at': utc_now(),
+            'runs': 0,
+            'wins': 0,
+            'best_score': 0,
+        }
+        db['accounts'].insert_one(document)
+        session.clear()
+        session['account_key'] = key
+        session.permanent = True
+        return jsonify(ok=True, message='Account created. Your case files can now be saved to the cloud.', account={'username': username, 'displayName': display_name, 'runs': 0, 'wins': 0, 'bestScore': 0})
+    except Exception as exc:
+        return api_database_error(exc)
+
+
+@app.post('/api/auth/login')
+def api_auth_login():
+    data = request.get_json(silent=True) or {}
+    username = str(data.get('username', '')).strip()
+    password = data.get('password', '')
+    if not re.fullmatch(r'[A-Za-z0-9_]{3,20}', username) or not isinstance(password, str) or not password:
+        return jsonify(ok=False, error='Enter your username and password.'), 400
+    try:
+        db = get_database()
+        account = db['accounts'].find_one({'_id': username.lower()})
+        if not account or not check_password_hash(account.get('password_hash', ''), password):
+            return jsonify(ok=False, error='Username or password is incorrect.'), 401
+        session.clear()
+        session['account_key'] = account['_id']
+        session.permanent = True
+        leaderboard = db['leaderboard'].find_one({'_id': account['_id']}) or {}
+        return jsonify(ok=True, message='Welcome back. Your account is connected.', account={'username': account.get('username', username), 'displayName': account.get('display_name') or account.get('username', username), 'runs': int(account.get('runs', leaderboard.get('runs', 0)) or 0), 'wins': int(account.get('wins', leaderboard.get('wins', 0)) or 0), 'bestScore': int(leaderboard.get('score', 0) or 0)})
+    except Exception as exc:
+        return api_database_error(exc)
+
+
+@app.post('/api/auth/logout')
+def api_auth_logout():
+    session.clear()
+    return jsonify(ok=True, message='Logged out.')
+
+
+@app.get('/api/leaderboard')
+def api_leaderboard():
+    try:
+        db = get_database()
+        rows = db['leaderboard'].find({}, {'_id': 0, 'username': 1, 'display_name': 1, 'score': 1, 'wins': 1, 'runs': 1, 'true_ending_wins': 1, 'updated_at': 1}).sort([('score', DESCENDING), ('wins', DESCENDING), ('updated_at', DESCENDING)]).limit(25)
+        entries = []
+        for row in rows:
+            entries.append({'username': row.get('username', 'Unknown'), 'displayName': row.get('display_name') or row.get('username', 'Unknown'), 'score': int(row.get('score', 0) or 0), 'wins': int(row.get('wins', 0) or 0), 'runs': int(row.get('runs', 0) or 0), 'trueEndingWins': int(row.get('true_ending_wins', 0) or 0)})
+        return jsonify(ok=True, entries=entries)
+    except Exception as exc:
+        return api_database_error(exc)
+
+
+@app.get('/api/achievements')
+def api_achievements():
+    if not session.get('account_key'):
+        return jsonify(ok=False, error='Log in to view your achievements.'), 401
+    try:
+        db = get_database()
+        account = current_account(db)
+        if not account:
+            return jsonify(ok=False, error='Your session expired. Please log in again.'), 401
+        rows = db['achievements'].find({'username_key': account['_id']}, {'_id': 0, 'achievement_id': 1, 'title': 1, 'description': 1, 'unlocked_at': 1}).sort('unlocked_at', DESCENDING)
+        achievements = [{'id': row.get('achievement_id', ''), 'title': row.get('title', ''), 'description': row.get('description', ''), 'unlockedAt': row.get('unlocked_at').isoformat() if row.get('unlocked_at') else None} for row in rows]
+        return jsonify(ok=True, achievements=achievements)
+    except Exception as exc:
+        return api_database_error(exc)
+
+
+@app.route('/api/save', methods=['GET', 'POST'])
+def api_save():
+    if not session.get('account_key'):
+        return jsonify(ok=False, error='Log in before saving or loading a cloud case.'), 401
+    try:
+        db = get_database()
+        account = current_account(db)
+        if not account:
+            return jsonify(ok=False, error='Your session expired. Please log in again.'), 401
+        saves = db['saves']
+        if request.method == 'GET':
+            saved = saves.find_one({'_id': account['_id']})
+            if not saved:
+                return jsonify(ok=True, exists=False)
+            snapshot = saved.get('snapshot', {})
+            return jsonify(ok=True, exists=True, snapshot=snapshot, updatedAt=saved.get('updated_at').isoformat() if saved.get('updated_at') else None)
+        payload = request.get_json(silent=True) or {}
+        try:
+            snapshot = clean_save_snapshot(payload.get('snapshot'))
+        except ValueError as exc:
+            return jsonify(ok=False, error=str(exc)), 400
+        now = utc_now()
+        saves.update_one({'_id': account['_id']}, {'$set': {'username': account.get('username', ''), 'display_name': account.get('display_name', ''), 'snapshot': snapshot, 'updated_at': now}, '$setOnInsert': {'created_at': now}}, upsert=True)
+        return jsonify(ok=True, message='Case saved.', updatedAt=now.isoformat())
+    except Exception as exc:
+        return api_database_error(exc)
+
+
+@app.post('/api/run/finish')
+def api_finish_run():
+    if not session.get('account_key'):
+        return jsonify(ok=False, error='Log in to post a run to the leaderboard.'), 401
+    data = request.get_json(silent=True) or {}
+    raw = data.get('stats') if isinstance(data.get('stats'), dict) else {}
+    stats = {
+        'success': bool(raw.get('success')),
+        'trueEnding': bool(raw.get('trueEnding')),
+        'elapsed': safe_number(raw.get('elapsed'), 0, 0, 200000),
+        'health': safe_number(raw.get('health'), 0, 0, 150),
+        'clues': safe_number(raw.get('clues'), 0, 0, 100),
+        'studied': safe_number(raw.get('studied'), 0, 0, 200),
+        'reports': safe_number(raw.get('reports'), 0, 0, 100),
+        'survivors': safe_number(raw.get('survivors'), 0, 0, 2),
+        'kills': safe_number(raw.get('kills'), 0, 0, 1000),
+        'shots': safe_number(raw.get('shots'), 0, 0, 10000),
+        'buildings': safe_number(raw.get('buildings'), 0, 0, 50),
+        'anchors': safe_number(raw.get('anchors'), 0, 0, 3),
+        'huntsSurvived': safe_number(raw.get('huntsSurvived'), 0, 0, 50),
+        'stationCorrect': safe_number(raw.get('stationCorrect'), 0, 0, 6),
+        'stationProcessed': safe_number(raw.get('stationProcessed'), 0, 0, 6),
+        'duplicateDetained': bool(raw.get('duplicateDetained')),
+        'records': safe_number(raw.get('records'), 0, 0, 200),
+    }
+    score = stats['clues'] * 100 + stats['studied'] * 120 + stats['reports'] * 170 + stats['survivors'] * 400 + stats['kills'] * 15 + stats['buildings'] * 60 + stats['anchors'] * 280 + stats['huntsSurvived'] * 110 + stats['stationCorrect'] * 80 + stats['records'] * 10 + stats['health'] * 4
+    if stats['success']:
+        score += 1500
+    if stats['trueEnding']:
+        score += 1000
+    now = utc_now()
+    definitions = {
+        'first_case': ('First Case', 'Finish your first investigation.', True),
+        'survivor_saver': ('Bring Them Home', 'Successfully extract both survivors.', stats['success'] and stats['survivors'] >= 2),
+        'forensic_mind': ('Forensic Mind', 'Study six clues and file four distinct comparisons.', stats['studied'] >= 6 and stats['reports'] >= 4),
+        'identity_guard': ('Identity Guard', 'Screen the visitors and detain the duplicate.', stats['stationProcessed'] >= 6 and stats['stationCorrect'] >= 5 and stats['duplicateDetained']),
+        'signal_breaker': ('Signal Breaker', 'Destroy all three signal anchors.', stats['anchors'] >= 3),
+        'nightmare_survivor': ('Nightmare Survivor', 'Win after surviving at least three hunts.', stats['success'] and stats['huntsSurvived'] >= 3),
+        'true_ending': ('Signal Silenced', 'Complete the true ending.', stats['success'] and stats['trueEnding']),
+        'photographic_memory': ('Nothing Forgotten', 'Study eight or more case records.', stats['records'] >= 8),
+    }
+    newly_unlocked = []
+    try:
+        db = get_database()
+        account = current_account(db)
+        if not account:
+            return jsonify(ok=False, error='Your session expired. Please log in again.'), 401
+        users = db['accounts']
+        users.update_one({'_id': account['_id']}, {'$inc': {'runs': 1, 'wins': 1 if stats['success'] else 0}, '$max': {'best_score': score}})
+        board = db['leaderboard']
+        existing = board.find_one({'_id': account['_id']}) or {}
+        runs = int(existing.get('runs', 0) or 0) + 1
+        wins = int(existing.get('wins', 0) or 0) + (1 if stats['success'] else 0)
+        best_score = max(int(existing.get('score', 0) or 0), score)
+        best_true = int(existing.get('true_ending_wins', 0) or 0) + (1 if stats['success'] and stats['trueEnding'] else 0)
+        board.update_one({'_id': account['_id']}, {'$set': {'username': account.get('username', ''), 'display_name': account.get('display_name') or account.get('username', ''), 'score': best_score, 'last_score': score, 'runs': runs, 'wins': wins, 'true_ending_wins': best_true, 'last_result': 'WIN' if stats['success'] else 'LOST', 'updated_at': now}, '$setOnInsert': {'created_at': now}}, upsert=True)
+        for achievement_id, (title, description, condition) in definitions.items():
+            should_unlock = bool(condition) or (achievement_id == 'first_case' and runs >= 1)
+            if not should_unlock:
+                continue
+            key = account['_id'] + ':' + achievement_id
+            result = db['achievements'].update_one({'_id': key}, {'$setOnInsert': {'username_key': account['_id'], 'username': account.get('username', ''), 'achievement_id': achievement_id, 'title': title, 'description': description, 'unlocked_at': now}}, upsert=True)
+            if result.upserted_id is not None:
+                newly_unlocked.append(title)
+        return jsonify(ok=True, score=score, bestScore=best_score, wins=wins, runs=runs, achievements=newly_unlocked)
+    except Exception as exc:
+        return api_database_error(exc)
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '5000'))
