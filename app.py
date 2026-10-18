@@ -1,19 +1,101 @@
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, session
+from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timezone
-from threading import Lock
+import json
 import os
 import re
+import time
+import uuid
 
 try:
-    from pymongo import MongoClient
+    from pymongo import MongoClient, ASCENDING, DESCENDING
+    from pymongo.errors import DuplicateKeyError
 except ImportError:
     MongoClient = None
+    ASCENDING = 1
+    DESCENDING = -1
+    DuplicateKeyError = Exception
 
 app = Flask(__name__)
-_prayer_memory = []
-_prayer_lock = Lock()
-_prayer_mongo_client = None
-_prayer_mongo_uri = None
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or os.urandom(32)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = str(os.environ.get("COOKIE_SECURE", "")).lower() in ("1", "true", "yes") or bool(os.environ.get("RENDER"))
+app.config["PERMANENT_SESSION_LIFETIME"] = 60 * 60 * 24 * 14
+
+MONGODB_URI = os.environ.get("MONGODB_URI", "").strip()
+MONGODB_DB = os.environ.get("MONGODB_DB", "florida_shadows").strip() or "florida_shadows"
+_mongo_client = None
+_mongo_db = None
+_mongo_failed_until = 0.0
+
+ACHIEVEMENT_CATALOG = {
+    "first_case": {"title": "First Night on Record", "description": "Complete your first patrol."},
+    "first_escape": {"title": "Out of the Marsh", "description": "Survive and complete an extraction."},
+    "forensic_mind": {"title": "Forensic Mind", "description": "Study six clues and make four cross-reference reports in a successful run."},
+    "signal_breaker": {"title": "Signal Breaker", "description": "Destroy all three signal anchors and reach the true ending."},
+    "rescuer": {"title": "Nobody Left Behind", "description": "Bring both missing people to extraction."},
+}
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+def get_db():
+    global _mongo_client, _mongo_db, _mongo_failed_until
+    if not MONGODB_URI or MongoClient is None:
+        return None
+    if _mongo_db is not None:
+        return _mongo_db
+    if time.monotonic() < _mongo_failed_until:
+        return None
+    candidate = None
+    try:
+        candidate = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=1800, connectTimeoutMS=1800, maxPoolSize=25, appname="FloridaShadows")
+        candidate.admin.command("ping")
+        database = candidate[MONGODB_DB]
+        database.users.create_index([("username_key", ASCENDING)], unique=True)
+        database.saves.create_index([("user_id", ASCENDING), ("slot", ASCENDING)], unique=True)
+        database.leaderboard.create_index([("best_score", DESCENDING)])
+        database.achievements.create_index([("user_id", ASCENDING), ("achievement_id", ASCENDING)], unique=True)
+        _mongo_client = candidate
+        _mongo_db = database
+        _mongo_failed_until = 0.0
+        return _mongo_db
+    except Exception:
+        if candidate is not None:
+            try:
+                candidate.close()
+            except Exception:
+                pass
+        _mongo_failed_until = time.monotonic() + 15.0
+        return None
+
+def public_user(user):
+    return {
+        "id": user.get("_id", ""),
+        "username": user.get("username", ""),
+        "display_name": user.get("display_name") or user.get("username", ""),
+        "games_played": int(user.get("games_played", 0) or 0),
+        "best_score": int(user.get("best_score", 0) or 0),
+        "created_at": user.get("created_at").isoformat() if hasattr(user.get("created_at"), "isoformat") else "",
+    }
+
+def current_user(database=None):
+    database = database or get_db()
+    user_id = session.get("user_id")
+    if database is None or not user_id:
+        return None
+    try:
+        return database.users.find_one({"_id": str(user_id)})
+    except Exception:
+        return None
+
+def database_error():
+    if not MONGODB_URI:
+        return jsonify(ok=False, message="Cloud accounts are not configured yet. Add MONGODB_URI, MONGODB_DB, and SECRET_KEY to your Render environment variables.", database_available=False), 503
+    if MongoClient is None:
+        return jsonify(ok=False, message="MongoDB support is not installed on this deployment. Add pymongo to requirements.txt and redeploy.", database_available=False), 503
+    return jsonify(ok=False, message="MongoDB is temporarily unavailable. Check the connection string, network access list, and database user in your environment settings.", database_available=False), 503
 
 HTML = r'''<!doctype html>
 <html lang="en">
@@ -454,6 +536,29 @@ body.prologue-mode.prologue-drive.mobile-mode #touchControls { display: block; }
   background: linear-gradient(#632c30, #291719);
   border-color: #b28c68;
 }
+
+.auth-form { display:grid; gap:12px; margin:14px 0; }
+.input-label { display:grid; gap:6px; color:#d6d5c5; font-size:11px; letter-spacing:.5px; }
+.text-field, .select-field, .prayer-field { width:100%; padding:12px; border:1px solid #5b6a58; background:#050906; color:#e9e6d6; outline:none; border-radius:0; }
+.text-field:focus, .select-field:focus, .prayer-field:focus { border-color:#d4bc80; box-shadow:0 0 0 1px #d4bc8055; }
+.db-status { margin:12px 0; padding:12px; border:1px solid #555f4d; background:#090f0b; color:#c2cbb8; font-size:11px; line-height:1.7; overflow-wrap:anywhere; }
+.db-status.error { border-color:#88494a; color:#efaaa1; }
+.db-status.good { border-color:#657e56; color:#d5e3b7; }
+.account-summary { display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; padding:12px; border:1px solid #4c5b49; background:#0a100c; margin:12px 0; }
+.account-summary strong { color:#e2d3a9; }
+.account-save-grid { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:8px; align-items:end; margin:14px 0; }
+.achievement-list { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:8px; margin:12px 0; }
+.achievement-card { border:1px solid #3e4b3d; padding:11px; background:#08100b; font-size:11px; line-height:1.55; color:#aebbac; }
+.achievement-card strong { color:#e1d4ac; display:block; margin-bottom:4px; }
+.achievement-card.locked { opacity:.53; }
+.leaderboard-list { display:grid; gap:6px; margin:14px 0; }
+.leaderboard-row { display:grid; grid-template-columns:42px minmax(0,1fr) 100px; gap:10px; align-items:center; border:1px solid #3c483b; background:#080d0a; padding:10px 12px; color:#c6d0c1; font-size:12px; }
+.leaderboard-row .rank { color:#d8c08a; font-weight:bold; }
+.leaderboard-row .player-name { overflow-wrap:anywhere; }
+.leaderboard-row .score { text-align:right; color:#f0d9a0; font-weight:bold; font-variant-numeric:tabular-nums; }
+.prayer-verse { border-left:2px solid #bca875; padding:12px 16px; margin:15px 0; color:#d1c7aa; background:#0c100b; line-height:1.9; font-size:12px; }
+.account-small { color:#9ba99a; font-size:10px; line-height:1.7; }
+@media(max-width:620px) { .account-save-grid { grid-template-columns:1fr 1fr; } .account-save-grid .input-label { grid-column:1 / -1; } .leaderboard-row { grid-template-columns:32px minmax(0,1fr) 78px; padding:9px; font-size:10px; } }
 .menu-art canvas {
   display: block;
   width: 100%;
@@ -504,30 +609,7 @@ body.prologue-mode.prologue-drive.mobile-mode #touchControls { display: block; }
 .memorial-photo { min-height:86px; display:flex; flex-direction:column; justify-content:center; align-items:center; gap:8px; padding:10px 5px; border:1px solid #59533e; background:#0b0f0a; color:#cabb95; text-align:center; font-size:10px; letter-spacing:1px; }
 .memorial-photo strong { font-size:25px; line-height:1; font-weight:normal; color:#e0d0a6; }
 .memorial-note { color:#a9ad9d; font-size:10px; line-height:1.7; }
-.prayer-open-button { width:100%; margin-top:10px; padding:9px 10px; color:#f1e5c4; border-color:#8d7c55; background:linear-gradient(180deg,#393421,#1b1b13); font-size:10px; letter-spacing:1px; }
-.prayer-book-panel { width:min(760px,96vw); border-color:#8b7d5b; background:linear-gradient(145deg,rgba(19,23,17,.99),rgba(3,5,4,.99)); }
-.prayer-book-panel .section-title { color:#efe3c5; }
-.prayer-intro { padding:12px 14px; color:#c8c4b4; border-left:2px solid #b9a16b; background:#11160f; font-size:12px; line-height:1.7; }
-.prayer-form { display:grid; gap:8px; margin:15px 0 16px; }
-.prayer-form label { color:#d9c99c; font-size:10px; letter-spacing:1px; text-transform:uppercase; }
-.prayer-form input, .prayer-form textarea { display:block; width:100%; padding:10px 11px; border:1px solid #55624f; border-radius:0; background:#090e0a; color:#eee9d9; font:12px/1.55 Consolas,Monaco,"Courier New",monospace; text-transform:none; letter-spacing:0; user-select:text; -webkit-user-select:text; pointer-events:auto; }
-.prayer-form textarea { min-height:108px; resize:vertical; }
-.prayer-form input:focus, .prayer-form textarea:focus { outline:1px solid #cbb47b; border-color:#cbb47b; }
-.prayer-form input::placeholder, .prayer-form textarea::placeholder { color:#8c9688; opacity:1; }
-.prayer-template-row { display:flex; flex-wrap:wrap; gap:6px; }
-.prayer-template-row button { padding:7px 8px; font-size:9px; letter-spacing:.3px; text-transform:none; }
-.prayer-form-bottom { display:flex; flex-wrap:wrap; align-items:center; gap:9px; }
-.prayer-form-bottom button { min-width:145px; }
-.prayer-status { min-height:32px; flex:1 1 220px; color:#c8d1bc; font-size:10px; line-height:1.5; }
-.prayer-storage-note { margin:6px 0 12px; color:#879584; font-size:9px; line-height:1.5; }
-.prayer-feed { display:grid; gap:8px; margin:10px 0 4px; }
-.prayer-empty { padding:15px 12px; border:1px dashed #4d5848; color:#8f9b8b; text-align:center; font-size:11px; line-height:1.7; }
-.prayer-entry { padding:11px 12px; border:1px solid #3e4a3d; border-left:2px solid #9f9065; background:linear-gradient(120deg,#11170f,#090d09); }
-.prayer-entry-head { display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:7px; margin-bottom:5px; color:#e0d1a7; font-size:10px; }
-.prayer-entry time { color:#7f8d7d; font-size:9px; }
-.prayer-entry-message { color:#c9d0c1; font-size:11px; line-height:1.7; white-space:pre-wrap; overflow-wrap:anywhere; user-select:text; }
-.prayer-honeypot { position:absolute!important; left:-10000px!important; width:1px!important; height:1px!important; opacity:0!important; }
-@media(max-width:760px) { .memorial-photo-row { gap:5px; } .memorial-photo { min-height:73px; font-size:8px; } .memorial-photo strong { font-size:20px; } .memorial-home p { font-size:10px; } .prayer-form textarea { min-height:95px; } .prayer-form-bottom button { width:100%; } }
+@media(max-width:760px) { .memorial-photo-row { gap:5px; } .memorial-photo { min-height:73px; font-size:8px; } .memorial-photo strong { font-size:20px; } .memorial-home p { font-size:10px; } }
 .section-title {
   margin: 7px 0 12px;
   color: #e8e2ce;
@@ -1380,7 +1462,9 @@ body.hunting #survivorLocator{opacity:0}
           <button id="controlsBtn">Control mode</button>
           <button id="howBtn">How to play</button>
           <button id="creditsBtn">Credits</button>
-          <button id="prayersBtn">✦ Send a Prayer</button>
+          <button id="loginBtn">Login / Cloud Saves</button>
+          <button id="leaderboardBtn">Leaderboard</button>
+          <button id="prayerBtn">✦ Send a Prayer</button>
           <button id="disclaimerBtn">Horror & privacy disclaimer</button>
         </div>
         <section class="memorial-home" aria-label="In loving memory of Yumi's grandfather">
@@ -1388,7 +1472,6 @@ body.hunting #survivorLocator{opacity:0}
           <div class="memorial-icons" aria-label="His loves"><span>✈ PLANES</span><span>▰ CARS</span><span>▣ PHOTOGRAPHY</span></div>
           <p>He was a great man who lived a long, full life. His passing came suddenly in the early morning, but the things he loved and the memories he leaves behind will continue to matter. May the journeys he admired, the photographs he treasured, and the stories he shared bring comfort to everyone who loves him.</p>
           <span class="memorial-signoff">With heartfelt sympathy to Yumi and her family. May he rest in peace.</span>
-          <button type="button" id="openPrayerBook" class="prayer-open-button">✦ LEAVE A PRAYER FOR YUMI AND HER FAMILY</button>
         </section>
         <div class="pc-hint">THE SEVENTH ARRIVAL · SCREAM JAM 2026 · HEADPHONES RECOMMENDED</div>
       </div>
@@ -1477,34 +1560,6 @@ body.hunting #survivorLocator{opacity:0}
     </div>
     <p class="memorial-note">This is a quiet tribute offered with respect and sympathy to Yumi and her family. It is not evidence in the case, and nothing here is meant to turn their loss into a scare.</p>
     <div class="page-buttons"><button id="closeMemorial">Leave the memory in peace</button></div>
-  </div>
-</div>
-<div id="prayersPanel" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="prayerBookTitle">
-  <div class="panel prayer-book-panel">
-    <div class="kicker">A space for kindness and remembrance</div>
-    <h2 id="prayerBookTitle" class="section-title">Prayer & Remembrance Book</h2>
-    <p class="prayer-intro">Leave a prayer, a kind thought, or a few words of remembrance for Yumi and her family as they grieve the sudden loss of her grandfather. You do not need perfect words. A short, sincere message is enough.</p>
-    <div class="prayer-template-row" aria-label="Optional prayer starters">
-      <button type="button" data-prayer-template="May he rest in peace. May Yumi and her family find comfort, strength, and gentle moments of peace in the memories they shared.">A prayer for peace</button>
-      <button type="button" data-prayer-template="May Yumi feel surrounded by kindness and patience. May she have space to grieve and people who will listen when she needs them.">A prayer for strength</button>
-      <button type="button" data-prayer-template="Thank you for the life he lived, the journeys he loved, and the memories he left behind. May those memories continue to bring warmth to the people who miss him.">A prayer of remembrance</button>
-    </div>
-    <form id="prayerForm" class="prayer-form" autocomplete="off">
-      <label for="prayerName">Your name or nickname (optional)</label>
-      <input id="prayerName" name="name" type="text" maxlength="32" placeholder="Anonymous is okay" autocomplete="nickname">
-      <label for="prayerMessage">Your prayer or message</label>
-      <textarea id="prayerMessage" name="message" minlength="3" maxlength="600" required placeholder="Write a kind thought, prayer, or message for Yumi and her family…"></textarea>
-      <label class="prayer-honeypot" aria-hidden="true" for="prayerWebsite">Leave this field empty</label>
-      <input class="prayer-honeypot" id="prayerWebsite" name="website" tabindex="-1" autocomplete="off" aria-hidden="true">
-      <div class="prayer-form-bottom">
-        <button id="sendPrayerButton" type="submit">Send Prayer</button>
-        <div id="prayerStatus" class="prayer-status" role="status" aria-live="polite">Your message can be anonymous. Please share only kind words and do not include private contact details.</div>
-      </div>
-    </form>
-    <div class="kicker">Messages of support</div>
-    <p id="prayerStorageNote" class="prayer-storage-note">Loading the remembrance book…</p>
-    <div id="prayerFeed" class="prayer-feed" aria-live="polite"><div class="prayer-empty">Loading prayers…</div></div>
-    <div class="page-buttons"><button id="backPrayers" type="button">Return to homepage</button></div>
   </div>
 </div>
 <div id="objectivePanel" class="overlay hidden">
@@ -1647,7 +1702,7 @@ Awaiting database query.</div>
     <div class="kicker">Patrol interrupted</div>
     <h2 class="section-title">Paused</h2>
     <p class="intro">The swamp is still there when you return.</p>
-    <div class="page-buttons"><button id="resume">Resume patrol</button><button id="pauseObjectives">Case file</button><button id="pauseMenu">Abandon patrol</button></div>
+    <div class="page-buttons"><button id="resume">Resume patrol</button><button id="pauseObjectives">Case file</button><button id="pauseCloud">Cloud saves</button><button id="pauseMenu">Abandon patrol</button></div>
   </div>
 </div>
 
@@ -1688,6 +1743,59 @@ PARTNER: “Why did you let me in?”</div>
     <div class="page-buttons"><button id="closeRadio">Return to patrol</button></div>
   </div>
 </div>
+
+<div id="accountPanel" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="accountPanelTitle">
+  <div class="panel">
+    <div class="kicker">Player services · MongoDB cloud profile</div>
+    <h2 id="accountPanelTitle" class="section-title">Login & Cloud Saves</h2>
+    <p class="intro">Create an account to sync save slots, compare scores, and collect achievements. Your password is stored as a one-way hash, never as plain text. Account, save, and leaderboard data use your server-configured MongoDB connection.</p>
+    <div id="accountDbStatus" class="db-status">Checking cloud database configuration…</div>
+    <div id="accountSignedOut">
+      <form id="accountForm" class="auth-form" autocomplete="on">
+        <label id="displayNameWrap" class="input-label hidden">DISPLAY NAME (OPTIONAL)<input id="accountDisplayName" class="text-field" type="text" maxlength="32" autocomplete="nickname" placeholder="How you appear on the leaderboard"></label>
+        <label class="input-label">USERNAME<input id="accountUsername" class="text-field" name="username" type="text" required minlength="3" maxlength="20" pattern="[A-Za-z0-9_-]{3,20}" autocomplete="username" placeholder="3–20 letters, numbers, _ or -"></label>
+        <label class="input-label">PASSWORD<input id="accountPassword" class="text-field" name="password" type="password" required minlength="8" maxlength="128" autocomplete="current-password" placeholder="At least 8 characters"></label>
+        <div class="page-buttons"><button id="authSubmit" type="submit">Sign in</button><button id="authModeToggle" type="button">Create account instead</button></div>
+      </form>
+      <div class="account-small">Use a unique password. This is a game account, not an official police account. Cloud functions require MongoDB environment variables on your Flask host.</div>
+    </div>
+    <div id="accountSignedIn" class="hidden">
+      <div class="account-summary"><div><span class="account-small">SIGNED IN AS</span><br><strong id="accountDisplayLabel">PLAYER</strong><div id="accountMeta" class="account-small"></div></div><button id="logoutBtn" type="button">Log out</button></div>
+      <h3 class="section-title" style="font-size:19px;margin-top:18px">Cloud save slots</h3>
+      <div class="account-save-grid">
+        <label class="input-label">SAVE SLOT<select id="cloudSaveSlot" class="select-field"><option value="1">Slot 1</option><option value="2">Slot 2</option><option value="3">Slot 3</option></select></label>
+        <button id="saveCloudBtn" type="button">Save current run</button>
+        <button id="loadCloudBtn" type="button">Load selected slot</button>
+      </div>
+      <div id="cloudSaveStatus" class="db-status">Cloud saves are tied to your account.</div>
+      <h3 class="section-title" style="font-size:19px;margin-top:18px">Achievements</h3>
+      <div id="achievementList" class="achievement-list"></div>
+    </div>
+    <div class="page-buttons"><button id="backAccount" type="button">Return</button></div>
+  </div>
+</div>
+<div id="leaderboardPanel" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="leaderboardTitle">
+  <div class="panel">
+    <div class="kicker">Field records · Global rankings</div>
+    <h2 id="leaderboardTitle" class="section-title">Leaderboard</h2>
+    <p class="intro">Scores are recorded when a signed-in player finishes a patrol. Successful extractions, evidence analysis, survivor rescues, and signal anchors all contribute.</p>
+    <div id="leaderboardStatus" class="db-status">Connecting to cloud records…</div>
+    <div id="leaderboardList" class="leaderboard-list"></div>
+    <div class="page-buttons"><button id="refreshLeaderboard" type="button">Refresh scores</button><button id="leaderboardLogin" type="button">Login / Create account</button><button id="backLeaderboard" type="button">Return to menu</button></div>
+  </div>
+</div>
+<div id="prayerPanel" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="prayerTitle">
+  <div class="panel memorial-panel">
+    <div class="kicker">A quiet moment of remembrance</div>
+    <h2 id="prayerTitle" class="section-title">A Prayer for Yumi’s Lolo</h2>
+    <div class="prayer-verse">May God welcome him into peace and hold him in everlasting light. May the love he gave, the journeys he enjoyed, and the memories he captured remain a blessing to all who knew him. Give Yumi and her family strength for the difficult hours, gentleness for the days when grief returns, and people who will sit beside them without asking them to be strong. May their tears be met with kindness, their memories with gratitude, and their hearts with comfort. Amen.</div>
+    <p class="intro">This prayer is offered with care and respect. Nothing entered here is sent to the server or saved to the account.</p>
+    <label class="input-label">OPTIONAL WORDS OF SUPPORT<textarea id="prayerWords" class="prayer-field" rows="3" maxlength="500" placeholder="Write a quiet thought or prayer for Yumi and her family…"></textarea></label>
+    <div id="prayerFeedback" class="db-status hidden">Your prayer has been held here in this session.</div>
+    <div class="page-buttons"><button id="offerPrayer" type="button">Offer this prayer</button><button id="closePrayer" type="button">Return to menu</button></div>
+  </div>
+</div>
+
 <script>
 (()=>{
 "use strict";
@@ -1955,7 +2063,9 @@ function setScreen(name){
     controls:'controlsPanel',
     how:'howPanel',
     credits:'creditsPanel',
-    prayers:'prayersPanel',
+    account:'accountPanel',
+    leaderboard:'leaderboardPanel',
+    prayer:'prayerPanel',
     objectives:'objectivePanel',
     memorial:'memorialPanel',
     inventory:'inventoryPanel',
@@ -1968,7 +2078,7 @@ function setScreen(name){
   for(const id of Object.values(mapping))$(id).classList.add('hidden');
   const suspectZoom=$('suspectZoomPanel');if(suspectZoom)suspectZoom.classList.add('hidden');
   if(mapping[name])$(mapping[name]).classList.remove('hidden');
-  if(name==='menu'||name==='character'||name==='controls'||name==='how'||name==='credits'||name==='prayers'){
+  if(name==='menu'||name==='character'||name==='controls'||name==='how'||name==='credits'||name==='account'||name==='leaderboard'||name==='prayer'){
     state.running=false;
     document.body.classList.remove('game-active');
   }
@@ -2680,7 +2790,7 @@ function applyControlMode(){
   $('mobileMode').classList.toggle('selected',state.pendingMode==='mobile');
 }
 function activeOverlay(){
-  return ['menu','character','controls','how','credits','objectives','inventory','pause','ending','radio'].includes(state.screen);
+  return ['menu','character','controls','how','credits','account','leaderboard','prayer','objectives','inventory','pause','ending','radio'].includes(state.screen);
 }
 function setPrologueStage(stage){
   state.prologueStage=stage;
@@ -4248,6 +4358,7 @@ function finishGame(success){
   $('radioBreachPanel').classList.add('hidden');state.radioIncidentActive=false;state.radioIncidentTimer=0;state.paused=false;$('huntBanner').classList.remove('active');$('realityPulse').classList.remove('active');document.body.classList.remove('hunting');
   $('endingStats').innerHTML='TIME IN FIELD: '+Math.floor(state.elapsed/60)+' MINUTES<br>HUNTS SURVIVED: '+state.huntsSurvived+'/3<br>SIGNAL ANCHORS DESTROYED: '+state.anchorsDestroyed.length+'/3<br>RADIO HELP CALLS: '+state.helpCount+'<br>SCREAMS: '+(state.shoutCount||0)+'<br>EVIDENCE RECOVERED: '+collectedClueCount()+'<br>CLUES STUDIED: '+studyCount()+'<br>CROSS-REFERENCES: '+validCrossReferenceCount()+'<br>RELAY KEY: '+(state.keysFound?'RECOVERED':'MISSING')+'<br>WITNESS STATEMENT: '+(state.witnessInterviewed?(state.witnessTrust>=2?'CORROBORATED':'UNRELIABLE'):'MISSING')+'<br>SURVIVORS EXTRACTED: '+survivors.filter(s=>s.delivered).length+'/2<br>CRAWLERS NEUTRALIZED: '+state.kills+'<br>SHOTS FIRED: '+state.shots+'<br>BUILDINGS SEARCHED: '+state.exploredRoomIds.length+'<br>EXTRACTION HOLD: '+Math.floor(state.extractionHold)+'/30 SECONDS';
   setScreen('ending');
+  submitRunResult(success);
   if(success)tone(460,.4,'sine',.1,180);else sound('scare');
 }
 function enterScreen(name){
@@ -7322,82 +7433,227 @@ function drawPortraits(){
     }
   });
 }
-function renderPrayerFeed(prayers){
-  const feed=$('prayerFeed');
-  feed.replaceChildren();
-  if(!Array.isArray(prayers)||!prayers.length){
-    const empty=document.createElement('div');
-    empty.className='prayer-empty';
-    empty.textContent='No prayers have been shared yet. You can leave the first kind words here.';
-    feed.appendChild(empty);
-    return;
-  }
-  for(const item of prayers.slice(0,20)){
-    const card=document.createElement('article');
-    card.className='prayer-entry';
-    const head=document.createElement('div');
-    head.className='prayer-entry-head';
-    const name=document.createElement('strong');
-    name.textContent=String(item.name||'Anonymous').slice(0,32);
-    const time=document.createElement('time');
-    const raw=String(item.created_at||'');
-    const date=new Date(raw);
-    time.textContent=Number.isNaN(date.getTime())?'A message of remembrance':date.toLocaleString();
-    head.append(name,time);
-    const message=document.createElement('div');
-    message.className='prayer-entry-message';
-    message.textContent=String(item.message||'').slice(0,600);
-    card.append(head,message);
-    feed.appendChild(card);
-  }
+let accountMode='login';
+let accountProfile=null;
+let accountReturnScreen='menu';
+let accountDatabaseAvailable=false;
+const achievementInfo={
+  first_case:{title:'First Night on Record',description:'Complete your first patrol.'},
+  first_escape:{title:'Out of the Marsh',description:'Survive and complete an extraction.'},
+  forensic_mind:{title:'Forensic Mind',description:'Study six clues and make four cross-reference reports in a successful run.'},
+  signal_breaker:{title:'Signal Breaker',description:'Destroy all three signal anchors and reach the true ending.'},
+  rescuer:{title:'Nobody Left Behind',description:'Bring both missing people to extraction.'}
+};
+function setAccountMode(mode){
+  accountMode=mode==='register'?'register':'login';
+  $('displayNameWrap').classList.toggle('hidden',accountMode!=='register');
+  $('accountPassword').autocomplete=accountMode==='register'?'new-password':'current-password';
+  $('authSubmit').textContent=accountMode==='register'?'Create account':'Sign in';
+  $('authModeToggle').textContent=accountMode==='register'?'I already have an account':'Create account instead';
+  $('accountPassword').minLength=accountMode==='register'?8:1;
 }
-async function loadPrayers(){
-  const note=$('prayerStorageNote');
-  const feed=$('prayerFeed');
-  if(!note||!feed)return;
+async function cloudRequest(url,options={}){
+  const headers=Object.assign({'Content-Type':'application/json'},options.headers||{});
+  const response=await fetch(url,Object.assign({credentials:'same-origin',headers},options));
+  let data={};
+  try{data=await response.json();}catch(_){data={};}
+  if(!response.ok)throw new Error(data.message||'Request failed. Check the server and try again.');
+  return data;
+}
+function setBoxMessage(elementId,message,kind=''){
+  const el=$(elementId);if(!el)return;
+  el.textContent=message;
+  el.classList.remove('error','good');
+  if(kind)el.classList.add(kind);
+}
+function openAccount(returnTo='menu'){
+  accountReturnScreen=returnTo;
+  setAccountMode('login');
+  $('accountPassword').value='';
+  setScreen('account');
+  refreshAccountPanel();
+}
+function leaveAccountPanel(){
+  if(accountReturnScreen==='pause'&&player&&!state.gameOver){
+    state.running=false;state.paused=true;setScreen('pause');
+  }else setScreen('menu');
+}
+async function refreshAccountPanel(){
+  setBoxMessage('accountDbStatus','Checking MongoDB cloud account…');
   try{
-    const response=await fetch('/api/prayers',{headers:{'Accept':'application/json'},cache:'no-store'});
-    const data=await response.json();
-    if(!response.ok)throw new Error(data.error||'Could not load prayers.');
-    renderPrayerFeed(data.prayers||[]);
-    note.textContent=data.persistent?'Prayers are being saved to the community remembrance book.':'Temporary mode: prayers work now, but add MONGODB_URI in Render to preserve them between restarts and across all visitors.';
+    const data=await cloudRequest('/api/account/me',{method:'GET',headers:{}});
+    accountDatabaseAvailable=!!data.database_available;
+    accountProfile=data.authenticated?data.account:null;
+    if(!accountDatabaseAvailable){
+      setBoxMessage('accountDbStatus',data.message||'MongoDB is not configured. Set MONGODB_URI, MONGODB_DB, and SECRET_KEY on Render.','error');
+    }else{
+      setBoxMessage('accountDbStatus','MongoDB is connected. Cloud accounts, saves, leaderboard scores, and achievements are available.','good');
+    }
+    $('accountSignedOut').classList.toggle('hidden',!!accountProfile);
+    $('accountSignedIn').classList.toggle('hidden',!accountProfile);
+    $('logoutBtn').classList.toggle('hidden',!accountProfile);
+    $('backAccount').textContent=accountReturnScreen==='pause'?'Return to pause':'Return to menu';
+    if(accountProfile){
+      $('accountDisplayLabel').textContent=accountProfile.display_name||accountProfile.username;
+      $('accountMeta').textContent='PATROLS: '+(accountProfile.games_played||0)+' · BEST SCORE: '+(accountProfile.best_score||0);
+      await refreshCloudSlots();
+      await refreshAchievements();
+    }
   }catch(error){
-    renderPrayerFeed([]);
-    note.textContent='The prayer book could not connect just now. You can still write a message and try again.';
+    accountDatabaseAvailable=false;
+    accountProfile=null;
+    $('accountSignedOut').classList.remove('hidden');
+    $('accountSignedIn').classList.add('hidden');
+    $('logoutBtn').classList.add('hidden');
+    setBoxMessage('accountDbStatus',error.message,'error');
   }
 }
-function openPrayerBook(){
-  setScreen('prayers');
-  loadPrayers();
-  setTimeout(()=>{const input=$('prayerMessage');if(input)input.focus({preventScroll:true});},80);
-}
-async function submitPrayer(event){
+async function submitAccountForm(event){
   event.preventDefault();
-  const button=$('sendPrayerButton');
-  const status=$('prayerStatus');
-  const message=$('prayerMessage').value.trim();
-  const name=$('prayerName').value.trim();
-  const honeypot=$('prayerWebsite').value;
-  if(honeypot)return;
-  if(message.length<3){status.textContent='Please write a few kind words before sending.';$('prayerMessage').focus();return;}
-  if(message.length>600){status.textContent='Please keep your message under 600 characters.';return;}
-  button.disabled=true;
-  button.textContent='SENDING…';
-  status.textContent='Sending your prayer…';
+  const username=$('accountUsername').value.trim();
+  const password=$('accountPassword').value;
+  const display_name=$('accountDisplayName').value.trim();
+  setBoxMessage('accountDbStatus',accountMode==='register'?'Creating your account…':'Signing in…');
+  $('authSubmit').disabled=true;
   try{
-    const response=await fetch('/api/prayers',{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify({name,message,website:honeypot})});
-    const data=await response.json();
-    if(!response.ok||!data.ok)throw new Error(data.error||'Your prayer could not be sent. Please try again.');
-    $('prayerMessage').value='';
-    status.textContent=data.persistent?'Your prayer has been saved. Thank you for sharing kindness with Yumi and her family.':'Your prayer was received for this running session. To keep it permanently across visits, connect MongoDB with MONGODB_URI in Render.';
-    await loadPrayers();
+    const endpoint=accountMode==='register'?'/api/account/register':'/api/account/login';
+    const data=await cloudRequest(endpoint,{method:'POST',body:JSON.stringify({username,password,display_name})});
+    accountProfile=data.account;
+    $('accountPassword').value='';
+    setBoxMessage('accountDbStatus',accountMode==='register'?'Account created. Your password was stored as a one-way hash.':'Signed in successfully.','good');
+    await refreshAccountPanel();
   }catch(error){
-    status.textContent=error&&error.message?error.message:'The prayer could not be sent. Please check your connection and try again.';
-  }finally{
-    button.disabled=false;
-    button.textContent='Send Prayer';
-  }
+    setBoxMessage('accountDbStatus',error.message,'error');
+  }finally{$('authSubmit').disabled=false;}
 }
+async function refreshCloudSlots(){
+  try{
+    const data=await cloudRequest('/api/saves',{method:'GET',headers:{}});
+    const saved=(data.saves||[]).find(item=>Number(item.slot)===Number($('cloudSaveSlot').value));
+    if(saved)setBoxMessage('cloudSaveStatus','Slot '+saved.slot+' · Updated '+(saved.updated_at||'recently')+' · '+(saved.description||'Run progress saved.'),'good');
+    else setBoxMessage('cloudSaveStatus','Selected slot is empty. Start a patrol and use Pause → Cloud saves to save progress.');
+  }catch(error){setBoxMessage('cloudSaveStatus',error.message,'error');}
+}
+async function refreshAchievements(){
+  const container=$('achievementList');
+  if(!accountProfile||!container)return;
+  container.replaceChildren();
+  try{
+    const data=await cloudRequest('/api/achievements',{method:'GET',headers:{}});
+    const unlocked=new Map((data.unlocked||[]).map(item=>[item.achievement_id,item]));
+    for(const [id,info] of Object.entries(achievementInfo)){
+      const card=document.createElement('div');
+      card.className='achievement-card'+(unlocked.has(id)?'':' locked');
+      const title=document.createElement('strong');title.textContent=(unlocked.has(id)?'✦ ':'◇ ')+info.title;
+      const desc=document.createElement('span');desc.textContent=info.description;
+      const status=document.createElement('div');status.className='account-small';status.textContent=unlocked.has(id)?'UNLOCKED':'LOCKED';
+      card.append(title,desc,status);container.append(card);
+    }
+  }catch(error){setBoxMessage('cloudSaveStatus','Could not refresh achievements: '+error.message,'error');}
+}
+function serializeCloudSave(){
+  if(!player||state.gameOver||state.prologueStage!=='swamp')throw new Error('Start the patrol first, then pause during the on-foot investigation to save.');
+  const stateKeys=['elapsed','missionClock','discovered','rescued','keysFound','witnessInterviewed','witnessTrust','stationStage','stationQueue','stationQueuePosition','stationRetryMode','stationDecisions','stationChecks','stationChats','stationTopics','stationManifestEvents','stationFeedback','stationComplete','stationThreat','stationCorrect','stationProcessed','stationIncidentLogged','stationAuditTrail','extractionStarted','extractionHold','extractionWave1','extractionWave2','extractionWave3','extractionWave4','exploredRoomIds','caseComparisons','pendingTheory','caseTheory','theoryAttempts','interviewStep','interviewAwaitingContinue','interviewChoiceFeedback','missingTimer','missingCount','missingIds','roomItemStates','disappearanceLog','exploredRooms','kills','shots','saves','anchorsDestroyed','anchorsDisabled','trueEnding','soundVoidTotal','huntsTriggered','huntsSurvived','huntKind','radioIncidentCount','radioSilenceUntil','partnerSent','partnerChatCount','personalScareCount','memorialTributeViewed','shoutCount'];
+  const stateData={};
+  for(const key of stateKeys)stateData[key]=state[key];
+  return {version:1,saved_at:new Date().toISOString(),selectedCharacter:state.selectedCharacter,controlMode:state.controlMode,floor:state.floor,roomId:state.room?state.room.id:null,lastBuildingExit:state.lastBuildingExit?{x:state.lastBuildingExit.x,y:state.lastBuildingExit.y}:null,player:{x:player.x,y:player.y,hp:player.hp,stamina,angle:player.angle},inventory:{ammo,reserve,evidence,medkits,batteryCells,flashlightBattery,flashlight},state:stateData,caseRecords:caseRecords.slice(-80).map(r=>({id:r.id,name:r.name,detail:r.detail,analysis:r.analysis,kind:r.kind,studied:!!r.studied})),objects:objects.map(o=>({id:o.id,found:!!o.found,missing:!!o.missing,delivered:!!o.delivered,following:!!o.following})),survivors:survivors.map(s=>({id:s.id,x:s.x,y:s.y,found:!!s.found,following:!!s.following,delivered:!!s.delivered,hp:s.hp})),monster:monster?{x:monster.x,y:monster.y,active:!!monster.active,spotted:!!monster.spotted,phase:monster.phase,stun:monster.stun,attack:monster.attack,hidden:!!monster.hidden,vanishTimer:monster.vanishTimer,vanishCooldown:monster.vanishCooldown,activeTime:monster.activeTime,warpCooldown:monster.warpCooldown}:null,crawlers:crawlers.filter(c=>!c.dead).slice(0,10).map(c=>({x:c.x,y:c.y,hp:c.hp,phase:c.phase,alert:!!c.alert,attack:c.attack,speed:c.speed}))};
+}
+async function saveCloudSlot(){
+  if(!accountProfile){setBoxMessage('cloudSaveStatus','Sign in first to use cloud saves.','error');return;}
+  try{
+    const snapshot=serializeCloudSave();
+    const slot=Number($('cloudSaveSlot').value);
+    const data=await cloudRequest('/api/saves',{method:'POST',body:JSON.stringify({slot,data:snapshot})});
+    setBoxMessage('cloudSaveStatus','Saved slot '+slot+' at '+data.updated_at+'.','good');
+    await refreshCloudSlots();
+  }catch(error){setBoxMessage('cloudSaveStatus',error.message,'error');}
+}
+async function loadCloudSlot(){
+  if(!accountProfile){setBoxMessage('cloudSaveStatus','Sign in first to load a cloud save.','error');return;}
+  const slot=Number($('cloudSaveSlot').value);
+  try{
+    const result=await cloudRequest('/api/saves/'+slot,{method:'GET',headers:{}});
+    if(!result.save||!result.save.data)throw new Error('That slot is empty.');
+    applyCloudSave(result.save.data);
+    toast('CLOUD SAVE LOADED · SLOT '+slot,2.2);
+  }catch(error){setBoxMessage('cloudSaveStatus',error.message,'error');}
+}
+function applyCloudSave(snapshot){
+  if(!snapshot||snapshot.version!==1||!snapshot.player||!snapshot.inventory)throw new Error('This save version is invalid or no longer supported.');
+  const validRooms=new Set(['checkpoint','station','gas','cabin','tower','motel','diner','clinic','depot','church','warehouse','farmhouse']);
+  if(snapshot.selectedCharacter==='hugo'||snapshot.selectedCharacter==='yumi')state.selectedCharacter=snapshot.selectedCharacter;
+  if(snapshot.controlMode==='desktop'||snapshot.controlMode==='mobile')state.controlMode=snapshot.controlMode;
+  resetGame();
+  setPrologueStage('swamp');
+  const savedState=snapshot.state||{};
+  const stateKeys=Object.keys(savedState);
+  for(const key of stateKeys){
+    if(Object.prototype.hasOwnProperty.call(state,key))state[key]=savedState[key];
+  }
+  state.gameOver=false;state.won=false;state.running=true;state.paused=false;state.floor='outside';state.room=null;
+  state.missingIds=Array.isArray(savedState.missingIds)?savedState.missingIds:[];
+  state.roomItemStates=savedState.roomItemStates||{};
+  state.disappearanceLog=Array.isArray(savedState.disappearanceLog)?savedState.disappearanceLog:[];
+  if(snapshot.floor==='inside'&&validRooms.has(snapshot.roomId)){
+    state.floor='inside';
+    state.room=makeRoom(snapshot.roomId);
+  }
+  const basePlayer=snapshot.player;
+  const maxX=state.floor==='inside'&&state.room?state.room.w:WORLD.w;
+  const maxY=state.floor==='inside'&&state.room?state.room.h:WORLD.h;
+  player.x=clamp(Number(basePlayer.x)||100,25,maxX-25);
+  player.y=clamp(Number(basePlayer.y)||100,25,maxY-25);
+  player.hp=clamp(Number(basePlayer.hp)||1,1,player.maxHp);player.stamina=clamp(Number(basePlayer.stamina)||0,0,player.maxStamina);player.angle=Number(basePlayer.angle)||0;player.hidden=false;player.moving=false;
+  health=player.hp;stamina=player.stamina;
+  ammo=clamp(Number(snapshot.inventory.ammo)||0,0,99);reserve=clamp(Number(snapshot.inventory.reserve)||0,0,999);evidence=clamp(Number(snapshot.inventory.evidence)||0,0,999);medkits=clamp(Number(snapshot.inventory.medkits)||0,0,99);batteryCells=clamp(Number(snapshot.inventory.batteryCells)||0,0,99);flashlightBattery=clamp(Number(snapshot.inventory.flashlightBattery)||0,0,100);flashlight=snapshot.inventory.flashlight!==false;
+  caseRecords=Array.isArray(snapshot.caseRecords)?snapshot.caseRecords.filter(r=>r&&typeof r.id==='string'&&typeof r.name==='string').slice(-80):[];
+  const objectStates=new Map((snapshot.objects||[]).map(o=>[o.id,o]));
+  for(const obj of objects){const saved=objectStates.get(obj.id);if(saved){obj.found=!!saved.found;obj.missing=!!saved.missing;obj.delivered=!!saved.delivered;obj.following=!!saved.following;}}
+  const survivorStates=new Map((snapshot.survivors||[]).map(o=>[o.id,o]));
+  for(const survivor of survivors){const saved=survivorStates.get(survivor.id);if(saved){survivor.x=Number(saved.x)||survivor.x;survivor.y=Number(saved.y)||survivor.y;survivor.found=!!saved.found;survivor.following=!!saved.following;survivor.delivered=!!saved.delivered;survivor.hp=Number(saved.hp)||survivor.hp;}}
+  if(snapshot.monster&&monster){Object.assign(monster,snapshot.monster);}
+  if(Array.isArray(snapshot.crawlers))crawlers=snapshot.crawlers.slice(0,10).map(c=>({x:Number(c.x)||100,y:Number(c.y)||100,r:9,hp:Math.max(1,Number(c.hp)||1),speed:Math.max(45,Number(c.speed)||70),phase:Number(c.phase)||0,alert:!!c.alert,attack:Number(c.attack)||0,dead:false,hiddenUntil:0}));
+  state.rescued=survivors.filter(s=>s.found||s.following||s.delivered).length;
+  state.discovered=evidence;
+  state.prologueStage='swamp';state.gameOver=false;state.won=false;state.running=true;state.paused=false;
+  document.body.classList.remove('prologue-mode','prologue-call','prologue-drive','prologue-arrival');document.body.classList.add('game-active');$('hud').style.display='block';
+  camera={x:clamp(player.x-W/2,0,Math.max(0,WORLD.w-W)),y:clamp(player.y-H/2,0,Math.max(0,WORLD.h-H))};
+  lastSafe={x:player.x,y:player.y};lastMiniDraw=-999;lastMiniFloor=null;lastMiniRoom=null;interiorBaseCache={room:null,canvas:null};
+  state.lastFrame=performance.now();setScreen('game');applyControlMode();updateHUD();updateObjectives();updateInventory();resetPartnerChat();
+}
+async function refreshLeaderboard(){
+  const status=$('leaderboardStatus'),list=$('leaderboardList');
+  list.replaceChildren();setBoxMessage('leaderboardStatus','Loading global scores…');
+  try{
+    const data=await cloudRequest('/api/leaderboard',{method:'GET',headers:{}});
+    if(!data.database_available){setBoxMessage('leaderboardStatus',data.message||'Cloud leaderboard requires MongoDB configuration.','error');return;}
+    const entries=data.entries||[];
+    if(!entries.length){setBoxMessage('leaderboardStatus','The leaderboard is empty. Finish a patrol while signed in to record the first score.','good');return;}
+    setBoxMessage('leaderboardStatus','GLOBAL FIELD RECORDS · TOP '+entries.length,'good');
+    entries.forEach((entry,index)=>{
+      const row=document.createElement('div');row.className='leaderboard-row';
+      const rank=document.createElement('span');rank.className='rank';rank.textContent=String(index+1).padStart(2,'0');
+      const name=document.createElement('span');name.className='player-name';name.textContent=entry.display_name||entry.username||'Unknown officer';
+      const score=document.createElement('span');score.className='score';score.textContent=Number(entry.best_score||0).toLocaleString();
+      row.append(rank,name,score);list.append(row);
+    });
+  }catch(error){setBoxMessage('leaderboardStatus',error.message,'error');}
+}
+function offerPrayer(){
+  const words=$('prayerWords').value.trim();
+  $('prayerFeedback').classList.remove('hidden');
+  $('prayerFeedback').textContent=words?'Your words have been offered privately in this session. They were not uploaded or stored. May they bring comfort to Yumi and her family.':'A quiet moment of prayer has been offered. May Yumi and her family find gentleness, strength, and comfort.';
+  $('prayerFeedback').classList.remove('error');$('prayerFeedback').classList.add('good');
+}
+function submitRunResult(success){
+  if(!accountProfile)return;
+  const delivered=survivors.filter(s=>s.delivered).length;
+  const payload={success:!!success,true_ending:!!state.trueEnding,clues:collectedClueCount(),studied:studyCount(),reports:validCrossReferenceCount(),survivors:delivered,anchors:state.anchorsDestroyed.length,kills:state.kills,elapsed:Math.floor(state.elapsed||0)};
+  cloudRequest('/api/run/complete',{method:'POST',body:JSON.stringify(payload)}).then(data=>{
+    if(data.new_achievements&&data.new_achievements.length){toast('ACHIEVEMENT UNLOCKED: '+data.new_achievements.join(', ').toUpperCase(),3.2);}
+  }).catch(()=>{});
+}
+
 function bindEvents(){
   const partnerComposer=$('partnerComposer');
   if(partnerComposer)partnerComposer.addEventListener('submit',e=>{e.preventDefault();sendPartnerChat();});
@@ -7415,11 +7671,22 @@ function bindEvents(){
   });
   $('howBtn').addEventListener('click',()=>setScreen('how'));
   $('creditsBtn').addEventListener('click',()=>setScreen('credits'));
-  $('prayersBtn').addEventListener('click',openPrayerBook);
-  $('openPrayerBook').addEventListener('click',openPrayerBook);
-  $('backPrayers').addEventListener('click',()=>setScreen('menu'));
-  $('prayerForm').addEventListener('submit',submitPrayer);
-  document.querySelectorAll('[data-prayer-template]').forEach(button=>button.addEventListener('click',()=>{const area=$('prayerMessage');area.value=button.dataset.prayerTemplate||'';area.focus({preventScroll:true});$('prayerStatus').textContent='You can edit this prayer before sending it.';}));
+  $('loginBtn').addEventListener('click',()=>openAccount('menu'));
+  $('leaderboardBtn').addEventListener('click',()=>{setScreen('leaderboard');refreshLeaderboard();});
+  $('prayerBtn').addEventListener('click',()=>setScreen('prayer'));
+  $('leaderboardLogin').addEventListener('click',()=>openAccount('menu'));
+  $('refreshLeaderboard').addEventListener('click',refreshLeaderboard);
+  $('backLeaderboard').addEventListener('click',()=>setScreen('menu'));
+  $('backAccount').addEventListener('click',leaveAccountPanel);
+  $('pauseCloud').addEventListener('click',()=>openAccount('pause'));
+  $('accountForm').addEventListener('submit',submitAccountForm);
+  $('authModeToggle').addEventListener('click',()=>setAccountMode(accountMode==='login'?'register':'login'));
+  $('logoutBtn').addEventListener('click',async()=>{try{await cloudRequest('/api/account/logout',{method:'POST',body:'{}'});accountProfile=null;setAccountMode('login');await refreshAccountPanel();}catch(error){setBoxMessage('accountDbStatus',error.message,'error');}});
+  $('cloudSaveSlot').addEventListener('change',refreshCloudSlots);
+  $('saveCloudBtn').addEventListener('click',saveCloudSlot);
+  $('loadCloudBtn').addEventListener('click',loadCloudSlot);
+  $('offerPrayer').addEventListener('click',offerPrayer);
+  $('closePrayer').addEventListener('click',()=>setScreen('menu'));
   $('backCharacter').addEventListener('click',()=>setScreen('menu'));
   $('confirmCharacter').addEventListener('click',()=>{
     state.selectedCharacter=state.pendingCharacter;
@@ -7453,7 +7720,6 @@ function bindEvents(){
     state.options.personalScares=$('enablePersonalScares').checked;
     state.options.voiceWhispers=$('enableVoiceWhispers').checked;
     $('disclaimerPanel').classList.add('hidden');
-    toast(state.options.voiceWhispers?'VOICE WHISPERS ENABLED. THE RADIO MAY LIE.':'VOICE WHISPERS DISABLED.',1.8);
   });
   $('enablePersonalScares').addEventListener('change',e=>state.options.personalScares=e.target.checked);
   $('enableVoiceWhispers').addEventListener('change',e=>state.options.voiceWhispers=e.target.checked);
@@ -7664,87 +7930,197 @@ boot();
 </body>
 </html>'''
 
-def _get_prayer_collection():
-    global _prayer_mongo_client, _prayer_mongo_uri
-    uri = os.environ.get('MONGODB_URI', '').strip()
-    if not uri or MongoClient is None:
-        return None
-    if _prayer_mongo_client is None or _prayer_mongo_uri != uri:
-        if _prayer_mongo_client is not None:
-            try:
-                _prayer_mongo_client.close()
-            except Exception:
-                pass
-        _prayer_mongo_client = MongoClient(uri, serverSelectionTimeoutMS=1800, connectTimeoutMS=1800, appname='FloridaShadows')
-        _prayer_mongo_uri = uri
-    db_name = os.environ.get('MONGODB_DB_NAME', 'florida_shadows').strip() or 'florida_shadows'
-    return _prayer_mongo_client[db_name]['memorial_prayers']
-
-
-def _public_prayer(document):
-    created = document.get('created_at')
-    if hasattr(created, 'isoformat'):
-        created = created.isoformat()
-    return {
-        'name': str(document.get('name') or 'Anonymous')[:32],
-        'message': str(document.get('message') or '')[:600],
-        'created_at': str(created or ''),
-    }
-
-
-@app.get('/api/prayers')
-def list_prayers():
-    try:
-        collection = _get_prayer_collection()
-        if collection is not None:
-            documents = list(collection.find({}, {'_id': 0, 'name': 1, 'message': 1, 'created_at': 1}).sort('created_at', -1).limit(20))
-            return jsonify(ok=True, persistent=True, prayers=[_public_prayer(document) for document in documents])
-    except Exception:
-        pass
-    with _prayer_lock:
-        recent = [_public_prayer(document) for document in _prayer_memory[:20]]
-    return jsonify(ok=True, persistent=False, prayers=recent)
-
-
-@app.post('/api/prayers')
-def submit_prayer_api():
-    data = request.get_json(silent=True) or request.form.to_dict()
-    if not isinstance(data, dict):
-        return jsonify(ok=False, error='Please send a prayer using the form.'), 400
-    if str(data.get('website', '')).strip():
-        return jsonify(ok=True, persistent=False, prayer={'name': 'Anonymous', 'message': '', 'created_at': ''}), 201
-    message = str(data.get('message', '')).strip()
-    name = str(data.get('name', '')).strip()
-    message = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', message)
-    name = re.sub(r'[\x00-\x1f\x7f]', ' ', name)
-    name = re.sub(r'\s+', ' ', name).strip()[:32] or 'Anonymous'
-    if len(message) < 3:
-        return jsonify(ok=False, error='Please write at least three characters so your prayer can be shared.'), 400
-    if len(message) > 600:
-        return jsonify(ok=False, error='Please keep your prayer to 600 characters or fewer.'), 400
-    prayer = {'name': name, 'message': message, 'created_at': datetime.now(timezone.utc)}
-    persistent = False
-    try:
-        collection = _get_prayer_collection()
-        if collection is not None:
-            collection.insert_one(dict(prayer))
-            persistent = True
-    except Exception:
-        persistent = False
-    with _prayer_lock:
-        _prayer_memory.insert(0, dict(prayer))
-        del _prayer_memory[100:]
-    response_prayer = _public_prayer(prayer)
-    return jsonify(ok=True, persistent=persistent, prayer=response_prayer), 201
-
-
 @app.get('/')
 def index():
     return Response(HTML, mimetype='text/html')
 
 @app.get('/health')
 def health():
-    return jsonify(status='ok', game='Florida Shadows: The Living Nightmare', version='The Definitive Nightmare Edition', prayer_storage='mongodb' if os.environ.get('MONGODB_URI') and MongoClient is not None else 'temporary')
+    database = get_db()
+    return jsonify(status='ok', game='Florida Shadows: The Living Nightmare', version='The Definitive Nightmare Edition', database_configured=database is not None)
+
+@app.get('/api/status')
+def api_status():
+    database = get_db()
+    return jsonify(ok=True, database_available=database is not None, database_name=MONGODB_DB if database is not None else None)
+
+@app.get('/api/account/me')
+def api_account_me():
+    database = get_db()
+    if database is None:
+        return jsonify(authenticated=False, database_available=False, message="Cloud accounts are unavailable. Configure MONGODB_URI, MONGODB_DB, and SECRET_KEY in your host environment."), 200
+    user = current_user(database)
+    if not user:
+        return jsonify(authenticated=False, database_available=True)
+    return jsonify(authenticated=True, database_available=True, account=public_user(user))
+
+@app.post('/api/account/register')
+def api_account_register():
+    database = get_db()
+    if database is None:
+        return database_error()
+    body = request.get_json(silent=True) or {}
+    username = str(body.get('username', '')).strip()
+    username_key = username.casefold()
+    password = str(body.get('password', ''))
+    display_name = re.sub(r'\s+', ' ', str(body.get('display_name', '')).strip())[:32] or username
+    if not re.fullmatch(r'[A-Za-z0-9_-]{3,20}', username):
+        return jsonify(ok=False, message='Username must be 3–20 characters using letters, numbers, underscore, or hyphen.'), 400
+    if len(password) < 8 or len(password) > 128:
+        return jsonify(ok=False, message='Password must be between 8 and 128 characters.'), 400
+    if username_key in {'admin', 'administrator', 'support', 'null', 'undefined'}:
+        return jsonify(ok=False, message='That username is reserved. Choose another one.'), 400
+    doc = {'_id': str(uuid.uuid4()), 'username': username, 'username_key': username_key, 'display_name': display_name, 'password_hash': generate_password_hash(password), 'created_at': utc_now(), 'games_played': 0, 'best_score': 0}
+    try:
+        database.users.insert_one(doc)
+    except Exception as error:
+        if isinstance(error, DuplicateKeyError) or 'duplicate key' in str(error).lower():
+            return jsonify(ok=False, message='That username already exists. Try signing in instead.'), 409
+        return jsonify(ok=False, message='Could not create the account. Verify MongoDB is online and try again.'), 503
+    session.clear()
+    session['user_id'] = doc['_id']
+    session.permanent = True
+    return jsonify(ok=True, account=public_user(doc)), 201
+
+@app.post('/api/account/login')
+def api_account_login():
+    database = get_db()
+    if database is None:
+        return database_error()
+    body = request.get_json(silent=True) or {}
+    username = str(body.get('username', '')).strip()
+    password = str(body.get('password', ''))
+    user = database.users.find_one({'username_key': username.casefold()})
+    if not user or not check_password_hash(user.get('password_hash', ''), password):
+        return jsonify(ok=False, message='Username or password is incorrect.'), 401
+    session.clear()
+    session['user_id'] = user['_id']
+    session.permanent = True
+    return jsonify(ok=True, account=public_user(user))
+
+@app.post('/api/account/logout')
+def api_account_logout():
+    session.clear()
+    return jsonify(ok=True)
+
+@app.get('/api/saves')
+def api_saves_list():
+    database = get_db()
+    if database is None:
+        return database_error()
+    user = current_user(database)
+    if not user:
+        return jsonify(ok=False, message='Sign in to view cloud saves.'), 401
+    rows = list(database.saves.find({'user_id': user['_id']}, {'slot': 1, 'updated_at': 1, 'data.state.elapsed': 1, 'data.state.caseTheory': 1, 'data.floor': 1}).sort('slot', ASCENDING))
+    saves = []
+    for row in rows:
+        updated = row.get('updated_at')
+        data = row.get('data') or {}
+        save_state = data.get('state') or {}
+        saves.append({'slot': int(row.get('slot', 1)), 'updated_at': updated.isoformat() if hasattr(updated, 'isoformat') else '', 'description': ('On-foot investigation · '+str(int(save_state.get('elapsed', 0)))+' seconds' if save_state else 'Saved run')})
+    return jsonify(ok=True, saves=saves)
+
+@app.post('/api/saves')
+def api_saves_write():
+    database = get_db()
+    if database is None:
+        return database_error()
+    user = current_user(database)
+    if not user:
+        return jsonify(ok=False, message='Sign in before saving your run.'), 401
+    body = request.get_json(silent=True) or {}
+    try:
+        slot = int(body.get('slot', 0))
+    except (TypeError, ValueError):
+        slot = 0
+    data = body.get('data')
+    if slot not in (1, 2, 3):
+        return jsonify(ok=False, message='Choose save slot 1, 2, or 3.'), 400
+    if not isinstance(data, dict) or data.get('version') != 1:
+        return jsonify(ok=False, message='The save data format is invalid.'), 400
+    try:
+        serialized = json.dumps(data, separators=(',', ':'), ensure_ascii=False)
+    except (TypeError, ValueError):
+        return jsonify(ok=False, message='The save contains unsupported data.'), 400
+    if len(serialized.encode('utf-8')) > 120_000:
+        return jsonify(ok=False, message='This save is too large. Close extra case files and try again.'), 413
+    now = utc_now()
+    database.saves.update_one({'user_id': user['_id'], 'slot': slot}, {'$set': {'user_id': user['_id'], 'slot': slot, 'data': data, 'updated_at': now}}, upsert=True)
+    return jsonify(ok=True, slot=slot, updated_at=now.isoformat())
+
+@app.get('/api/saves/<int:slot>')
+def api_saves_load(slot):
+    database = get_db()
+    if database is None:
+        return database_error()
+    user = current_user(database)
+    if not user:
+        return jsonify(ok=False, message='Sign in before loading cloud saves.'), 401
+    if slot not in (1, 2, 3):
+        return jsonify(ok=False, message='Choose save slot 1, 2, or 3.'), 400
+    row = database.saves.find_one({'user_id': user['_id'], 'slot': slot})
+    if not row:
+        return jsonify(ok=False, message='That save slot is empty.'), 404
+    return jsonify(ok=True, save={'slot': slot, 'updated_at': row.get('updated_at').isoformat() if hasattr(row.get('updated_at'), 'isoformat') else '', 'data': row.get('data', {})})
+
+@app.get('/api/leaderboard')
+def api_leaderboard():
+    database = get_db()
+    if database is None:
+        message = 'Cloud leaderboard is not available. Configure MONGODB_URI, MONGODB_DB, and SECRET_KEY in the host environment.'
+        return jsonify(ok=True, database_available=False, message=message, entries=[])
+    try:
+        rows = list(database.leaderboard.find({}, {'username': 1, 'display_name': 1, 'best_score': 1, 'games_played': 1}).sort([('best_score', DESCENDING), ('display_name', ASCENDING)]).limit(25))
+        entries = [{'username': row.get('username', ''), 'display_name': row.get('display_name') or row.get('username', 'Officer'), 'best_score': int(row.get('best_score', 0) or 0), 'games_played': int(row.get('games_played', 0) or 0)} for row in rows]
+        return jsonify(ok=True, database_available=True, entries=entries)
+    except Exception:
+        return jsonify(ok=True, database_available=False, message='Leaderboard is temporarily unavailable.', entries=[])
+
+@app.get('/api/achievements')
+def api_achievements():
+    database = get_db()
+    if database is None:
+        return database_error()
+    user = current_user(database)
+    if not user:
+        return jsonify(ok=False, message='Sign in to view achievements.'), 401
+    unlocked = list(database.achievements.find({'user_id': user['_id']}, {'achievement_id': 1, 'unlocked_at': 1}))
+    return jsonify(ok=True, catalog=[{'id': key, **value} for key, value in ACHIEVEMENT_CATALOG.items()], unlocked=[{'achievement_id': row.get('achievement_id'), 'unlocked_at': row.get('unlocked_at').isoformat() if hasattr(row.get('unlocked_at'), 'isoformat') else ''} for row in unlocked])
+
+@app.post('/api/run/complete')
+def api_run_complete():
+    database = get_db()
+    if database is None:
+        return database_error()
+    user = current_user(database)
+    if not user:
+        return jsonify(ok=False, message='Sign in before recording leaderboard scores.'), 401
+    body = request.get_json(silent=True) or {}
+    success = bool(body.get('success'))
+    true_ending = bool(body.get('true_ending'))
+    def safe_int(key, low=0, high=10000):
+        try:
+            return max(low, min(high, int(body.get(key, 0))))
+        except (TypeError, ValueError):
+            return 0
+    clues=safe_int('clues',0,100); studied=safe_int('studied',0,100); reports=safe_int('reports',0,100); rescued=safe_int('survivors',0,2); anchors=safe_int('anchors',0,3); kills=safe_int('kills',0,500); elapsed=safe_int('elapsed',0,86400)
+    score=max(0, clues*55 + studied*85 + reports*125 + rescued*300 + anchors*180 + min(kills,100)*8 + (900 if success else 0) + (600 if true_ending else 0) - int(elapsed*.15))
+    now=utc_now()
+    database.users.update_one({'_id':user['_id']},{'$inc':{'games_played':1},'$max':{'best_score':score},'$set':{'last_played':now}})
+    database.leaderboard.update_one({'user_id':user['_id']},{'$set':{'user_id':user['_id'],'username':user.get('username','Officer'),'display_name':user.get('display_name') or user.get('username','Officer'),'best_score':max(score,int(user.get('best_score',0) or 0)),'last_score':score,'updated_at':now},'$inc':{'games_played':1}},upsert=True)
+    earned=[]
+    candidates=[]
+    candidates.append('first_case')
+    if success:candidates.append('first_escape')
+    if success and studied>=6 and reports>=4:candidates.append('forensic_mind')
+    if success and true_ending and anchors>=3:candidates.append('signal_breaker')
+    if success and rescued>=2:candidates.append('rescuer')
+    for achievement_id in candidates:
+        catalog=ACHIEVEMENT_CATALOG.get(achievement_id)
+        if not catalog:continue
+        result=database.achievements.update_one({'user_id':user['_id'],'achievement_id':achievement_id},{'$setOnInsert':{'user_id':user['_id'],'achievement_id':achievement_id,'title':catalog['title'],'unlocked_at':now}},upsert=True)
+        if result.upserted_id is not None:earned.append(catalog['title'])
+    return jsonify(ok=True,score=score,new_achievements=earned)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '5000'))
