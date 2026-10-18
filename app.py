@@ -1,19 +1,7 @@
-from flask import Flask, Response, jsonify, request, session
-from werkzeug.security import generate_password_hash, check_password_hash
-import os, re, time, uuid, secrets, threading
-from datetime import datetime, timezone
-try:
-    from pymongo import MongoClient, DESCENDING
-except Exception:
-    MongoClient = None
-    DESCENDING = -1
+from flask import Flask, Response, jsonify
+import os
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('FLASK_SECRET_KEY') or os.environ.get('SECRET_KEY') or secrets.token_hex(32)
-app.config['MAX_CONTENT_LENGTH'] = 350_000
-app.config['SESSION_COOKIE_HTTPONLY'] = True
-app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
-app.config['SESSION_COOKIE_SECURE'] = os.environ.get('SESSION_COOKIE_SECURE', 'false').lower() == 'true' 
 
 HTML = r'''<!doctype html>
 <html lang="en">
@@ -1249,43 +1237,8 @@ body.hunting #survivorLocator{opacity:0}
 @keyframes realityPulse{0%{opacity:.17;clip-path:inset(0 0 90% 0)}25%{opacity:.55;clip-path:inset(26% 0 62% 0)}50%{opacity:.12;clip-path:inset(58% 0 28% 0)}75%{opacity:.44;clip-path:inset(84% 0 8% 0)}100%{opacity:.2;clip-path:inset(10% 0 80% 0)}}
 @media(max-width:650px){#huntBanner{top:8px;font-size:9px;padding:8px 9px;max-width:94vw}#huntBanner small{font-size:8px}.radio-breach-choices{grid-template-columns:1fr}.radio-breach-choices button{min-height:56px}}
 
-
-#partnerChat,#driveLaneHUD,.station-compose{display:none!important}
-.community-panel{width:min(1040px,97vw);max-height:95vh;overflow:auto;border-color:#827554;background:linear-gradient(150deg,#101811,#030504 70%)}
-.community-tabs{display:flex;gap:8px;flex-wrap:wrap;margin:15px 0;border-bottom:1px solid #4c5845;padding-bottom:9px}
-.community-tabs button{flex:1;min-width:145px;border-color:#465343;background:#090e0a;color:#b7c5b5}
-.community-tabs button.active{border-color:#c9b783;color:#f1dfb4;background:linear-gradient(#343326,#151911);box-shadow:0 0 14px #d4bc8018}
-.community-help{font-size:11px;line-height:1.75;color:#aeb9a7;max-width:80ch}
-.prayer-form{display:grid;grid-template-columns:minmax(150px,.42fr) minmax(0,1fr);gap:9px;margin:14px 0 10px;padding:12px;background:#080d09;border:1px solid #354435}
-.prayer-form input,.prayer-form textarea,.account-form input{width:100%;min-width:0;padding:10px 11px;background:#0f1711;border:1px solid #455541;color:#eee8d6;text-transform:none;letter-spacing:0;user-select:text;-webkit-user-select:text}
-.prayer-form textarea{grid-column:1/-1;min-height:86px;resize:vertical;line-height:1.55}
-.prayer-form button{grid-column:1/-1}
-.community-status{padding:8px 10px;margin:8px 0;background:#080d09;border:1px solid #384536;color:#c3c7b4;font-size:10px;line-height:1.6}
-.prayer-wall{display:grid;gap:8px;max-height:35vh;overflow:auto;margin-top:10px;padding-right:4px}
-.prayer-card{padding:12px;border:1px solid #3d493a;border-left:3px solid #b8a576;background:linear-gradient(100deg,#121912,#080b08);overflow-wrap:anywhere}
-.prayer-card-head{display:flex;justify-content:space-between;gap:10px;align-items:baseline;color:#e0d2ac;font-size:10px;letter-spacing:.5px}
-.prayer-card-date{color:#778471;font-size:9px;text-align:right}
-.prayer-card-text{margin-top:7px;white-space:pre-wrap;line-height:1.75;color:#d0d6c8;font-size:12px;overflow-wrap:anywhere}
-.community-empty{padding:18px;border:1px dashed #46513f;color:#9da996;text-align:center;font-size:11px;line-height:1.7}
-.leaderboard-list{display:grid;gap:7px;margin-top:12px;max-height:49vh;overflow:auto}
-.leaderboard-row{display:grid;grid-template-columns:42px minmax(0,1fr) auto;align-items:center;gap:10px;padding:10px;border:1px solid #394637;background:#090e0a}
-.leaderboard-rank{display:grid;place-items:center;width:32px;height:32px;border:1px solid #665a3e;color:#e7d3a3;font-size:12px;font-weight:bold}
-.leaderboard-name{color:#e4e6d7;font-size:11px;font-weight:bold;overflow-wrap:anywhere}
-.leaderboard-detail{margin-top:4px;color:#879582;font-size:9px;line-height:1.5}
-.leaderboard-score{text-align:right;color:#dbca98;font-size:13px;font-weight:bold;white-space:nowrap}
-.leaderboard-result{font-size:8px;letter-spacing:1px;margin-top:3px;color:#a9bf99}
-.account-panel{width:min(720px,96vw);max-height:94vh;overflow:auto}
-.account-form{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin:14px 0}
-.account-form input{font-size:12px}
-.account-actions{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
-.account-actions button{flex:1;min-width:130px}
-.achievement-list{display:grid;gap:7px;margin-top:10px}
-.achievement-item{padding:9px 11px;background:#090e0a;border:1px solid #354334;color:#d8d9c9;font-size:10px;line-height:1.5}
-.achievement-item strong{display:block;color:#dfc994;margin-bottom:3px}
-.cloud-save-note{font-size:10px;color:#96a48e;line-height:1.65;margin-top:9px}
-.ending-community{margin-top:16px;padding-top:13px;border-top:1px solid #465142}
-@media(max-width:650px){.prayer-form{grid-template-columns:1fr}.prayer-form textarea,.prayer-form button{grid-column:auto}.leaderboard-row{grid-template-columns:34px minmax(0,1fr) auto;gap:7px}.leaderboard-rank{width:28px;height:28px}.account-form{grid-template-columns:1fr}.prayer-card-head{align-items:flex-start;flex-direction:column;gap:3px}.prayer-card-date{text-align:left}}
-
+#partnerChat { display:none !important; visibility:hidden !important; pointer-events:none !important; }
+#driveLaneHUD { display:none !important; }
 </style>
 </head>
 <body>
@@ -1329,7 +1282,8 @@ body.hunting #survivorLocator{opacity:0}
     <button id="hideAction" type="button" title="Hide in nearby cover (C)">C · HIDE</button>
     <button id="screamAction" type="button" title="Scream to stagger nearby enemies but attract the Smiler (G)">G · SCREAM</button>
     <button id="helpAction" type="button" title="Request a short radio assist (H)">H · HELP</button>
-    <span id="survivalStatus">RUN · HIDE · SCREAM · ASK FOR HELP</span>
+    <button id="bodycamAction" type="button" title="Use a limited bodycam burst (V) to capture hidden movement; the flash attracts attention">V · CAM 3</button>
+    <span id="survivalStatus">RUN · HIDE · SCREAM · BODYCAM · HELP</span>
   </div>
   <div id="bottom">
     <div class="hudbox">
@@ -1359,6 +1313,7 @@ body.hunting #survivorLocator{opacity:0}
     <button id="touchReload">RELOAD</button>
     <button id="touchRun">SPRINT</button>
     <button id="touchBag">BAG</button>
+    <button id="touchBodycam">CAM</button>
   </div>
 </div>
 <div id="toast"></div>
@@ -1394,9 +1349,6 @@ body.hunting #survivorLocator{opacity:0}
           <button id="controlsBtn">Control mode</button>
           <button id="howBtn">How to play</button>
           <button id="creditsBtn">Credits</button>
-          <button id="communityBtn">Prayer Wall</button>
-          <button id="leaderboardBtn">Leaderboard</button>
-          <button id="accountBtn">Account / Cloud Save</button>
           <button id="disclaimerBtn">Horror & privacy disclaimer</button>
         </div>
         <section class="memorial-home" aria-label="In loving memory of Yumi's grandfather">
@@ -1404,8 +1356,6 @@ body.hunting #survivorLocator{opacity:0}
           <div class="memorial-icons" aria-label="His loves"><span>✈ PLANES</span><span>▰ CARS</span><span>▣ PHOTOGRAPHY</span></div>
           <p>He was a great man who lived a long, full life. His passing came suddenly in the early morning, but the things he loved and the memories he leaves behind will continue to matter. May the journeys he admired, the photographs he treasured, and the stories he shared bring comfort to everyone who loves him.</p>
           <span class="memorial-signoff">With heartfelt sympathy to Yumi and her family. May he rest in peace.</span>
-          <p>To Yumi: you do not have to be brave every minute. You are allowed to grieve, rest, cry, remember, and smile when a good memory finds you. The kindness and creativity you share with others still matter on the days when you have little to give.</p>
-          <span class="memorial-signoff">A community prayer wall is available before and after the story. Leave a prayer or read the kind words others have shared.</span>
         </section>
         <div class="pc-hint">THE SEVENTH ARRIVAL · SCREAM JAM 2026 · HEADPHONES RECOMMENDED</div>
       </div>
@@ -1414,52 +1364,6 @@ body.hunting #survivorLocator{opacity:0}
         <div class="info-card"><b>INCIDENT REPORT / 02:17 AM</b><br>Last transmission: “It's standing between the trees.”<br><span class="danger">UNIT 14 — SIGNAL LOST</span></div>
       </div>
     </div>
-  </div>
-</div>
-<div id="communityPanel" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="communityTitle">
-  <div class="panel community-panel">
-    <div class="kicker">The community remembers</div>
-    <h2 id="communityTitle" class="section-title">Prayer Wall & Leaderboard</h2>
-    <p class="community-help">Share a kind prayer for Yumi, her family, and her lolo, or read messages left by other players. Please be respectful and do not post addresses, phone numbers, passwords, or other private information. Prayers are displayed as plain text.</p>
-    <div class="community-tabs" role="tablist" aria-label="Community board tabs">
-      <button type="button" class="active" data-community-tab="prayers" role="tab" aria-selected="true">PRAYER WALL</button>
-      <button type="button" data-community-tab="leaderboard" role="tab" aria-selected="false">LEADERBOARD</button>
-    </div>
-    <section id="prayersTab" role="tabpanel">
-      <form id="prayerForm" class="prayer-form" autocomplete="off">
-        <input id="prayerName" maxlength="30" placeholder="Display name (optional)" aria-label="Display name or anonymous">
-        <div class="community-help">Your prayer can be public and supportive. You may remain anonymous.</div>
-        <textarea id="prayerText" maxlength="600" required placeholder="Write a prayer or a few kind words for Yumi and her family…" aria-label="Write a prayer"></textarea>
-        <button id="submitPrayer" type="submit">SEND PRAYER</button>
-      </form>
-      <div id="prayerStatus" class="community-status" aria-live="polite">Loading prayers…</div>
-      <div id="prayerWall" class="prayer-wall" aria-live="polite"><div class="community-empty">Connecting to the prayer wall…</div></div>
-    </section>
-    <section id="leaderboardTab" class="hidden" role="tabpanel">
-      <div class="community-status">Top field scores. Completing the case, rescuing survivors, studying clues, and disabling signal anchors increases your score. Sign in before a patrol to associate scores and achievements with your account.</div>
-      <div id="leaderboardStatus" class="community-status" aria-live="polite">Loading leaderboard…</div>
-      <div id="leaderboardList" class="leaderboard-list"><div class="community-empty">Loading field records…</div></div>
-      <h3 class="section-title" style="font-size:18px;margin-top:20px">Account achievements</h3>
-      <div id="communityAchievements" class="achievement-list"><div class="community-empty">Sign in to view saved achievements.</div></div>
-    </section>
-    <div class="page-buttons"><button type="button" id="refreshCommunity">Refresh</button><button type="button" id="closeCommunity">Return</button></div>
-  </div>
-</div>
-<div id="accountPanel" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="accountTitle">
-  <div class="panel account-panel">
-    <div class="kicker">Optional persistent profile</div>
-    <h2 id="accountTitle" class="section-title">Account & Cloud Save</h2>
-    <p class="community-help">Accounts, saves, leaderboards, and achievements use MongoDB when <code>MONGODB_URI</code> is configured on the server. Without it, community boards use temporary memory and account/saves will not survive a server restart. The game remains playable either way.</p>
-    <form id="accountForm" class="account-form" autocomplete="on">
-      <input id="accountUsername" maxlength="24" minlength="3" placeholder="Username (3–24 characters)" aria-label="Username" autocomplete="username" required>
-      <input id="accountPassword" maxlength="128" type="password" placeholder="Password (at least 8 characters)" aria-label="Password" autocomplete="current-password" required>
-    </form>
-    <div class="account-actions"><button id="registerAccount" type="button">Create account</button><button id="loginAccount" type="button">Sign in</button><button id="logoutAccount" type="button">Sign out</button></div>
-    <div id="accountStatus" class="community-status" aria-live="polite">You can play without an account. Sign in to keep cloud saves and achievements.</div>
-    <div class="account-actions"><button id="loadCloudSave" type="button">Continue saved patrol</button><button id="refreshAchievements" type="button">Refresh achievements</button></div>
-    <div id="accountAchievements" class="achievement-list"><div class="community-empty">No account loaded.</div></div>
-    <p class="cloud-save-note">Cloud checkpoint saving is available from the pause menu after signing in before your patrol. Passwords are never stored in plain text; the server stores a password hash. Use a unique password.</p>
-    <div class="page-buttons"><button id="closeAccount" type="button">Return</button></div>
   </div>
 </div>
 <div id="characterPanel" class="overlay hidden">
@@ -1482,8 +1386,8 @@ body.hunting #survivorLocator{opacity:0}
     <p class="intro">Choose the controls that match your device. You can switch this later from the main menu.</p>
     <div class="choice-row"><button id="desktopMode" class="selected">Desktop / Laptop</button><button id="mobileMode">Mobile / Touchscreen</button></div>
     <div class="two-col">
-      <div class="info-card"><b>DESKTOP</b><br>WASD or arrows to move<br>Shift to sprint<br>E to investigate<br>F to toggle flashlight<br>C to hide in nearby cover<br>G to scream: stagger threats, attract Smiler<br>H to request partner radio pulse<br>R reload · Space/left-click fire<br>J case file · I inventory · Esc pause</div>
-      <div class="info-card"><b>MOBILE</b><br>Use the directional pad to move<br>Tap SEARCH to investigate<br>Tap FIRE to shoot<br>Tap LIGHT to use the flashlight<br>Tap SPRINT to run<br>Tap HIDE / SCREAM / HELP on the survival panel<br>Tap BAG for inventory<br>Touch buttons stay visible during play</div>
+      <div class="info-card"><b>DESKTOP</b><br>WASD or arrows to move<br>Shift to sprint<br>E to investigate<br>F to toggle flashlight<br>C to hide in nearby cover<br>G to scream: stagger threats, attract Smiler<br>H to request partner radio pulse<br>V to use one of 3 bodycam bursts (reveals hidden movement but attracts the Smiler)<br>R reload · Space/left-click fire<br>J case file · I inventory · Esc pause</div>
+      <div class="info-card"><b>MOBILE</b><br>Use the directional pad to move<br>Tap SEARCH to investigate<br>Tap FIRE to shoot<br>Tap LIGHT to use the flashlight<br>Tap SPRINT to run<br>Tap HIDE / SCREAM / HELP on the survival panel<br>Tap BAG for inventory<br>Tap CAM for a limited bodycam reveal<br>Touch buttons stay visible during play</div>
     </div>
     <div class="page-buttons"><button id="saveControls">Save control mode</button><button id="backControls">Back to menu</button></div>
   </div>
@@ -1500,7 +1404,7 @@ body.hunting #survivorLocator{opacity:0}
       <div class="rule"><b>04B / SCREEN VISITORS</b>Inside the County Police Station, inspect six visitor IDs, question each one, cross-check the official roster, and make at least five correct admit/detain decisions. Review flagged files after studying four clues.</div>
       <div class="rule"><b>05 / RESCUE</b>Find both missing people. They follow after you help them, and their footsteps attract attention.</div>
       <div class="rule"><b>06 / STAY ALIVE</b>The Smiler learns your habits. Sprinting and constant light make it predict your route. During a hunt, hide only briefly, then break line of sight. A false dispatch may offer a tempting green signal.</div>
-      <div class="rule"><b>07 / RUN, HIDE, SCREAM</b>Use C near cover to hide and stay still. G makes a loud scream that can stagger nearby enemies but attracts the Smiler. The Smiler can begin five marked hunt phases; survive by sprinting in bursts, hiding briefly, and using buildings to break sight. H requests a short radio pulse that marks nearby threats, stuns crawlers briefly, and restores a little flashlight battery.</div>
+      <div class="rule"><b>07 / RUN, HIDE, SCREAM, SNAP</b>Use C near cover to hide and stay still. G makes a loud scream that can stagger nearby crawlers but attracts the Smiler. H requests a short radio pulse. V uses one of three bodycam bursts: it briefly exposes movement in the darkness, but the flash and recording tone attract the Smiler.</div>
       <div class="rule"><b>08 / BREAK THE SIGNAL</b>Optional: destroy the black signal seals in the County Police Station, Pine Rest Motel, and St. Mercy Chapel. They weaken the mimic network and unlock a true-ending variation.</div>
       <div class="rule"><b>09 / SEARCH BUILDINGS</b>Press E at doors. Search five different buildings, and check rooms again: items may vanish when you look away. Important mission keys remain recoverable.</div>
       <div class="rule"><b>10 / ESCAPE</b>Rescue both survivors, recover and study six clues, generate four distinct cross-reference reports, defend the theory, recover the relay override key, search five buildings, save Silas Venn’s statement, then survive the 30-second extraction defense.</div>
@@ -1519,8 +1423,6 @@ body.hunting #survivorLocator{opacity:0}
       <div><b>FLORIDA SHADOWS</b><span>STATE TROOPER HORROR FILES</span><small>Pixel horror project · Scream Jam 2026</small></div>
     </div>
     <div class="credits-lines"><b>WITH APPRECIATION TO</b><br><strong class="credit-name">Mayumi Alingarog</strong><br><span class="credit-alias">Also known as Yumi, Mimi, and Yumimi</span><p>To Mayumi Alingarog, my classmate and fellow developer: thank you for being such a helpful, kind, and respectful person. Your support, encouragement, and willingness to share this creative journey mean a lot. Your kindness makes collaboration better, and I am grateful to have you as a classmate and fellow developer.</p><p>This project is a little more special because of the people who offer encouragement along the way. Thank you for being one of them.</p></div>
-    <div class="credits-lines"><b>IN LOVING MEMORY OF YUMI’S GRANDFATHER</b><br><span class="credit-alias">October 16, 2026 · May he rest in peace</span><p>For a great man who lived a long life and loved planes, cars, and photographs. May the journeys he admired, the moments he preserved, and the memories his family carries bring comfort through the suddenness of goodbye. May God welcome him into peace and surround Yumi and her family with strength, patience, and gentle reminders of the love they shared.</p><p><b>A prayer for Yumi and her lolo:</b> Loving God, hold Yumi and her family close as they grieve. Give them rest when they are exhausted, comfort when the loss feels sudden again, and people who will listen without asking them to hurry through sadness. Bless her grandfather’s memory and let the good years of his life remain a light in their hearts. Amen.</p></div>
-    <div class="credits-lines"><b>FOR YUMI</b><br>Mayumi Alingarog, thank you for inspiring this project and for the kindness you bring to the people around you. You do not have to be okay all the time, and you do not have to carry grief alone. Your creativity, friendship, and care matter beyond this game. May you find room to cry, to rest, to remember, and one day to smile at the memories without feeling that you have left him behind.</div>
     <div class="credits-lines"><b>TO EVERYONE WHO PLAYS</b><br>Thank you for stepping into the swamp, investigating the case, and helping bring this horror story to life. Keep exploring, keep creating, and never ignore strange sounds on the radio.</div>
     <div class="info-card credits-quote">“Every mystery leaves a trace. Every crime leaves a shadow. And some shadows are always watching.”</div>
     <div class="page-buttons"><button id="backCredits">Return to menu</button></div>
@@ -1539,11 +1441,10 @@ body.hunting #survivorLocator{opacity:0}
       <p>Dedicated to Yumi’s grandfather, who passed away suddenly in the early morning of October 16, 2026.</p>
       <p>He loved planes, cars, and photographs—the journeys they represented, the details worth noticing, and the moments worth keeping. He lived a long life and was a great man. A sudden goodbye cannot take away the years he lived, the memories he made, or the love that remains.</p>
       <p>May every photograph bring back a story, every passing plane remind those who loved him of the wonder he saw in the world, and every memory make the loss a little gentler with time. May he rest in peace.</p>
-      <p><b>A prayer for Yumi’s lolo:</b> God of mercy, welcome him into peace. Give thanks for the long life he lived, for the people he loved, for the journeys he watched, the cars he admired, and the photographs that kept precious moments alive. Comfort Yumi and her family in the suddenness of their loss. When grief arrives unexpectedly, give them patience with one another, strength for the difficult hours, and gentle memories that help them breathe again. Amen.</p>
-      <p><b>For Yumi:</b> You do not need to turn sadness into productivity or pretend you are okay for everyone else. Take the time you need. The care you have shown, the creativity you shared, and the inspiration you gave this project remain part of what you leave in the world.</p>
-      <p class="memorial-note">The Smiler may speak softly near this memorial: “How’s life, Officer Yumi? I heard about your lolo. I offer my condolences.” These lines are subdued story dialogue, not a jumpscare and never a joke about his passing.</p>
+      <p><b>A prayer for her lolo:</b> God of mercy, welcome him into peace and hold his family close as they grieve. Give Yumi patience with the difficult mornings, comfort when memories arrive unexpectedly, and people who will listen when words are hard to find. Let the love he gave remain a light she can carry. Amen.</p>
+      <p><b>For Yumi:</b> You do not have to be strong every minute. You are allowed to miss him, to cry, to laugh at a memory, and to take things one day at a time. The care and inspiration you have given other people still matter, even on days when your own heart feels heavy.</p>
     </div>
-    <p class="memorial-note">This is a quiet tribute offered with respect and sympathy to Yumi and her family. It is not evidence in the case, and nothing here is meant to turn their loss into a scare. Players can leave a prayer on the community wall before starting or after finishing the case.</p>
+    <p class="memorial-note">This is a quiet tribute offered with respect and sympathy to Yumi and her family. It is not evidence in the case, and nothing here is meant to turn their loss into a scare. The Smiler’s condolence line happens only after you leave this memorial; the tribute itself stays peaceful.</p>
     <div class="page-buttons"><button id="closeMemorial">Leave the memory in peace</button></div>
   </div>
 </div>
@@ -1687,7 +1588,7 @@ Awaiting database query.</div>
     <div class="kicker">Patrol interrupted</div>
     <h2 class="section-title">Paused</h2>
     <p class="intro">The swamp is still there when you return.</p>
-    <div class="page-buttons"><button id="resume">Resume patrol</button><button id="pauseObjectives">Case file</button><button id="saveCheckpoint">Save cloud checkpoint</button><button id="pauseMenu">Abandon patrol</button></div>
+    <div class="page-buttons"><button id="resume">Resume patrol</button><button id="pauseObjectives">Case file</button><button id="pauseMenu">Abandon patrol</button></div>
   </div>
 </div>
 
@@ -1717,11 +1618,6 @@ PARTNER: “Why did you let me in?”</div>
     <h2 id="endingTitle" class="section-title">Case closed</h2>
     <p id="endingText" class="intro"></p>
     <div id="endingStats" class="info-card"></div>
-    <div class="ending-community">
-      <div class="kicker">After the incident report</div>
-      <p class="community-help">Read the same community prayer wall and leaderboard shown before the patrol. New prayers remain available after either victory or defeat.</p>
-      <div class="page-buttons"><button id="endingPrayers">Prayer Wall</button><button id="endingLeaderboard">Leaderboard</button><button id="endingAccount">Account / Achievements</button></div>
-    </div>
     <div class="page-buttons"><button id="again">Start another patrol</button><button id="toMenu">Main menu</button></div>
   </div>
 </div>
@@ -1905,16 +1801,14 @@ const state={
   realityPulseCount:0,
   lastRealityRoom:'',
   memorialTributeViewed:false,
-  tombstoneVisited:false,
-  loloWhisperOne:false,
-  loloWhisperTwo:false,
-  resultSubmitted:false,
-  runId:''
+  memorialViewedAt:0,
+  bodycamCharges:3,
+  bodycamCooldown:0,
+  bodycamRevealTimer:0,
+  bodycamFlashTimer:0,
+  bodycamTarget:null,
+  bodycamCount:0
 };
-let communityReturnScreen='menu';
-let accountReturnScreen='menu';
-let sessionAccount=null;
-let loopGeneration=0;
 let W=innerWidth;
 let H=innerHeight;
 let dpr=1;
@@ -2016,14 +1910,12 @@ function setScreen(name){
     ending:'endingPanel',
     radio:'radioPanel',
     interview:'interviewPanel',
-    stationIntake:'stationIntakePanel',
-    community:'communityPanel',
-    account:'accountPanel'
+    stationIntake:'stationIntakePanel'
   };
   for(const id of Object.values(mapping))$(id).classList.add('hidden');
   const suspectZoom=$('suspectZoomPanel');if(suspectZoom)suspectZoom.classList.add('hidden');
   if(mapping[name])$(mapping[name]).classList.remove('hidden');
-  if(name==='menu'||name==='character'||name==='controls'||name==='how'||name==='credits'||name==='community'||name==='account'){
+  if(name==='menu'||name==='character'||name==='controls'||name==='how'||name==='credits'){
     state.running=false;
     document.body.classList.remove('game-active');
   }
@@ -2473,13 +2365,13 @@ function makeObjects(){
     {id:'clinic',x:1210,y:445,type:'building',name:'County Clinic',detail:'The emergency lights are on. Nobody answers the door.',room:'clinic',w:184,h:142,style:'clinic'},
     {id:'depot',x:2700,y:1080,type:'building',name:'Road Maintenance Depot',detail:'A maintenance depot with a broken gate and abandoned tools.',room:'depot',w:196,h:150,style:'depot'},
     {id:'church',x:2180,y:1870,type:'building',name:'St. Mercy Chapel',detail:'Candles glow inside although the power is gone.',room:'church',w:174,h:160,style:'chapel'},
-    {id:'lolo-tombstone',x:2345,y:2030,type:'tombstone',name:'A small memorial stone',detail:'A quiet in-game tribute to Yumi’s grandfather. The inscription honours his long life and his love of planes, cars, and photographs. Press E to leave a moment of remembrance.',icon:'✦'},
     {id:'warehouse',x:1370,y:2110,type:'building',name:'Flood Control Warehouse',detail:'The warehouse doors are chained from the inside.',room:'warehouse',w:210,h:158,style:'warehouse'},
     {id:'farmhouse',x:2820,y:1570,type:'building',name:'Cypress Farmhouse',detail:'A farmhouse with a light moving behind its upstairs window.',room:'farmhouse',w:182,h:146,style:'farmhouse'},
     {id:'medkit1',x:500,y:430,type:'loot',name:'First-aid pouch',loot:'medkit',found:false,icon:'+'},
     {id:'ammo1',x:1010,y:805,type:'loot',name:'Ammunition box',loot:'ammo',found:false,icon:'▪'},
     {id:'battery1',x:1525,y:520,type:'loot',name:'Flashlight batteries',loot:'battery',found:false,icon:'ϟ'},
     {id:'ammo2',x:2225,y:1590,type:'loot',name:'Emergency ammo pouch',loot:'ammo',found:false,icon:'▪'},
+    {id:'grandfather-tombstone',x:2325,y:1985,type:'memorialStone',name:'A quiet remembrance stone',detail:'A peaceful memorial for Yumi’s grandfather. Planes, cars, and photographs are carved into its base. This is a place for remembrance, not evidence.',icon:'✦'},
     {id:'exit',x:2920,y:2300,type:'exit',name:'Emergency extraction beacon',detail:'A portable emergency beacon awaits a completed case file and the relay override key.',icon:'✦'}
   ];
   survivors=[
@@ -2627,12 +2519,14 @@ function resetGame(){
   bullets=[];
   particles=[];
   crawlers=[];
-  for(let i=0;i<1;i++){
-    crawlers.push({x:850+i*780,y:600+(i%2)*790,r:9,hp:2,speed:66+Math.random()*10,phase:Math.random()*8,alert:false,attack:0,dead:false,hiddenUntil:18});
+  for(let i=0;i<2;i++){
+    crawlers.push({x:760+i*760,y:420+(i%2)*620,r:9,hp:2,speed:70+Math.random()*12,phase:Math.random()*8,alert:false,attack:0,dead:false,hiddenUntil:18});
   }
   monster={x:2800,y:2080,r:15,stun:0,phase:0,active:false,spotted:false,attack:0,lastMove:0,warpCooldown:0,hidden:false,vanishTimer:0,vanishCooldown:4.5+Math.random()*3.4,activeTime:0,pendingX:0,pendingY:0,reappearGlow:0,blinkCount:0};
   makeObjects();
   state.elapsed=0;
+  state.memorialTributeViewed=false;state.memorialViewedAt=0;
+  state.bodycamCharges=3;state.bodycamCooldown=0;state.bodycamRevealTimer=0;state.bodycamFlashTimer=0;state.bodycamTarget=null;state.bodycamCount=0;
   state.missionClock=137;
   state.toastTimer=0;
   state.radioTimer=0;
@@ -2648,8 +2542,6 @@ function resetGame(){
   state.apparitionX=0;
   state.apparitionY=0;
   state.horrorEventFlags={};
-  state.memorialTributeViewed=false;state.tombstoneVisited=false;state.loloWhisperOne=false;state.loloWhisperTwo=false;state.resultSubmitted=false;
-  state.runId=(typeof crypto!=='undefined'&&crypto.randomUUID)?crypto.randomUUID():('run-'+Date.now()+'-'+Math.random().toString(36).slice(2));
   state.storyScareQueue=[];
   state.indoorPresence={timer:0,cooldown:7+Math.random()*5,x:0,y:0,phase:0,arming:0,appearances:0};
   indoorEchoHistory=[];indoorEcho={active:false,timer:0,cooldown:11+Math.random()*5,x:0,y:0,angle:0,phase:Math.random()*9,roomId:'',roomAge:0};indoorEchoSampleTimer=0;indoorEchoRoomId='';
@@ -2730,7 +2622,7 @@ function resetGame(){
   setAmbientBed(true);
   tone(280,.15,'sine',.08,160);
   state.lastFrame=performance.now();
-  startGameLoop();
+  requestAnimationFrame(loop);
 }
 function applyControlMode(){
   document.body.classList.toggle('mobile-mode',state.controlMode==='mobile');
@@ -3549,9 +3441,11 @@ function interact(){
     if(evidence>=6&&!state.horrorEventFlags.sixthClueWhisper){state.horrorEventFlags.sixthClueWhisper=true;state.flashlightFlickerTimer=2.3;triggerWhisper('That was the last clue. I was hoping you would never find it.','center','VOICE INSIDE THE FILE');toast('THE SIXTH CLUE HAS YOUR HANDWRITING ON IT.',3.8);}
     return;
   }
-  if(target.type==='memorial'||target.type==='tombstone'){
+  if(target.type==='memorial'||target.type==='memorialStone'){
     state.memorialTributeViewed=true;
-    if(target.type==='tombstone')state.tombstoneVisited=true;
+    state.memorialViewedAt=state.elapsed;
+    state.horrorEventFlags.memorialVisited=true;
+    state.horrorEventFlags.memorialCondolenceAt=state.elapsed+4.5;
     enterScreen('memorial');
     return;
   }
@@ -3726,7 +3620,8 @@ function spawnCrawlerWave(count=2,minRadius=180,speedBase=92,hp=2){
   if(state.anchorsDisabled&&state.extractionStarted)count=Math.max(1,count-1);
   let alive=crawlers.filter(c=>!c.dead).length;
   let made=0;
-  for(let i=0;i<count&&alive<3;i++){
+  const activeLimit=4;
+  for(let i=0;i<count&&alive<activeLimit;i++){
     const angle=(Math.PI*2*i/Math.max(1,count))+Math.random()*.55;
     const radius=minRadius+Math.random()*70;
     let x=clamp(player.x+Math.cos(angle)*radius,70,WORLD.w-70);
@@ -4170,6 +4065,10 @@ function drawScreamPulse(){
   ctx.strokeStyle='rgba(223,194,168,'+(.55*(1-progress))+')';ctx.lineWidth=1;ctx.beginPath();ctx.arc(x,y,radius*.78,0,Math.PI*2);ctx.stroke();ctx.restore();
 }
 function updateSurvivalActions(dt){
+  state.bodycamCooldown=Math.max(0,state.bodycamCooldown-dt);
+  state.bodycamRevealTimer=Math.max(0,state.bodycamRevealTimer-dt);
+  state.bodycamFlashTimer=Math.max(0,state.bodycamFlashTimer-dt);
+  if(state.bodycamRevealTimer<=0)state.bodycamTarget=null;
   state.screamCooldown=Math.max(0,state.screamCooldown-dt);
   state.helpCooldown=Math.max(0,state.helpCooldown-dt);
   state.helpTimer=Math.max(0,state.helpTimer-dt);
@@ -4186,17 +4085,53 @@ function updateSurvivalActions(dt){
   }
   const moving=keys.w||keys.a||keys.s||keys.d||keys.arrowup||keys.arrowdown||keys.arrowleft||keys.arrowright;
   if(state.hideSpotActive&&moving){state.hideSpotActive=false;player.hidden=false;state.hideSpotName='';state.hideElapsed=0;state.hideRisk=0;state.noise=Math.max(state.noise,.35);if(state.hideRestoreFlashlight&&flashlightBattery>0)flashlight=true;state.hideRestoreFlashlight=false;toast('YOU SCRAMBLE OUT OF COVER. IT HEARD YOU.',1.9);}
-  const hideBtn=$('hideAction'),screamBtn=$('screamAction'),helpBtn=$('helpAction'),status=$('survivalStatus');
+  const hideBtn=$('hideAction'),screamBtn=$('screamAction'),helpBtn=$('helpAction'),camBtn=$('bodycamAction'),status=$('survivalStatus');
   if(hideBtn){hideBtn.textContent=state.hideSpotActive?'C · EMERGE':'C · HIDE';hideBtn.setAttribute('aria-label',state.hideSpotActive?'Leave hiding place':'Hide in nearby cover');}
   if(screamBtn){screamBtn.disabled=state.screamCooldown>0;screamBtn.textContent=state.screamCooldown>0?'G · SCREAM '+Math.ceil(state.screamCooldown)+'s':'G · SCREAM';}
   if(helpBtn){helpBtn.disabled=state.helpCooldown>0;helpBtn.textContent=state.helpCooldown>0?'H · HELP '+Math.ceil(state.helpCooldown)+'s':'H · HELP';}
+  if(camBtn){camBtn.disabled=state.bodycamCooldown>0||state.bodycamCharges<=0;camBtn.textContent=state.bodycamCooldown>0?'V · CAM '+Math.ceil(state.bodycamCooldown)+'s':'V · CAM '+state.bodycamCharges;camBtn.title=state.bodycamCharges+' bodycam bursts remain. Reveals movement but attracts the Smiler.';}
   if(status){
     if(state.hideSpotActive)status.textContent='HIDDEN '+Math.min(100,Math.floor(state.hideElapsed/13.5*100))+'% · STAY STILL';
     else if(state.helpTimer>0)status.textContent='RADIO PULSE ACTIVE · '+Math.ceil(state.helpTimer)+'s';
-    else status.textContent='RUN · HIDE · SCREAM · CALL FOR HELP';
+    else status.textContent='RUN · HIDE · SCREAM · BODYCAM '+state.bodycamCharges+'/3 · HELP';
   }
 }
 
+function useBodycamBurst(){
+  if(!state.running||state.paused||state.gameOver||state.screen!=='game'||state.prologueStage!=='swamp')return;
+  if(state.hideSpotActive){toast('DO NOT FLASH WHILE HIDING. THE LIGHT WILL GIVE YOU AWAY.',1.8);return;}
+  if(state.bodycamCooldown>0){toast('BODYCAM RECHARGING: '+Math.ceil(state.bodycamCooldown)+'s.',1.2);return;}
+  if(state.bodycamCharges<=0){toast('NO BODYCAM FLASHES REMAIN.',1.6);return;}
+  state.bodycamCharges--;
+  state.bodycamCooldown=2.8;
+  state.bodycamRevealTimer=2.65;
+  state.bodycamFlashTimer=.17;
+  state.bodycamCount++;
+  state.noise=Math.max(state.noise,.58);
+  state.intensity=Math.max(state.intensity,.82);
+  state.screenShake=Math.max(state.screenShake,.12);
+  sound('radio');tone(1260,.055,'square',.045,-860);tone(73,.22,'triangle',.045,-30);
+  let target=null;
+  if(state.floor==='inside'&&state.indoorPresence&&state.indoorPresence.timer>0){
+    target={x:state.indoorPresence.x,y:state.indoorPresence.y,real:true,label:'INDOOR PRESENCE'};
+  }else if(monster&&monster.active){
+    target={x:monster.hidden?monster.pendingX:monster.x,y:monster.hidden?monster.pendingY:monster.y,real:true,label:monster.hidden?'REAPPEARANCE VECTOR':'THE SMILER'};
+  }else if(state.falseSignal&&state.falseSignal.active){
+    target={x:state.falseSignal.x,y:state.falseSignal.y,real:false,label:'FALSE SIGNAL'};
+  }else{
+    const a=(player.angle||0)+Math.PI+(Math.random()-.5)*1.4;
+    const r=135+Math.random()*155;
+    const localW=state.floor==='inside'&&state.room?state.room.w:WORLD.w;
+    const localH=state.floor==='inside'&&state.room?state.room.h:WORLD.h;
+    target={x:clamp(player.x+Math.cos(a)*r,55,localW-55),y:clamp(player.y+Math.sin(a)*r,55,localH-55),real:false,label:'UNIDENTIFIED SHAPE'};
+  }
+  state.bodycamTarget=target;
+  for(const c of crawlers){if(!c.dead&&dist(player.x,player.y,c.x,c.y)<145)c.stunned=Math.max(c.stunned||0,.75);}
+  if(monster&&monster.active&&!state.huntActive)state.nextHuntAt=Math.min(state.nextHuntAt,state.elapsed+7.5);
+  caseRecords.push({id:'bodycam-negative-'+state.bodycamCount,name:'Bodycam negative frame '+state.bodycamCount,detail:'The camera flash captured an outline that was not visible to the naked eye at the moment the shutter fired.',analysis:target.real?'Motion appears across more than one frame. The figure relocated without a continuous path between positions.':'The silhouette has no matching movement signature. The camera recorded a person-shaped outline that may not have been there.',kind:'anomaly',studied:false});
+  toast('BODYCAM BURST SAVED · '+state.bodycamCharges+' FLASHES LEFT. THE SNAPSHOT HAS A SECOND OUTLINE.',2.8);
+  updateHUD();updateObjectives();
+}
 function useMedkit(){
   if(medkits<=0){toast('NO MEDICAL PACKS LEFT.');return;}
   if(player.hp>=player.maxHp){toast('YOU ARE ALREADY IN GOOD CONDITION.');return;}
@@ -4307,7 +4242,6 @@ function finishGame(success){
   $('radioBreachPanel').classList.add('hidden');state.radioIncidentActive=false;state.radioIncidentTimer=0;state.paused=false;$('huntBanner').classList.remove('active');$('realityPulse').classList.remove('active');document.body.classList.remove('hunting');
   $('endingStats').innerHTML='TIME IN FIELD: '+Math.floor(state.elapsed/60)+' MINUTES<br>HUNTS SURVIVED: '+state.huntsSurvived+'/3<br>SIGNAL ANCHORS DESTROYED: '+state.anchorsDestroyed.length+'/3<br>RADIO HELP CALLS: '+state.helpCount+'<br>SCREAMS: '+(state.shoutCount||0)+'<br>EVIDENCE RECOVERED: '+collectedClueCount()+'<br>CLUES STUDIED: '+studyCount()+'<br>CROSS-REFERENCES: '+validCrossReferenceCount()+'<br>RELAY KEY: '+(state.keysFound?'RECOVERED':'MISSING')+'<br>WITNESS STATEMENT: '+(state.witnessInterviewed?(state.witnessTrust>=2?'CORROBORATED':'UNRELIABLE'):'MISSING')+'<br>SURVIVORS EXTRACTED: '+survivors.filter(s=>s.delivered).length+'/2<br>CRAWLERS NEUTRALIZED: '+state.kills+'<br>SHOTS FIRED: '+state.shots+'<br>BUILDINGS SEARCHED: '+state.exploredRoomIds.length+'<br>EXTRACTION HOLD: '+Math.floor(state.extractionHold)+'/30 SECONDS';
   setScreen('ending');
-  postRunCompletion(success);
   if(success)tone(460,.4,'sine',.1,180);else sound('scare');
 }
 function enterScreen(name){
@@ -4320,11 +4254,11 @@ function closeOverlay(){
   state.paused=false;
   state.running=true;
   state.screen='game';
-  for(const id of ['objectivePanel','inventoryPanel','pausePanel','radioPanel','interviewPanel','stationIntakePanel','suspectZoomPanel','memorialPanel','communityPanel','accountPanel'])$(id).classList.add('hidden');
+  for(const id of ['objectivePanel','inventoryPanel','pausePanel','radioPanel','interviewPanel','stationIntakePanel','suspectZoomPanel','memorialPanel'])$(id).classList.add('hidden');
   $('hud').style.display='block';
   document.body.classList.add('game-active');
   state.lastFrame=performance.now();
-  startGameLoop();
+  requestAnimationFrame(loop);
 }
 function pauseGame(){
   if(!state.running||state.gameOver)return;
@@ -5679,19 +5613,6 @@ function drawRealityText(){
   const strength=Math.min(1,state.realityPulseTimer*2.1);
   ctx.save();ctx.globalAlpha=strength*.27;ctx.fillStyle='#4e0810';ctx.font='bold '+Math.max(13,Math.min(24,W*.028))+'px monospace';ctx.textAlign='center';ctx.fillText('YOU HAVE ALREADY BEEN HERE',W*.5,H*.20);ctx.restore();
 }
-function updateMemorialWhispers(){
-  if(state.floor!=='outside'||!player||!state.running||state.paused||state.gameOver)return;
-  const stone=objects.find(o=>o.type==='tombstone');
-  if(!stone||dist(player.x,player.y,stone.x,stone.y)>170)return;
-  if(!state.loloWhisperOne){
-    const line=state.selectedCharacter==='yumi'?'How’s life, Officer Yumi? I heard about your lolo. I offer my condolences.':'How’s life, Officer Hugo? I heard about Yumi’s grandfather. I offer my condolences.';
-    if(triggerWhisper(line,'center','THE SMILER / QUIET VOICE'))state.loloWhisperOne=true;
-  }else if(state.memorialTributeViewed&&!state.loloWhisperTwo){
-    const line=state.selectedCharacter==='yumi'?'You do not have to be strong every minute, Yumi. The love in those photographs is still there.':'Tell Yumi this, Hugo: grief is not weakness. A life well lived leaves light behind.';
-    if(triggerWhisper(line,'left','THE SMILER / CONDOLENCE'))state.loloWhisperTwo=true;
-  }
-}
-
 function update(dt){
   if(state.prologueStage!=='swamp'){updatePrologue(dt);return;}
   state.sceneFade=Math.max(0,state.sceneFade-dt*1.7);
@@ -5699,7 +5620,6 @@ function update(dt){
   state.elapsed+=dt;
   updateSurvivalActions(dt);
   updateWhispers(dt);
-  updateMemorialWhispers();
   updateFearDirector(dt);
   updateThreatEscalation(dt);
   if(updateAdaptiveHorror(dt))return;
@@ -6077,6 +5997,23 @@ function drawLoot(o){
   px(x-6,y-7,12,2,'#7e815a');
   px(x-5,y-4,10,7,'#b09b67');
   px(x-3,y-2,6,3,pulse?'#e8d49b':'#7e764f');
+}
+function drawMemorialStone(o){
+  const x=o.x-camera.x+shakeX,y=o.y-camera.y+shakeY;
+  if(x<-90||y<-90||x>W+90||y>H+90)return;
+  const pulse=.5+.5*Math.sin(state.elapsed*1.2);
+  ctx.save();
+  ctx.fillStyle='rgba(0,0,0,.72)';ctx.beginPath();ctx.ellipse(x,y+18,30,9,0,0,Math.PI*2);ctx.fill();
+  poly([[x-23,y+11],[x-19,y-18],[x-11,y-30],[x+11,y-30],[x+20,y-18],[x+23,y+11]],'#40483f');
+  poly([[x-18,y+7],[x-15,y-17],[x-8,y-25],[x+8,y-25],[x+15,y-17],[x+18,y+7]],'#707767');
+  px(x-13,y-14,26,1,'#afb29a');px(x-2,y-23,4,13,'#b8bba1');px(x-7,y-19,14,4,'#b8bba1');
+  ctx.fillStyle='#d7d4bd';ctx.font='bold 5px monospace';ctx.textAlign='center';ctx.fillText('IN MEMORY',x,y-3);ctx.fillText('LOVE REMAINS',x,y+4);
+  px(x-24,y+11,48,5,'#262d25');px(x-19,y+16,38,4,'#121713');
+  const candle=state.memorialTributeViewed?'#d5b771':'#8b987c';
+  ctx.shadowColor=candle;ctx.shadowBlur=7+7*pulse;px(x-30,y+7,4,8,'#b5b09a');px(x+27,y+7,4,8,'#b5b09a');
+  ctx.fillStyle=candle;ctx.fillRect(x-29,y+3,2,3);ctx.fillRect(x+28,y+3,2,3);ctx.shadowBlur=0;
+  if(dist(player.x,player.y,o.x,o.y)<210){ctx.fillStyle='#e5d7a8';ctx.font='bold 8px monospace';ctx.textAlign='center';ctx.fillText('QUIET MEMORIAL · PRESS E',x,y-42);}
+  ctx.restore();
 }
 function drawExit(o){
   const x=o.x-camera.x;
@@ -6514,22 +6451,24 @@ function drawThreatMarkers(){
   ctx.restore();
 }
 
-function drawMemorialTombstone(o){
-  const x=o.x-camera.x+shakeX;
-  const y=o.y-camera.y+shakeY;
-  if(x<-70||y<-90||x>W+70||y>H+70)return;
-  const pulse=.5+.5*Math.sin(state.elapsed*1.15);
-  ctx.save();ctx.globalAlpha=.16+.07*pulse;
-  const glow=ctx.createRadialGradient(x,y,2,x,y,55);
-  glow.addColorStop(0,'rgba(224,202,144,.32)');glow.addColorStop(1,'rgba(224,202,144,0)');
-  ctx.fillStyle=glow;ctx.fillRect(x-58,y-58,116,116);ctx.restore();
-  px(x-20,y+22,40,6,'#050705');px(x-15,y-29,30,50,'#34382f');px(x-12,y-36,24,12,'#45493c');
-  px(x-9,y-32,18,44,'#77735d');px(x-7,y-27,14,34,'#34392f');px(x-1,y-25,2,13,'#c5b48a');
-  px(x-5,y-20,10,2,'#c5b48a');px(x-6,y+5,12,2,'#a2946d');px(x-6,y+10,12,1,'#958867');
-  ctx.fillStyle='#d9c99b';ctx.font='bold 7px monospace';ctx.textAlign='center';ctx.fillText('IN LOVING MEMORY',x,y+42);
-  if(dist(player.x,player.y,o.x,o.y)<180){ctx.fillStyle='rgba(4,7,5,.88)';ctx.fillRect(x-82,y+48,164,18);ctx.strokeStyle='#796c4e';ctx.strokeRect(x-82,y+48,164,18);ctx.fillStyle='#e6d5ac';ctx.font='bold 8px monospace';ctx.textAlign='center';ctx.fillText('E · READ THE MEMORIAL',x,y+60);}
+function drawBodycamOverlay(){
+  if(!state.bodycamRevealTimer&&!state.bodycamFlashTimer)return;
+  if(state.bodycamFlashTimer>0){ctx.save();ctx.globalAlpha=Math.min(.52,state.bodycamFlashTimer/.17*.52);ctx.fillStyle='#d5e6d1';ctx.fillRect(0,0,W,H);ctx.restore();}
+  if(state.bodycamRevealTimer<=0||!state.bodycamTarget)return;
+  const t=state.bodycamTarget;
+  const sx=t.x-camera.x+shakeX,sy=t.y-camera.y+shakeY;
+  const margin=28;
+  const onScreen=sx>margin&&sy>margin&&sx<W-margin&&sy<H-margin;
+  const x=onScreen?sx:clamp(sx,margin,W-margin),y=onScreen?sy:clamp(sy,margin,H-margin);
+  const left=x-21,top=y-38,alpha=Math.min(1,state.bodycamRevealTimer/.45);
+  ctx.save();ctx.globalAlpha=.38*alpha;ctx.fillStyle='#99d5b6';for(let yy=0;yy<H;yy+=7)ctx.fillRect(0,yy,W,1);ctx.restore();
+  ctx.save();ctx.globalAlpha=.92*alpha;ctx.strokeStyle=t.real?'#c5f6d6':'#e6c9a0';ctx.lineWidth=1.5;ctx.setLineDash([5,4]);ctx.strokeRect(left,top,42,76);ctx.setLineDash([]);
+  ctx.beginPath();ctx.moveTo(x-30,y);ctx.lineTo(x-20,y);ctx.moveTo(x+20,y);ctx.lineTo(x+30,y);ctx.moveTo(x,y-49);ctx.lineTo(x,y-39);ctx.moveTo(x,y+39);ctx.lineTo(x,y+49);ctx.stroke();
+  ctx.fillStyle='#030806';ctx.fillRect(Math.max(8,Math.min(W-266,x-130)),Math.max(8,top-24),260,17);
+  ctx.fillStyle=t.real?'#c6f2d1':'#e8d4af';ctx.font='bold 9px monospace';ctx.textAlign='center';ctx.fillText((t.real?'MOTION CAPTURED / ':'NO MATCHING BODY / ')+t.label,Math.max(138,Math.min(W-138,x)),Math.max(20,top-12));
+  ctx.fillStyle='#a6baa8';ctx.font='8px monospace';ctx.textAlign='left';ctx.fillText('BODYCAM BURST 0'+state.bodycamCount+' · BUFFER '+state.bodycamRevealTimer.toFixed(1)+'s',12,H-42);
+  ctx.fillStyle='rgba(139,26,31,.68)';ctx.fillRect(10,H-29,Math.max(6,(W-20)*(state.bodycamRevealTimer/2.65)),3);ctx.restore();
 }
-
 function drawWorld(){
   if(state.prologueStage!=='swamp'){drawPrologue();return;}
   screenJitter();
@@ -6547,6 +6486,7 @@ function drawWorld(){
     drawIndoorWayfinding();
     drawMini();
     drawRealityText();
+    drawBodycamOverlay();
     if(state.sceneFade>0){ctx.fillStyle='rgba(0,0,0,'+state.sceneFade+')';ctx.fillRect(0,0,W,H);}
     return;
   }
@@ -6562,7 +6502,7 @@ function drawWorld(){
     if(o.type==='evidence')drawEvidence(o);
     if(o.type==='loot')drawLoot(o);
     if(o.type==='exit')drawExit(o);
-    if(o.type==='tombstone')drawMemorialTombstone(o);
+    if(o.type==='memorialStone')drawMemorialStone(o);
   }
   drawSurvivors();
   for(const c of crawlers)drawCrawler(c);
@@ -6582,6 +6522,7 @@ function drawWorld(){
   drawMini();
   drawRealityText();
   drawSmilerContactLost();
+  drawBodycamOverlay();
   if(state.sceneFade>0){ctx.fillStyle='rgba(0,0,0,'+state.sceneFade+')';ctx.fillRect(0,0,W,H);}
 }
 function drawInteriorBase(room,sx,sy){
@@ -6923,6 +6864,13 @@ function updateNightmareAtmosphere(dt){
 function updateHauntingDirector(dt){
   if(!state.running||state.paused||state.gameOver||state.prologueStage!=='swamp')return;
   const flags=state.horrorEventFlags;
+  if(flags.memorialVisited&&!flags.smilerCondolenceSpoken&&state.memorialTributeViewed&&state.elapsed>=(flags.memorialCondolenceAt||Infinity)&&monster&&monster.active&&state.floor==='outside'&&!state.radioIncidentActive&&!state.huntActive){
+    flags.smilerCondolenceSpoken=true;
+    const line=state.selectedCharacter==='yumi'?'How is life, Yumi? I heard about your lolo. I offer my condolences. Even I know some memories should be left in peace.':'How is life, Hugo? I heard about Yumi’s lolo. I offer my condolences. Do not let this night take the kindness you came here with.';
+    triggerWhisper(line,'center','THE SMILER / A QUIET WORD');
+    toast('A QUIET VOICE COMES THROUGH THE STATIC. IT DOES NOT LAUGH.',3.2);
+    state.intensity=Math.max(state.intensity,.62);
+  }
   if(state.elapsed>48&&collectedClueCount()>=2&&!flags.unknownPartnerTransmission&&!state.radioIncidentActive){
     flags.unknownPartnerTransmission=true;
     state.intensity=Math.max(state.intensity,.83);
@@ -7246,7 +7194,6 @@ function drawMini(){
     if(o.type==='evidence'&&!o.found)color='#e1be65';
     if(o.type==='loot'&&!o.found)color='#93c68c';
     if(o.type==='exit')color='#d5d0ad';
-    if(o.type==='tombstone')color='#e0c994';
     mctx.fillStyle=color;
     mctx.fillRect(x-2,y-2,4,4);
   }
@@ -7414,173 +7361,7 @@ function drawPortraits(){
     }
   });
 }
-function setCommunityTab(tab){
-  const prayers=tab!=='leaderboard';
-  $('prayersTab').classList.toggle('hidden',!prayers);
-  $('leaderboardTab').classList.toggle('hidden',prayers);
-  for(const button of document.querySelectorAll('[data-community-tab]')){
-    const active=button.dataset.communityTab===(prayers?'prayers':'leaderboard');
-    button.classList.toggle('active',active);
-    button.setAttribute('aria-selected',active?'true':'false');
-  }
-  if(prayers)loadPrayerWall();else{loadLeaderboard();loadCommunityAchievements();}
-}
-function openCommunity(tab='prayers',returnScreen=null){
-  communityReturnScreen=returnScreen||(state.screen==='ending'?'ending':'menu');
-  setScreen('community');
-  setCommunityTab(tab);
-}
-function closeCommunity(){
-  $('communityPanel').classList.add('hidden');
-  setScreen(communityReturnScreen||'menu');
-}
-function openAccount(returnScreen=null){
-  accountReturnScreen=returnScreen||(state.screen==='ending'?'ending':'menu');
-  setScreen('account');
-  refreshAccountStatus();
-}
-function closeAccount(){
-  $('accountPanel').classList.add('hidden');
-  setScreen(accountReturnScreen||'menu');
-}
-function showPrayerStatus(message){const node=$('prayerStatus');if(node)node.textContent=message;}
-function renderPrayerWall(prayers){
-  const wall=$('prayerWall');wall.replaceChildren();
-  if(!prayers||!prayers.length){const empty=document.createElement('div');empty.className='community-empty';empty.textContent='No prayers have been posted yet. You can be the first to leave a kind message.';wall.appendChild(empty);return;}
-  for(const prayer of prayers){
-    const card=document.createElement('article');card.className='prayer-card';
-    const head=document.createElement('div');head.className='prayer-card-head';
-    const person=document.createElement('strong');person.textContent=String(prayer.name||'Anonymous').slice(0,30);
-    const date=document.createElement('span');date.className='prayer-card-date';let dateText='Community prayer';
-    try{const d=new Date(prayer.created_at||'');if(!Number.isNaN(d.getTime()))dateText=d.toLocaleString();}catch(e){}
-    date.textContent=dateText;head.append(person,date);
-    const copy=document.createElement('div');copy.className='prayer-card-text';copy.textContent=String(prayer.prayer||'').slice(0,600);
-    card.append(head,copy);wall.appendChild(card);
-  }
-}
-async function loadPrayerWall(){
-  if(!$('prayerWall'))return;
-  try{
-    const response=await fetch('/api/prayers?limit=500',{credentials:'same-origin'});const data=await response.json();
-    if(!response.ok)throw new Error(data.error||'Prayer wall is unavailable.');
-    renderPrayerWall(data.prayers||[]);
-    showPrayerStatus(data.persistent?'Prayers are saved in MongoDB and shared with players.':'MongoDB is not configured yet. Prayers work in this session, but are temporary until MONGODB_URI is set.');
-  }catch(error){renderPrayerWall([]);showPrayerStatus('Could not load the prayer service. The game remains playable; check the server deployment and MongoDB environment variables.');}
-}
-async function submitPrayer(event){
-  event.preventDefault();
-  const name=$('prayerName').value.trim();const prayer=$('prayerText').value.trim();
-  if(prayer.length<4){showPrayerStatus('Please write at least a few words before sending your prayer.');return;}
-  const button=$('submitPrayer');button.disabled=true;showPrayerStatus('Sending your prayer…');
-  try{
-    const response=await fetch('/api/prayers',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,prayer})});
-    const data=await response.json();if(!response.ok)throw new Error(data.error||'Prayer could not be sent.');
-    $('prayerText').value='';await loadPrayerWall();
-    showPrayerStatus(data.persistent?'Your prayer was added to the shared prayer wall.':'Your prayer was added to this temporary board. Set MONGODB_URI on Render to keep it across restarts.');
-  }catch(error){showPrayerStatus(error.message||'Prayer could not be sent. Please try again.');}
-  finally{button.disabled=false;}
-}
-function renderLeaderboard(entries){
-  const list=$('leaderboardList');list.replaceChildren();
-  if(!entries||!entries.length){const empty=document.createElement('div');empty.className='community-empty';empty.textContent='No patrol results yet. Finish a run to claim a place on the board.';list.appendChild(empty);return;}
-  entries.forEach((entry,index)=>{
-    const row=document.createElement('div');row.className='leaderboard-row';
-    const rank=document.createElement('div');rank.className='leaderboard-rank';rank.textContent=String(index+1).padStart(2,'0');
-    const details=document.createElement('div');const name=document.createElement('div');name.className='leaderboard-name';name.textContent=String(entry.name||'Unknown officer').slice(0,30);
-    const detail=document.createElement('div');detail.className='leaderboard-detail';detail.textContent=(entry.won?'CASE CLOSED':'OFFICER LOST')+' · '+Math.floor(Math.max(0,Number(entry.elapsed)||0)/60)+'m · '+Math.max(0,Number(entry.rescued)||0)+'/2 rescued · '+Math.max(0,Number(entry.clues_studied)||0)+' clues studied';details.append(name,detail);
-    const score=document.createElement('div');score.className='leaderboard-score';score.textContent=(Number(entry.score)||0).toLocaleString();
-    const result=document.createElement('div');result.className='leaderboard-result';result.textContent=entry.won?'ESCAPED':'LOST';score.appendChild(result);
-    row.append(rank,details,score);list.appendChild(row);
-  });
-}
-async function loadLeaderboard(){
-  try{
-    const response=await fetch('/api/leaderboard?limit=20',{credentials:'same-origin'});const data=await response.json();if(!response.ok)throw new Error(data.error||'Leaderboard unavailable.');
-    renderLeaderboard(data.entries||[]);$('leaderboardStatus').textContent=data.persistent?'Leaderboard stored in MongoDB.':'Temporary leaderboard: set MONGODB_URI in Render to retain scores after restarts.';
-  }catch(error){$('leaderboardStatus').textContent='Could not load leaderboard. The game remains playable.';renderLeaderboard([]);}
-}
-function renderAchievements(container,items){
-  container.replaceChildren();
-  if(!items||!items.length){const empty=document.createElement('div');empty.className='community-empty';empty.textContent=sessionAccount?'No achievements yet. Complete objectives to earn them.':'Sign in to save achievements to an account.';container.appendChild(empty);return;}
-  for(const item of items){const card=document.createElement('div');card.className='achievement-item';const title=document.createElement('strong');title.textContent=item.title||item.name||item.code||'Achievement';const detail=document.createElement('span');detail.textContent=item.description||('Earned '+(item.earned_at||''));card.append(title,detail);container.appendChild(card);}
-}
-async function loadCommunityAchievements(){
-  if(!sessionAccount){renderAchievements($('communityAchievements'),[]);return;}
-  try{const r=await fetch('/api/achievements',{credentials:'same-origin'});const d=await r.json();renderAchievements($('communityAchievements'),d.achievements||[]);}catch(e){renderAchievements($('communityAchievements'),[]);}
-}
-async function refreshAccountStatus(){
-  try{
-    const r=await fetch('/api/accounts/me',{credentials:'same-origin'});const data=await r.json();sessionAccount=data.account||null;
-    $('accountStatus').textContent=sessionAccount?'Signed in as '+sessionAccount.username+'. Cloud saves and achievements are linked to this account.':'Not signed in. Sign in before a patrol to use cloud saves; play without an account if preferred.';
-    $('logoutAccount').disabled=!sessionAccount;$('loadCloudSave').disabled=!sessionAccount;
-    if(sessionAccount){const a=await fetch('/api/achievements',{credentials:'same-origin'});const aj=await a.json();renderAchievements($('accountAchievements'),aj.achievements||[]);}else renderAchievements($('accountAchievements'),[]);
-    return sessionAccount;
-  }catch(error){$('accountStatus').textContent='Account service is unavailable. The game can still be played without an account.';sessionAccount=null;return null;}
-}
-async function postAccountAction(action){
-  const username=$('accountUsername').value.trim();const password=$('accountPassword').value;
-  if(action!=='logout'&&(!username||!password)){ $('accountStatus').textContent='Enter a username and password first.';return; }
-  $('accountStatus').textContent=action==='register'?'Creating account…':action==='login'?'Signing in…':'Signing out…';
-  try{
-    const url=action==='register'?'/api/accounts/register':action==='login'?'/api/accounts/login':'/api/accounts/logout';
-    const r=await fetch(url,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(action==='logout'?{}:{username,password})});const data=await r.json();if(!r.ok)throw new Error(data.error||'Account request failed.');
-    $('accountPassword').value='';await refreshAccountStatus();$('accountStatus').textContent=data.message||(sessionAccount?'Signed in as '+sessionAccount.username+'.':'Signed out.');
-    if(data.persistent===false)$('accountStatus').textContent+=' MongoDB is not configured; account data will not survive a server restart.';
-    loadLeaderboard();loadPrayerWall();
-  }catch(error){$('accountStatus').textContent=error.message||'Account request failed.';}
-}
-function cloneSaveValue(value){return JSON.parse(JSON.stringify(value));}
-function buildGameSnapshot(){
-  if(!player||!state.prologueStage)return null;
-  const copyState=cloneSaveValue(state);copyState.running=false;copyState.paused=false;copyState.screen='game';copyState.gameOver=false;
-  return {version:1,saved_at:new Date().toISOString(),selectedCharacter:state.selectedCharacter,controlMode:state.controlMode,state:copyState,player:cloneSaveValue(player),health,stamina,ammo,reserve,medkits,batteryCells,flashlightBattery,flashlight,evidence,caseRecords:cloneSaveValue(caseRecords),objects:cloneSaveValue(objects),survivors:cloneSaveValue(survivors),crawlers:cloneSaveValue(crawlers),monster:cloneSaveValue(monster),bullets:cloneSaveValue(bullets),floor:state.floor,room:state.room?cloneSaveValue(state.room):null,camera:cloneSaveValue(camera),lastSafe:cloneSaveValue(lastSafe)};
-}
-async function saveCloudCheckpoint(){
-  if(!sessionAccount){toast('SIGN IN FROM THE MAIN MENU BEFORE SAVING TO THE CLOUD.',2.5);return false;}
-  if(!player||state.gameOver){toast('NO ACTIVE PATROL TO SAVE.',1.8);return false;}
-  let snapshot;try{snapshot=buildGameSnapshot();}catch(error){toast('SAVE FAILED: THE CHECKPOINT COULD NOT BE SERIALIZED.',2.1);return false;}
-  try{const r=await fetch('/api/game/save',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({snapshot})});const data=await r.json();if(!r.ok)throw new Error(data.error||'Cloud save failed.');toast(data.persistent?'CLOUD CHECKPOINT SAVED.':'CHECKPOINT SAVED TEMPORARILY; MONGODB IS NOT CONFIGURED.',2.4);return true;}catch(error){toast(error.message||'CLOUD SAVE FAILED.',2.2);return false;}
-}
-async function loadCloudSave(){
-  if(!sessionAccount){$('accountStatus').textContent='Sign in before loading a cloud patrol.';return;}
-  $('accountStatus').textContent='Loading saved patrol…';
-  try{
-    const r=await fetch('/api/game/save',{credentials:'same-origin'});const data=await r.json();if(!r.ok)throw new Error(data.error||'No saved patrol was found.');
-    const snap=data.snapshot;if(!snap||snap.version!==1)throw new Error('The saved patrol format is not supported.');
-    state.selectedCharacter=snap.selectedCharacter==='yumi'?'yumi':'hugo';state.controlMode=snap.controlMode==='mobile'?'mobile':'desktop';
-    resetGame();state.running=false;Object.assign(state,snap.state||{});state.selectedCharacter=snap.selectedCharacter;state.controlMode=snap.controlMode||'desktop';
-    player=cloneSaveValue(snap.player);health=Number(snap.health)||player.hp;stamina=Number(snap.stamina)||player.stamina;ammo=Number(snap.ammo)||0;reserve=Number(snap.reserve)||0;medkits=Number(snap.medkits)||0;batteryCells=Number(snap.batteryCells)||0;flashlightBattery=Number(snap.flashlightBattery)||0;flashlight=!!snap.flashlight;evidence=Number(snap.evidence)||0;caseRecords=cloneSaveValue(snap.caseRecords||[]);objects=cloneSaveValue(snap.objects||objects);survivors=cloneSaveValue(snap.survivors||survivors);crawlers=cloneSaveValue(snap.crawlers||[]);monster=cloneSaveValue(snap.monster||monster);bullets=cloneSaveValue(snap.bullets||[]);state.floor=snap.floor||'outside';state.room=snap.room?cloneSaveValue(snap.room):null;camera=snap.camera?cloneSaveValue(snap.camera):{x:0,y:0};lastSafe=snap.lastSafe?cloneSaveValue(snap.lastSafe):{x:player.x,y:player.y};
-    state.running=true;state.paused=false;state.gameOver=false;state.screen='game';state.lastFrame=performance.now();interiorBaseCache={room:null,canvas:null};lastMiniDraw=-999;lastMiniFloor=null;lastMiniRoom=null;
-    $('accountPanel').classList.add('hidden');$('communityPanel').classList.add('hidden');$('hud').style.display='block';document.body.classList.add('game-active');document.body.classList.remove('prologue-mode','prologue-call','prologue-drive','prologue-arrival');if(['call','drive','arrival'].includes(state.prologueStage)){document.body.classList.add('prologue-mode','prologue-'+state.prologueStage);}
-    applyControlMode();updateHUD();updateObjectives();setAmbientBed(true);state.running=true;startGameLoop();$('accountStatus').textContent='Saved patrol loaded.';
-  }catch(error){$('accountStatus').textContent=error.message||'Could not load the saved patrol.';}
-}
-function postRunCompletion(success){
-  if(state.resultSubmitted)return;state.resultSubmitted=true;
-  const runId=state.runId||(Date.now()+'-'+Math.random().toString(36).slice(2));
-  const payload={run_id:runId,display_name:specs[state.selectedCharacter].name.replace(/^Officer\\s+/i,''),selected_character:state.selectedCharacter,won:!!success,elapsed:state.elapsed,rescued:survivors.filter(s=>s.delivered).length,clues_collected:collectedClueCount(),clues_studied:studyCount(),reports:validCrossReferenceCount(),anchors:state.anchorsDestroyed.length,station_correct:state.stationCorrect,station_processed:state.stationProcessed,witness:!!(state.witnessInterviewed&&state.witnessTrust>=2),kills:state.kills,hunts_survived:state.huntsSurvived,extraction_hold:state.extractionHold};
-  fetch('/api/game/complete',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(r=>r.json().then(data=>({ok:r.ok,data}))).then(({ok,data})=>{if(ok){state.earnedAchievements=data.earned||[];loadLeaderboard();if(sessionAccount)loadCommunityAchievements();}}).catch(()=>{});
-}
-
 function bindEvents(){
-  const prayerForm=$('prayerForm');if(prayerForm)prayerForm.addEventListener('submit',submitPrayer);
-  for(const tab of document.querySelectorAll('[data-community-tab]'))tab.addEventListener('click',()=>setCommunityTab(tab.dataset.communityTab));
-  $('communityBtn').addEventListener('click',()=>openCommunity('prayers','menu'));
-  $('leaderboardBtn').addEventListener('click',()=>openCommunity('leaderboard','menu'));
-  $('accountBtn').addEventListener('click',()=>openAccount('menu'));
-  $('endingPrayers').addEventListener('click',()=>openCommunity('prayers','ending'));
-  $('endingLeaderboard').addEventListener('click',()=>openCommunity('leaderboard','ending'));
-  $('endingAccount').addEventListener('click',()=>openAccount('ending'));
-  $('closeCommunity').addEventListener('click',closeCommunity);
-  $('refreshCommunity').addEventListener('click',()=>{loadPrayerWall();loadLeaderboard();loadCommunityAchievements();});
-  const accountForm=$('accountForm');if(accountForm)accountForm.addEventListener('submit',e=>{e.preventDefault();postAccountAction('login');});
-  $('registerAccount').addEventListener('click',()=>postAccountAction('register'));
-  $('loginAccount').addEventListener('click',()=>postAccountAction('login'));
-  $('logoutAccount').addEventListener('click',()=>postAccountAction('logout'));
-  $('loadCloudSave').addEventListener('click',loadCloudSave);
-  $('refreshAchievements').addEventListener('click',async()=>{await refreshAccountStatus();$('accountStatus').textContent='Account records refreshed.';});
-  $('closeAccount').addEventListener('click',closeAccount);
-  $('saveCheckpoint').addEventListener('click',saveCloudCheckpoint);
   const partnerComposer=$('partnerComposer');
   if(partnerComposer)partnerComposer.addEventListener('submit',e=>{e.preventDefault();sendPartnerChat();});
   $('radioBreachPanel').addEventListener('click',e=>{const choice=e.target.closest('[data-radio-breach-choice]');if(choice)resolveRadioBreach(choice.dataset.radioBreachChoice);});
@@ -7699,6 +7480,8 @@ function bindEvents(){
   $('hideAction').addEventListener('click',toggleHide);
   $('screamAction').addEventListener('click',playerScream);
   $('helpAction').addEventListener('click',callPartnerForHelp);
+  $('bodycamAction').addEventListener('click',useBodycamBurst);
+  $('touchBodycam').addEventListener('pointerdown',e=>{e.preventDefault();useBodycamBurst();});
   $('touchInteract').addEventListener('pointerdown',e=>{e.preventDefault();interact();});
   $('touchShoot').addEventListener('pointerdown',e=>{e.preventDefault();shoot();});
   $('touchLight').addEventListener('pointerdown',e=>{e.preventDefault();toggleFlashlight();});
@@ -7787,6 +7570,7 @@ function onKeyDown(e){
   if(key==='c')toggleHide();
   if(key==='g')playerScream();
   if(key==='h')callPartnerForHelp();
+  if(key==='v')useBodycamBurst();
   if(key==='f')toggleFlashlight();
   if(key==='r'){
     state.reloadActive=true;
@@ -7816,19 +7600,14 @@ function menuFrame(){
   drawMenuArt();
   requestAnimationFrame(menuFrame);
 }
-function startGameLoop(){
-  loopGeneration++;
-  state.lastFrame=performance.now();
-  requestAnimationFrame(now=>loop(now,loopGeneration));
-}
-function loop(now,generation=loopGeneration){
-  if(generation!==loopGeneration||!state.running)return;
-  if(document.hidden){state.lastFrame=now;requestAnimationFrame(next=>loop(next,generation));return;}
+function loop(now){
+  if(!state.running)return;
+  if(document.hidden){state.lastFrame=now;requestAnimationFrame(loop);return;}
   const dt=Math.min(.035,Math.max(.001,(now-state.lastFrame)/1000));
   state.lastFrame=now;
   if(!state.paused&&!state.gameOver)update(dt);
   drawWorld();
-  if(state.running&&generation===loopGeneration)requestAnimationFrame(next=>loop(next,generation));
+  if(state.running)requestAnimationFrame(loop);
 }
 function boot(){
   initializeAssets();
@@ -7839,9 +7618,6 @@ function boot(){
   updateCharacterSelection();
   updateObjectives();
   menuFrame();
-  loadPrayerWall();
-  loadLeaderboard();
-  refreshAccountStatus();
 }
 boot();
 })();
@@ -7849,507 +7625,13 @@ boot();
 </body>
 </html>'''
 
-_memory_lock = threading.RLock()
-_memory_prayers = []
-_memory_accounts = {}
-_memory_accounts_by_name = {}
-_memory_leaderboard = {}
-_memory_saves = {}
-_memory_achievements = {}
-_prayer_rate = {}
-_mongo_client = None
-_mongo_uri_active = None
-_mongo_indexes_ready = False
-_mongo_checked_at = 0.0
-
-
-def _clean_text(value, limit, multiline=False):
-    value = str(value or '')
-    value = value.replace('\r\n', '\n').replace('\r', '\n')
-    if multiline:
-        value = ''.join(ch for ch in value if ch in '\n\t' or ord(ch) >= 32 and ord(ch) != 127)
-    else:
-        value = ' '.join(value.split())
-        value = ''.join(ch for ch in value if ord(ch) >= 32 and ord(ch) != 127)
-    return value.strip()[:limit]
-
-
-def _request_data():
-    data = request.get_json(silent=True)
-    return data if isinstance(data, dict) else {}
-
-
-def _get_database():
-    global _mongo_client, _mongo_uri_active, _mongo_indexes_ready, _mongo_checked_at
-    uri = os.environ.get('MONGODB_URI', '').strip()
-    if not uri or MongoClient is None:
-        return None
-    try:
-        if _mongo_client is None or _mongo_uri_active != uri:
-            if _mongo_client is not None:
-                try:
-                    _mongo_client.close()
-                except Exception:
-                    pass
-            _mongo_client = MongoClient(uri, serverSelectionTimeoutMS=1800, connectTimeoutMS=1800, socketTimeoutMS=2500, appname='FloridaShadows')
-            _mongo_uri_active = uri
-            _mongo_indexes_ready = False
-        if time.monotonic() - _mongo_checked_at > 12 or not _mongo_indexes_ready:
-            _mongo_client.admin.command('ping')
-            _mongo_checked_at = time.monotonic()
-        db = _mongo_client[os.environ.get('MONGODB_DB', 'florida_shadows').strip() or 'florida_shadows']
-        if not _mongo_indexes_ready:
-            db.prayers.create_index([('created_at', DESCENDING)])
-            db.leaderboard_runs.create_index([('score', DESCENDING), ('created_at', DESCENDING)])
-            db.leaderboard_runs.create_index('run_id', unique=True)
-            db.accounts.create_index('username_lower', unique=True)
-            db.saves.create_index('account_id', unique=True)
-            db.achievements.create_index([('account_id', 1), ('code', 1)], unique=True)
-            _mongo_indexes_ready = True
-        return db
-    except Exception:
-        _mongo_checked_at = 0.0
-        return None
-
-
-def _now_iso():
-    return datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
-
-
-def _current_account(db=None):
-    account_id = session.get('account_id')
-    if not account_id:
-        return None
-    try:
-        if db is not None:
-            account = db.accounts.find_one({'_id': account_id}, {'password_hash': 0})
-            if account:
-                return {'id': account['_id'], 'username': account['username']}
-        with _memory_lock:
-            account = _memory_accounts.get(account_id)
-            if account:
-                return {'id': account['_id'], 'username': account['username']}
-    except Exception:
-        pass
-    return None
-
-
-def _achievement_definitions(payload):
-    definitions = []
-    if payload.get('won'):
-        definitions.append(('first_escape', 'Case Closed', 'Completed a successful escape from the marsh.'))
-    if int(payload.get('clues_studied', 0)) >= 6:
-        definitions.append(('six_clues', 'Forensic Eyes', 'Studied at least six pieces of evidence.'))
-    if int(payload.get('reports', 0)) >= 4:
-        definitions.append(('four_reports', 'Connected the Dots', 'Produced four distinct evidence cross-references.'))
-    if payload.get('witness'):
-        definitions.append(('trusted_witness', 'A Reliable Voice', 'Secured a corroborated witness statement.'))
-    if int(payload.get('station_correct', 0)) >= 5 and int(payload.get('station_processed', 0)) >= 6:
-        definitions.append(('station_audit', 'Night Shift Auditor', 'Completed the police-station intake audit.'))
-    if int(payload.get('anchors', 0)) >= 3:
-        definitions.append(('signal_silencer', 'Silence in the Marsh', 'Disabled all three signal anchors.'))
-    if int(payload.get('rescued', 0)) >= 2:
-        definitions.append(('nobody_left', 'Nobody Left Behind', 'Rescued both missing people.'))
-    return definitions
-
-
-_memory_lock = threading.RLock()
-_memory_prayers = []
-_memory_accounts = {}
-_memory_accounts_by_name = {}
-_memory_leaderboard = {}
-_memory_saves = {}
-_memory_achievements = {}
-_prayer_rate = {}
-_mongo_client = None
-_mongo_uri_active = None
-_mongo_indexes_ready = False
-
-
-def _clean_text(value, limit, multiline=False):
-    value = str(value or '').replace('\r\n', '\n').replace('\r', '\n')
-    if multiline:
-        value = ''.join(ch for ch in value if ch in '\n\t' or (ord(ch) >= 32 and ord(ch) != 127))
-    else:
-        value = ' '.join(value.split())
-        value = ''.join(ch for ch in value if ord(ch) >= 32 and ord(ch) != 127)
-    return value.strip()[:limit]
-
-
-def _request_data():
-    data = request.get_json(silent=True)
-    return data if isinstance(data, dict) else {}
-
-
-def _get_database():
-    global _mongo_client, _mongo_uri_active, _mongo_indexes_ready
-    uri = os.environ.get('MONGODB_URI', '').strip()
-    if not uri or MongoClient is None:
-        return None
-    try:
-        if _mongo_client is None or _mongo_uri_active != uri:
-            if _mongo_client is not None:
-                try:
-                    _mongo_client.close()
-                except Exception:
-                    pass
-            _mongo_client = MongoClient(uri, serverSelectionTimeoutMS=1800, connectTimeoutMS=1800, socketTimeoutMS=2500, appname='FloridaShadows')
-            _mongo_uri_active = uri
-            _mongo_indexes_ready = False
-        _mongo_client.admin.command('ping')
-        db = _mongo_client[os.environ.get('MONGODB_DB', 'florida_shadows').strip() or 'florida_shadows']
-        if not _mongo_indexes_ready:
-            db.prayers.create_index([('created_at', DESCENDING)])
-            db.leaderboard_runs.create_index([('score', DESCENDING), ('created_at', DESCENDING)])
-            db.leaderboard_runs.create_index('run_id', unique=True)
-            db.accounts.create_index('username_lower', unique=True)
-            db.saves.create_index('account_id', unique=True)
-            db.achievements.create_index([('account_id', 1), ('code', 1)], unique=True)
-            _mongo_indexes_ready = True
-        return db
-    except Exception:
-        return None
-
-
-def _now_iso():
-    return datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
-
-
-def _current_account(db=None):
-    account_id = session.get('account_id')
-    if not account_id:
-        return None
-    try:
-        if db is not None:
-            account = db.accounts.find_one({'_id': account_id}, {'password_hash': 0})
-            if account:
-                return {'id': account['_id'], 'username': account['username']}
-    except Exception:
-        pass
-    with _memory_lock:
-        account = _memory_accounts.get(account_id)
-        if account:
-            return {'id': account['_id'], 'username': account['username']}
-    return None
-
-
-def _achievement_definitions(payload):
-    definitions = []
-    if payload.get('won'):
-        definitions.append(('first_escape', 'Case Closed', 'Completed a successful escape from the marsh.'))
-    if int(payload.get('clues_studied', 0)) >= 6:
-        definitions.append(('six_clues', 'Forensic Eyes', 'Studied at least six pieces of evidence.'))
-    if int(payload.get('reports', 0)) >= 4:
-        definitions.append(('four_reports', 'Connected the Dots', 'Produced four distinct evidence cross-references.'))
-    if payload.get('witness'):
-        definitions.append(('trusted_witness', 'A Reliable Voice', 'Secured a corroborated witness statement.'))
-    if int(payload.get('station_correct', 0)) >= 5 and int(payload.get('station_processed', 0)) >= 6:
-        definitions.append(('station_audit', 'Night Shift Auditor', 'Completed the police-station intake audit.'))
-    if int(payload.get('anchors', 0)) >= 3:
-        definitions.append(('signal_silencer', 'Silence in the Marsh', 'Disabled all three signal anchors.'))
-    if int(payload.get('rescued', 0)) >= 2:
-        definitions.append(('nobody_left', 'Nobody Left Behind', 'Rescued both missing people.'))
-    return definitions
-
-
-def _limit_arg(default=100, maximum=500):
-    try:
-        value = int(request.args.get('limit', default))
-    except (TypeError, ValueError):
-        value = default
-    return max(1, min(maximum, value))
-
-
 @app.get('/')
 def index():
     return Response(HTML, mimetype='text/html')
 
-
 @app.get('/health')
 def health():
-    db = _get_database()
-    return jsonify(status='ok', game='Florida Shadows: State Trooper Horror Files', version='Mongo Community Edition', storage='mongodb' if db is not None else 'memory')
-
-
-@app.get('/api/status')
-def api_status():
-    db = _get_database()
-    return jsonify(status='ok', game='Florida Shadows: State Trooper Horror Files', storage='mongodb' if db is not None else 'memory', mongo_configured=bool(os.environ.get('MONGODB_URI')), accounts_enabled=True)
-
-
-@app.get('/api/prayers')
-def api_get_prayers():
-    limit = _limit_arg(250, 500)
-    db = _get_database()
-    try:
-        if db is not None:
-            rows = list(db.prayers.find({}, {'_id': 0, 'name': 1, 'prayer': 1, 'created_at': 1}).sort('created_at', DESCENDING).limit(limit))
-            result = []
-            for row in rows:
-                created = row.get('created_at')
-                if isinstance(created, datetime):
-                    created = created.isoformat()
-                result.append({'name': row.get('name', 'Anonymous'), 'prayer': row.get('prayer', ''), 'created_at': str(created or '')})
-            return jsonify(prayers=result, persistent=True)
-    except Exception:
-        pass
-    with _memory_lock:
-        rows = list(reversed(_memory_prayers[-limit:]))
-    return jsonify(prayers=rows, persistent=False)
-
-
-@app.post('/api/prayers')
-def api_post_prayer():
-    now = time.time()
-    ip = request.headers.get('X-Forwarded-For', request.remote_addr or 'unknown').split(',')[0].strip()[:80]
-    with _memory_lock:
-        recent = [stamp for stamp in _prayer_rate.get(ip, []) if now - stamp < 60]
-        if len(recent) >= 5:
-            return jsonify(error='Please wait a minute before posting another prayer.'), 429
-        recent.append(now)
-        _prayer_rate[ip] = recent
-    data = _request_data()
-    name = _clean_text(data.get('name') or 'Anonymous', 30) or 'Anonymous'
-    prayer = _clean_text(data.get('prayer'), 600, multiline=True)
-    if len(prayer) < 4 or not any(ch.isalpha() for ch in prayer):
-        return jsonify(error='Please enter a readable prayer or supportive message of at least four characters.'), 400
-    doc = {'id': uuid.uuid4().hex, 'name': name, 'prayer': prayer, 'created_at': _now_iso()}
-    persistent = False
-    db = _get_database()
-    if db is not None:
-        try:
-            db.prayers.insert_one({'_id': doc['id'], 'name': name, 'prayer': prayer, 'created_at': datetime.now(timezone.utc)})
-            persistent = True
-        except Exception:
-            persistent = False
-    if not persistent:
-        with _memory_lock:
-            _memory_prayers.append(doc)
-            if len(_memory_prayers) > 1500:
-                del _memory_prayers[:-1500]
-    return jsonify(ok=True, prayer=doc, persistent=persistent), 201
-
-
-@app.get('/api/leaderboard')
-def api_get_leaderboard():
-    limit = _limit_arg(20, 50)
-    db = _get_database()
-    try:
-        if db is not None:
-            rows = list(db.leaderboard_runs.find({}, {'_id': 0}).sort([('score', DESCENDING), ('created_at', DESCENDING)]).limit(limit))
-            for row in rows:
-                if isinstance(row.get('created_at'), datetime):
-                    row['created_at'] = row['created_at'].isoformat()
-            return jsonify(entries=rows, persistent=True)
-    except Exception:
-        pass
-    with _memory_lock:
-        rows = sorted(_memory_leaderboard.values(), key=lambda row: (int(row.get('score', 0)), str(row.get('created_at', ''))), reverse=True)[:limit]
-    return jsonify(entries=rows, persistent=False)
-
-
-@app.post('/api/game/complete')
-def api_game_complete():
-    data = _request_data()
-    run_id = _clean_text(data.get('run_id'), 100) or uuid.uuid4().hex
-    def bounded_int(key, low=0, high=9999):
-        try:
-            return max(low, min(high, int(float(data.get(key, 0)))))
-        except (TypeError, ValueError, OverflowError):
-            return 0
-    won = bool(data.get('won'))
-    elapsed = bounded_int('elapsed', 0, 86400)
-    rescued = bounded_int('rescued', 0, 2)
-    clues_studied = bounded_int('clues_studied', 0, 100)
-    clues_collected = bounded_int('clues_collected', 0, 100)
-    reports = bounded_int('reports', 0, 100)
-    anchors = bounded_int('anchors', 0, 3)
-    kills = bounded_int('kills', 0, 999)
-    station_correct = bounded_int('station_correct', 0, 6)
-    station_processed = bounded_int('station_processed', 0, 6)
-    witness = bool(data.get('witness'))
-    score = (12000 if won else 0) + rescued * 2500 + clues_studied * 400 + reports * 650 + anchors * 500 + station_correct * 250 + min(kills, 30) * 60 + min(elapsed, 1800) // 30
-    db = _get_database()
-    account = _current_account(db)
-    name = _clean_text(account['username'] if account else data.get('display_name') or data.get('selected_character') or 'Unknown officer', 30) or 'Unknown officer'
-    record = {'run_id': run_id, 'name': name, 'score': int(score), 'won': won, 'elapsed': elapsed, 'rescued': rescued, 'clues_collected': clues_collected, 'clues_studied': clues_studied, 'reports': reports, 'anchors': anchors, 'station_correct': station_correct, 'station_processed': station_processed, 'witness': witness, 'kills': kills, 'created_at': _now_iso()}
-    persistent = False
-    try:
-        if db is not None:
-            db.leaderboard_runs.update_one({'run_id': run_id}, {'$setOnInsert': {**record, 'account_id': account['id'] if account else None, 'created_at': datetime.now(timezone.utc)}}, upsert=True)
-            persistent = True
-    except Exception:
-        persistent = False
-    if not persistent:
-        with _memory_lock:
-            _memory_leaderboard.setdefault(run_id, record)
-    earned = []
-    if account:
-        for code, title, description in _achievement_definitions({**record, 'won': won, 'clues_studied': clues_studied, 'reports': reports, 'witness': witness, 'station_correct': station_correct, 'station_processed': station_processed, 'anchors': anchors, 'rescued': rescued}):
-            item = {'code': code, 'title': title, 'description': description, 'earned_at': _now_iso()}
-            inserted = False
-            try:
-                if db is not None:
-                    res = db.achievements.update_one({'account_id': account['id'], 'code': code}, {'$setOnInsert': {'account_id': account['id'], **item}}, upsert=True)
-                    inserted = res.upserted_id is not None
-                else:
-                    with _memory_lock:
-                        key = (account['id'], code)
-                        if key not in _memory_achievements:
-                            _memory_achievements[key] = {'account_id': account['id'], **item}
-                            inserted = True
-            except Exception:
-                with _memory_lock:
-                    key = (account['id'], code)
-                    if key not in _memory_achievements:
-                        _memory_achievements[key] = {'account_id': account['id'], **item}
-                        inserted = True
-            if inserted:
-                earned.append({'code': code, 'title': title, 'description': description})
-    return jsonify(ok=True, score=int(score), earned=earned, persistent=persistent)
-
-
-@app.post('/api/accounts/register')
-def api_register_account():
-    data = _request_data()
-    username = _clean_text(data.get('username'), 24)
-    password = str(data.get('password') or '')
-    if not re.fullmatch(r'[A-Za-z0-9_.-]{3,24}', username):
-        return jsonify(error='Username must be 3–24 characters using letters, numbers, dot, dash, or underscore.'), 400
-    if len(password) < 8 or len(password) > 128:
-        return jsonify(error='Password must be 8–128 characters.'), 400
-    username_lower = username.lower()
-    account_id = uuid.uuid4().hex
-    doc = {'_id': account_id, 'username': username, 'username_lower': username_lower, 'password_hash': generate_password_hash(password), 'created_at': datetime.now(timezone.utc)}
-    db = _get_database()
-    persistent = False
-    try:
-        if db is not None:
-            if db.accounts.find_one({'username_lower': username_lower}):
-                return jsonify(error='That username is already taken.'), 409
-            db.accounts.insert_one(doc)
-            persistent = True
-        else:
-            with _memory_lock:
-                if username_lower in _memory_accounts_by_name:
-                    return jsonify(error='That username is already taken.'), 409
-                _memory_accounts[account_id] = {**doc, 'persistent': False}
-                _memory_accounts_by_name[username_lower] = account_id
-    except Exception:
-        with _memory_lock:
-            if username_lower in _memory_accounts_by_name:
-                return jsonify(error='That username is already taken.'), 409
-            _memory_accounts[account_id] = {**doc, 'persistent': False}
-            _memory_accounts_by_name[username_lower] = account_id
-        persistent = False
-    session.clear()
-    session['account_id'] = account_id
-    return jsonify(ok=True, message='Account created. You are signed in.', persistent=persistent, account={'id': account_id, 'username': username}), 201
-
-
-@app.post('/api/accounts/login')
-def api_login_account():
-    data = _request_data()
-    username = _clean_text(data.get('username'), 24)
-    password = str(data.get('password') or '')
-    if not username or not password:
-        return jsonify(error='Enter your username and password.'), 400
-    username_lower = username.lower()
-    db = _get_database()
-    account_doc = None
-    persistent = False
-    try:
-        if db is not None:
-            account_doc = db.accounts.find_one({'username_lower': username_lower})
-            persistent = account_doc is not None
-        if account_doc is None:
-            with _memory_lock:
-                aid = _memory_accounts_by_name.get(username_lower)
-                account_doc = _memory_accounts.get(aid) if aid else None
-    except Exception:
-        with _memory_lock:
-            aid = _memory_accounts_by_name.get(username_lower)
-            account_doc = _memory_accounts.get(aid) if aid else None
-    if not account_doc or not check_password_hash(account_doc.get('password_hash', ''), password):
-        return jsonify(error='Username or password is incorrect.'), 401
-    session.clear()
-    session['account_id'] = account_doc['_id']
-    return jsonify(ok=True, message='Signed in successfully.', persistent=persistent, account={'id': account_doc['_id'], 'username': account_doc['username']})
-
-
-@app.post('/api/accounts/logout')
-def api_logout_account():
-    session.clear()
-    return jsonify(ok=True, message='Signed out.')
-
-
-@app.get('/api/accounts/me')
-def api_account_me():
-    db = _get_database()
-    account = _current_account(db)
-    return jsonify(account=account, persistent=bool(db is not None and account is not None))
-
-
-@app.get('/api/achievements')
-def api_get_achievements():
-    db = _get_database()
-    account = _current_account(db)
-    if not account:
-        return jsonify(achievements=[], signed_in=False, persistent=False)
-    rows = []
-    try:
-        if db is not None:
-            rows = list(db.achievements.find({'account_id': account['id']}, {'_id': 0, 'code': 1, 'title': 1, 'description': 1, 'earned_at': 1}).sort('earned_at', DESCENDING).limit(100))
-        else:
-            with _memory_lock:
-                rows = [dict(v) for (aid, _), v in _memory_achievements.items() if aid == account['id']]
-    except Exception:
-        with _memory_lock:
-            rows = [dict(v) for (aid, _), v in _memory_achievements.items() if aid == account['id']]
-    for row in rows:
-        if isinstance(row.get('earned_at'), datetime):
-            row['earned_at'] = row['earned_at'].isoformat()
-    return jsonify(achievements=rows, signed_in=True, persistent=db is not None)
-
-
-@app.route('/api/game/save', methods=['GET', 'POST'])
-def api_game_save():
-    db = _get_database()
-    account = _current_account(db)
-    if not account:
-        return jsonify(error='Sign in to use cloud saves.'), 401
-    if request.method == 'GET':
-        try:
-            if db is not None:
-                row = db.saves.find_one({'account_id': account['id']}, {'_id': 0, 'snapshot': 1, 'saved_at': 1})
-            else:
-                with _memory_lock:
-                    row = _memory_saves.get(account['id'])
-        except Exception:
-            with _memory_lock:
-                row = _memory_saves.get(account['id'])
-        if not row:
-            return jsonify(error='No saved patrol was found.'), 404
-        return jsonify(snapshot=row.get('snapshot'), saved_at=str(row.get('saved_at', '')), persistent=db is not None)
-    data = _request_data()
-    snapshot = data.get('snapshot')
-    if not isinstance(snapshot, dict):
-        return jsonify(error='A valid checkpoint snapshot is required.'), 400
-    if len(str(snapshot)) > 280_000:
-        return jsonify(error='Checkpoint is too large to save.'), 413
-    saved_at = datetime.now(timezone.utc)
-    persistent = False
-    try:
-        if db is not None:
-            db.saves.update_one({'account_id': account['id']}, {'$set': {'snapshot': snapshot, 'saved_at': saved_at}}, upsert=True)
-            persistent = True
-    except Exception:
-        persistent = False
-    if not persistent:
-        with _memory_lock:
-            _memory_saves[account['id']] = {'snapshot': snapshot, 'saved_at': saved_at.isoformat()}
-    return jsonify(ok=True, persistent=persistent, saved_at=saved_at.isoformat())
-
+    return jsonify(status='ok', game='Florida Shadows: The Living Nightmare', version='The Haunted Features Edition')
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '5000'))
