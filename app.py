@@ -1,7 +1,114 @@
-from flask import Flask, Response, jsonify
+from flask import Flask, Response, jsonify, request, session
+from datetime import datetime, timezone
+from functools import wraps
+import json
 import os
+import re
+import secrets
+
+try:
+    from pymongo import MongoClient, ASCENDING, DESCENDING
+    from pymongo.errors import DuplicateKeyError, PyMongoError
+    from bson import ObjectId
+    from werkzeug.security import generate_password_hash, check_password_hash
+except Exception:
+    MongoClient = None
+    ASCENDING = 1
+    DESCENDING = -1
+    DuplicateKeyError = Exception
+    PyMongoError = Exception
+    ObjectId = None
+    generate_password_hash = None
+    check_password_hash = None
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or os.environ.get('SECRET_KEY') or secrets.token_hex(32)
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get('COOKIE_SECURE', '').lower() in ('1', 'true', 'yes')
+app.config['MAX_CONTENT_LENGTH'] = 96 * 1024
+
+_mongo_client = None
+_mongo_database = None
+_mongo_uri_cache = None
+_mongo_indexes_ready = False
+
+ACHIEVEMENT_CATALOG = {
+    'first_trace': {'title': 'First Trace', 'description': 'Recover your first piece of physical evidence.', 'icon': '⌕'},
+    'forensic_mind': {'title': 'Forensic Mind', 'description': 'Study six clues and build a supported theory.', 'icon': '▤'},
+    'cross_examiner': {'title': 'Cross-Examiner', 'description': 'Complete a witness interview with a corroborated statement.', 'icon': '◈'},
+    'night_auditor': {'title': 'Night Auditor', 'description': 'Complete the six-visitor intake investigation.', 'icon': '▣'},
+    'five_roofs': {'title': 'Five Roofs', 'description': 'Search five different buildings.', 'icon': '⌂'},
+    'two_lives': {'title': 'Two Lives', 'description': 'Find both missing survivors.', 'icon': '♡'},
+    'signal_breaker': {'title': 'Signal Breaker', 'description': 'Destroy all three signal anchors.', 'icon': 'ϟ'},
+    'quiet_observer': {'title': 'Quiet Observer', 'description': 'Read the memorial and its prayer.', 'icon': '✦'},
+    'nightmare_survivor': {'title': 'Nightmare Survivor', 'description': 'Finish the extraction defense and escape.', 'icon': '✧'},
+    'archive_reader': {'title': 'Archive Reader', 'description': 'Open the Night Archive and read a sealed note.', 'icon': '▥'},
+    'unbroken': {'title': 'Unbroken', 'description': 'Escape without being defeated.', 'icon': '⌁'},
+    'anchorless': {'title': 'Anchorless Ending', 'description': 'Escape after silencing the signal network.', 'icon': '☼'}
+}
+
+def _utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+def _get_database():
+    global _mongo_client, _mongo_database, _mongo_uri_cache, _mongo_indexes_ready
+    uri = (os.environ.get('MONGODB_URI') or '').strip()
+    if not uri:
+        return None, 'MONGODB_URI is not configured.'
+    if MongoClient is None:
+        return None, 'The pymongo package is unavailable. Install requirements.txt.'
+    if _mongo_database is not None and _mongo_uri_cache == uri:
+        try:
+            _mongo_client.admin.command('ping')
+            return _mongo_database, None
+        except Exception:
+            _mongo_database = None
+            _mongo_client = None
+            _mongo_indexes_ready = False
+    try:
+        client = MongoClient(uri, serverSelectionTimeoutMS=2500, connectTimeoutMS=2500, tz_aware=True)
+        client.admin.command('ping')
+        database_name = (os.environ.get('MONGODB_DB') or 'florida_shadows').strip() or 'florida_shadows'
+        database = client[database_name]
+        if not _mongo_indexes_ready or _mongo_uri_cache != uri:
+            database.users.create_index([('username_key', ASCENDING)], unique=True)
+            database.saves.create_index([('user_id', ASCENDING), ('slot', ASCENDING)], unique=True)
+            database.leaderboards.create_index([('score', DESCENDING), ('created_at', ASCENDING)])
+            database.achievements.create_index([('user_id', ASCENDING), ('achievement_id', ASCENDING)], unique=True)
+            _mongo_indexes_ready = True
+        _mongo_client = client
+        _mongo_database = database
+        _mongo_uri_cache = uri
+        return database, None
+    except Exception:
+        return None, 'Could not connect to MongoDB. Check the URI, database access list, and credentials.'
+
+def _current_user(database):
+    user_id = session.get('user_id')
+    if not user_id or database is None or ObjectId is None:
+        return None
+    try:
+        user = database.users.find_one({'_id': ObjectId(user_id)}, {'password_hash': 0})
+        return user
+    except Exception:
+        return None
+
+def _auth_required(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        database, error = _get_database()
+        if database is None:
+            return jsonify(ok=False, error=error or 'Database unavailable.'), 503
+        user = _current_user(database)
+        if user is None:
+            return jsonify(ok=False, error='Sign in to use this feature.'), 401
+        return fn(database, user, *args, **kwargs)
+    return wrapped
+
+def _json_safe(value):
+    return json.loads(json.dumps(value, ensure_ascii=True, allow_nan=False))
+
 
 HTML = r'''<!doctype html>
 <html lang="en">
@@ -485,6 +592,7 @@ body.prologue-mode.prologue-drive.mobile-mode #touchControls { display: block; }
 .memorial-icons span { padding:4px 7px; color:#d8c99e; background:#171b13; border:1px solid #484533; font-size:9px; letter-spacing:.6px; }
 .memorial-home p { margin:8px 0 0; font-size:11px; line-height:1.7; color:#c3c8b9; }
 .memorial-home .memorial-signoff { display:block; margin-top:8px; color:#e0d1a9; font-size:10px; letter-spacing:.4px; }
+.memorial-prayer-home { border-top:1px solid #3b4030; padding-top:8px; color:#d1c6a7!important; font-style:italic; }
 .memorial-panel { width:min(760px,96vw); border-color:#8b7d5b; background:linear-gradient(145deg,rgba(21,23,17,.99),rgba(5,7,6,.99)); }
 .memorial-panel .section-title { color:#efe3c5; letter-spacing:.5px; }
 .memorial-letter { margin:18px 0; padding:20px clamp(16px,4vw,30px); border-top:1px solid #827554; border-bottom:1px solid #827554; background:linear-gradient(120deg,rgba(49,44,30,.47),rgba(8,11,8,.75)); color:#d3cbb8; font-size:13px; line-height:1.95; }
@@ -1237,8 +1345,51 @@ body.hunting #survivorLocator{opacity:0}
 @keyframes realityPulse{0%{opacity:.17;clip-path:inset(0 0 90% 0)}25%{opacity:.55;clip-path:inset(26% 0 62% 0)}50%{opacity:.12;clip-path:inset(58% 0 28% 0)}75%{opacity:.44;clip-path:inset(84% 0 8% 0)}100%{opacity:.2;clip-path:inset(10% 0 80% 0)}}
 @media(max-width:650px){#huntBanner{top:8px;font-size:9px;padding:8px 9px;max-width:94vw}#huntBanner small{font-size:8px}.radio-breach-choices{grid-template-columns:1fr}.radio-breach-choices button{min-height:56px}}
 
-#partnerChat { display:none !important; visibility:hidden !important; pointer-events:none !important; }
-#driveLaneHUD { display:none !important; }
+
+#partnerChat,
+#driveLaneHUD {
+  display: none !important;
+}
+.account-panel { width:min(920px,96vw); }
+.account-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:15px 0; }
+.account-card { min-width:0; padding:13px; border:1px solid #53614e; background:rgba(6,10,7,.94); }
+.account-card h3 { margin:0 0 9px; color:#d8c995; font-size:12px; letter-spacing:1.3px; }
+.account-card p { color:#aeb9a8; font-size:10px; line-height:1.6; }
+.account-field { display:grid; gap:5px; margin:9px 0; color:#bec9b8; font-size:10px; }
+.account-field input,.archive-search,.archive-select { width:100%; padding:9px; border:1px solid #52644e; background:#0b110d; color:#f0eddd; outline:none; }
+.account-actions { display:flex; flex-wrap:wrap; gap:7px; margin-top:10px; }
+.account-status { margin-top:10px; padding:10px; border:1px solid #43513e; color:#c2ceb8; background:#070b08; white-space:pre-wrap; font-size:10px; line-height:1.6; }
+.account-status.error { border-color:#8f4040; color:#f0b9b3; }
+.account-table { width:100%; border-collapse:collapse; font-size:10px; }
+.account-table th,.account-table td { text-align:left; vertical-align:top; padding:7px 5px; border-bottom:1px solid #2d382d; }
+.account-table th { color:#d7ca9f; }
+.account-achievement { display:grid; grid-template-columns:30px minmax(0,1fr) auto; gap:8px; align-items:center; padding:8px 0; border-bottom:1px solid #2c372d; }
+.account-achievement .achievement-icon { color:#ddca8b; font-size:19px; text-align:center; }
+.account-achievement strong { color:#dedac6; font-size:10px; display:block; }
+.account-achievement small { color:#a1ad9d; font-size:9px; line-height:1.4; display:block; margin-top:3px; }
+.archive-panel { width:min(1060px,97vw); max-height:92vh; }
+.archive-toolbar { display:grid; grid-template-columns:minmax(0,1fr) 210px; gap:8px; margin:14px 0; }
+.archive-count { margin:8px 0; color:#b9c4b0; font-size:10px; }
+.archive-list { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+.archive-entry { min-width:0; border:1px solid #39463a; background:linear-gradient(145deg,#0b100c,#060806); padding:12px; }
+.archive-entry[hidden] { display:none; }
+.archive-meta { display:flex; justify-content:space-between; gap:8px; color:#a8b69d; font-size:8px; letter-spacing:1px; }
+.archive-entry h3 { color:#e3d6ad; margin:9px 0; font-size:12px; line-height:1.4; }
+.archive-entry p { color:#c0c9b8; font-size:10px; line-height:1.65; margin:6px 0; }
+.archive-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin-top:10px; }
+.archive-grid section { padding:8px; background:#0b100c; border:1px solid #263126; }
+.archive-grid h4 { margin:0 0 7px; color:#b9c38d; font-size:8px; letter-spacing:1px; }
+.archive-entry details { margin-top:9px; border-top:1px solid #394239; padding-top:8px; }
+.archive-entry summary { color:#d4b97b; cursor:pointer; font-size:9px; letter-spacing:.5px; }
+.archive-tags { display:flex; gap:5px; flex-wrap:wrap; margin-top:9px; }
+.archive-tags span { padding:3px 5px; color:#99aa92; border:1px solid #354433; font-size:8px; }
+.memorial-tombstone-art { width:min(320px,82vw); min-height:150px; margin:12px auto; display:grid; place-items:center; }
+.tombstone-stone { width:min(260px,70vw); padding:20px 15px 14px; border:2px solid #78776b; border-radius:46% 46% 5px 5px / 22% 22% 5px 5px; background:linear-gradient(110deg,#353a35,#1b211c 48%,#111511); box-shadow:0 0 0 5px #171b16,0 12px 24px #000b,inset 0 0 18px #b9bd9f12; text-align:center; }
+.tombstone-cross { font-size:26px; color:#d0c7a8; line-height:1.1; }
+.tombstone-name { margin-top:8px; font-size:11px; color:#e2d6b0; letter-spacing:1px; }
+.tombstone-dates { margin-top:6px; font-size:9px; color:#b1b49f; }
+.prayer-card { margin:14px 0; border-left:3px solid #c0ae7a; padding:13px 16px; background:#10150f; color:#d5d0bf; font-size:12px; line-height:1.9; }
+@media(max-width:720px) { .account-grid,.archive-list { grid-template-columns:1fr; } .archive-toolbar { grid-template-columns:1fr; } .archive-grid { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
@@ -1282,8 +1433,7 @@ body.hunting #survivorLocator{opacity:0}
     <button id="hideAction" type="button" title="Hide in nearby cover (C)">C · HIDE</button>
     <button id="screamAction" type="button" title="Scream to stagger nearby enemies but attract the Smiler (G)">G · SCREAM</button>
     <button id="helpAction" type="button" title="Request a short radio assist (H)">H · HELP</button>
-    <button id="bodycamAction" type="button" title="Use a limited bodycam burst (V) to capture hidden movement; the flash attracts attention">V · CAM 3</button>
-    <span id="survivalStatus">RUN · HIDE · SCREAM · BODYCAM · HELP</span>
+    <span id="survivalStatus">RUN · HIDE · SCREAM · ASK FOR HELP</span>
   </div>
   <div id="bottom">
     <div class="hudbox">
@@ -1313,7 +1463,6 @@ body.hunting #survivorLocator{opacity:0}
     <button id="touchReload">RELOAD</button>
     <button id="touchRun">SPRINT</button>
     <button id="touchBag">BAG</button>
-    <button id="touchBodycam">CAM</button>
   </div>
 </div>
 <div id="toast"></div>
@@ -1349,6 +1498,8 @@ body.hunting #survivorLocator{opacity:0}
           <button id="controlsBtn">Control mode</button>
           <button id="howBtn">How to play</button>
           <button id="creditsBtn">Credits</button>
+          <button id="archiveBtn">Night Archive</button>
+          <button id="accountBtn">Account / Cloud Save</button>
           <button id="disclaimerBtn">Horror & privacy disclaimer</button>
         </div>
         <section class="memorial-home" aria-label="In loving memory of Yumi's grandfather">
@@ -1356,6 +1507,7 @@ body.hunting #survivorLocator{opacity:0}
           <div class="memorial-icons" aria-label="His loves"><span>✈ PLANES</span><span>▰ CARS</span><span>▣ PHOTOGRAPHY</span></div>
           <p>He was a great man who lived a long, full life. His passing came suddenly in the early morning, but the things he loved and the memories he leaves behind will continue to matter. May the journeys he admired, the photographs he treasured, and the stories he shared bring comfort to everyone who loves him.</p>
           <span class="memorial-signoff">With heartfelt sympathy to Yumi and her family. May he rest in peace.</span>
+          <p class="memorial-prayer-home">A prayer for comfort: May God welcome him into peace, and give Yumi and her family strength for the difficult mornings, gentleness for the quiet moments, and warm memories to hold close. Amen.</p>
         </section>
         <div class="pc-hint">THE SEVENTH ARRIVAL · SCREAM JAM 2026 · HEADPHONES RECOMMENDED</div>
       </div>
@@ -1386,8 +1538,8 @@ body.hunting #survivorLocator{opacity:0}
     <p class="intro">Choose the controls that match your device. You can switch this later from the main menu.</p>
     <div class="choice-row"><button id="desktopMode" class="selected">Desktop / Laptop</button><button id="mobileMode">Mobile / Touchscreen</button></div>
     <div class="two-col">
-      <div class="info-card"><b>DESKTOP</b><br>WASD or arrows to move<br>Shift to sprint<br>E to investigate<br>F to toggle flashlight<br>C to hide in nearby cover<br>G to scream: stagger threats, attract Smiler<br>H to request partner radio pulse<br>V to use one of 3 bodycam bursts (reveals hidden movement but attracts the Smiler)<br>R reload · Space/left-click fire<br>J case file · I inventory · Esc pause</div>
-      <div class="info-card"><b>MOBILE</b><br>Use the directional pad to move<br>Tap SEARCH to investigate<br>Tap FIRE to shoot<br>Tap LIGHT to use the flashlight<br>Tap SPRINT to run<br>Tap HIDE / SCREAM / HELP on the survival panel<br>Tap BAG for inventory<br>Tap CAM for a limited bodycam reveal<br>Touch buttons stay visible during play</div>
+      <div class="info-card"><b>DESKTOP</b><br>WASD or arrows to move<br>Shift to sprint<br>E to investigate<br>F to toggle flashlight<br>C to hide in nearby cover<br>G to scream: stagger threats, attract Smiler<br>H to request partner radio pulse<br>R reload · Space/left-click fire<br>J case file · I inventory · V quick save · Esc pause</div>
+      <div class="info-card"><b>MOBILE</b><br>Use the directional pad to move<br>Tap SEARCH to investigate<br>Tap FIRE to shoot<br>Tap LIGHT to use the flashlight<br>Tap SPRINT to run<br>Tap HIDE / SCREAM / HELP on the survival panel<br>Tap BAG for inventory<br>Touch buttons stay visible during play</div>
     </div>
     <div class="page-buttons"><button id="saveControls">Save control mode</button><button id="backControls">Back to menu</button></div>
   </div>
@@ -1404,11 +1556,11 @@ body.hunting #survivorLocator{opacity:0}
       <div class="rule"><b>04B / SCREEN VISITORS</b>Inside the County Police Station, inspect six visitor IDs, question each one, cross-check the official roster, and make at least five correct admit/detain decisions. Review flagged files after studying four clues.</div>
       <div class="rule"><b>05 / RESCUE</b>Find both missing people. They follow after you help them, and their footsteps attract attention.</div>
       <div class="rule"><b>06 / STAY ALIVE</b>The Smiler learns your habits. Sprinting and constant light make it predict your route. During a hunt, hide only briefly, then break line of sight. A false dispatch may offer a tempting green signal.</div>
-      <div class="rule"><b>07 / RUN, HIDE, SCREAM, SNAP</b>Use C near cover to hide and stay still. G makes a loud scream that can stagger nearby crawlers but attracts the Smiler. H requests a short radio pulse. V uses one of three bodycam bursts: it briefly exposes movement in the darkness, but the flash and recording tone attract the Smiler.</div>
+      <div class="rule"><b>07 / RUN, HIDE, SCREAM</b>Use C near cover to hide and stay still. G makes a loud scream that can stagger nearby enemies but attracts the Smiler. The Smiler can begin five marked hunt phases; survive by sprinting in bursts, hiding briefly, and using buildings to break sight. H requests a short radio pulse that marks nearby threats, stuns crawlers briefly, and restores a little flashlight battery.</div>
       <div class="rule"><b>08 / BREAK THE SIGNAL</b>Optional: destroy the black signal seals in the County Police Station, Pine Rest Motel, and St. Mercy Chapel. They weaken the mimic network and unlock a true-ending variation.</div>
       <div class="rule"><b>09 / SEARCH BUILDINGS</b>Press E at doors. Search five different buildings, and check rooms again: items may vanish when you look away. Important mission keys remain recoverable.</div>
       <div class="rule"><b>10 / ESCAPE</b>Rescue both survivors, recover and study six clues, generate four distinct cross-reference reports, defend the theory, recover the relay override key, search five buildings, save Silas Venn’s statement, then survive the 30-second extraction defense.</div>
-      <div class="rule"><b>11 / A MOMENT OF REMEMBRANCE</b>Optional: inside the County Police Station, look for the framed tribute along the east side of the room. Press E to read it. This quiet memorial is separate from the investigation objectives.</div>
+      <div class="rule"><b>11 / A MOMENT OF REMEMBRANCE</b>Optional: find the outdoor tombstone near St. Mercy Chapel or the framed tribute inside the County Police Station. Press E to read the remembrance and prayer. The Smiler may offer a quiet condolence line, but this memorial moment is not an attack.</div>
     </div>
     <p class="intro">Search buildings for ammunition, bandages, batteries, and clues. Press J to study collected evidence, compare contradictory details, and submit a supported case theory. Inside the County Police Station, chat with six visitors, inspect their ID cards, compare their explanations with the roster, and decide who should be admitted or detained. At least five decisions must be correct; flagged files can be re-audited after studying four clues. Extraction requires both survivors, six collected and studied clues, four distinct cross-reference reports, the accepted case theory, a corroborated witness statement, a completed intake audit, the relay override key, five different buildings searched, and a 30-second holdout under attack.</p>
     <div class="page-buttons"><button id="backHow">Return to menu</button></div>
@@ -1423,6 +1575,8 @@ body.hunting #survivorLocator{opacity:0}
       <div><b>FLORIDA SHADOWS</b><span>STATE TROOPER HORROR FILES</span><small>Pixel horror project · Scream Jam 2026</small></div>
     </div>
     <div class="credits-lines"><b>WITH APPRECIATION TO</b><br><strong class="credit-name">Mayumi Alingarog</strong><br><span class="credit-alias">Also known as Yumi, Mimi, and Yumimi</span><p>To Mayumi Alingarog, my classmate and fellow developer: thank you for being such a helpful, kind, and respectful person. Your support, encouragement, and willingness to share this creative journey mean a lot. Your kindness makes collaboration better, and I am grateful to have you as a classmate and fellow developer.</p><p>This project is a little more special because of the people who offer encouragement along the way. Thank you for being one of them.</p></div>
+    <div class="credits-lines"><b>IN LOVING MEMORY OF YUMI’S GRANDFATHER</b><p>For a great man who lived a long life and loved planes, cars, and photography. May the journeys he admired, the moments he captured, and the stories held in every photograph remain a source of comfort. His sudden passing cannot erase the years he lived or the love he gave. May he rest in peace, and may Yumi and her family be surrounded by patience, kindness, and support as they grieve.</p></div>
+    <div class="credits-lines"><b>A PRAYER FOR YUMI AND HER FAMILY</b><p>God of mercy, hold this family gently in a time of sorrow. Welcome their loved one into peace. Give them strength when grief arrives without warning, rest when the days feel heavy, and people who will listen without asking them to hurry. Let memories of his long life become a light they can return to. Amen.</p></div>
     <div class="credits-lines"><b>TO EVERYONE WHO PLAYS</b><br>Thank you for stepping into the swamp, investigating the case, and helping bring this horror story to life. Keep exploring, keep creating, and never ignore strange sounds on the radio.</div>
     <div class="info-card credits-quote">“Every mystery leaves a trace. Every crime leaves a shadow. And some shadows are always watching.”</div>
     <div class="page-buttons"><button id="backCredits">Return to menu</button></div>
@@ -1432,6 +1586,13 @@ body.hunting #survivorLocator{opacity:0}
   <div class="panel memorial-panel">
     <div class="kicker">A quiet corner of the County Police Station</div>
     <h2 id="grandfatherMemorialTitle" class="section-title">In Loving Memory</h2>
+    <div class="memorial-tombstone-art" aria-label="Memorial tombstone">
+      <div class="tombstone-stone">
+        <div class="tombstone-cross">✦</div>
+        <div class="tombstone-name">A LIFE WELL LIVED</div>
+        <div class="tombstone-dates">Remembered with love · October 16, 2026</div>
+      </div>
+    </div>
     <div class="memorial-photo-row" aria-label="A small tribute to his favourite things">
       <div class="memorial-photo"><strong>✈</strong><span>THE PLANES HE LOVED</span></div>
       <div class="memorial-photo"><strong>▰</strong><span>THE CARS HE ADMIRED</span></div>
@@ -1441,10 +1602,9 @@ body.hunting #survivorLocator{opacity:0}
       <p>Dedicated to Yumi’s grandfather, who passed away suddenly in the early morning of October 16, 2026.</p>
       <p>He loved planes, cars, and photographs—the journeys they represented, the details worth noticing, and the moments worth keeping. He lived a long life and was a great man. A sudden goodbye cannot take away the years he lived, the memories he made, or the love that remains.</p>
       <p>May every photograph bring back a story, every passing plane remind those who loved him of the wonder he saw in the world, and every memory make the loss a little gentler with time. May he rest in peace.</p>
-      <p><b>A prayer for her lolo:</b> God of mercy, welcome him into peace and hold his family close as they grieve. Give Yumi patience with the difficult mornings, comfort when memories arrive unexpectedly, and people who will listen when words are hard to find. Let the love he gave remain a light she can carry. Amen.</p>
-      <p><b>For Yumi:</b> You do not have to be strong every minute. You are allowed to miss him, to cry, to laugh at a memory, and to take things one day at a time. The care and inspiration you have given other people still matter, even on days when your own heart feels heavy.</p>
     </div>
-    <p class="memorial-note">This is a quiet tribute offered with respect and sympathy to Yumi and her family. It is not evidence in the case, and nothing here is meant to turn their loss into a scare. The Smiler’s condolence line happens only after you leave this memorial; the tribute itself stays peaceful.</p>
+    <div class="prayer-card"><strong>A PRAYER FOR HER LOLO</strong><br>God of compassion, welcome him into Your peace. Comfort Yumi and her family after this sudden goodbye. Give them strength on the mornings when the loss feels new, patience with every kind of grief, and gentle company when words are difficult. Let the memory of his long life, his love of planes and cars, and the photographs he treasured bring warmth instead of pain in time. May he rest in peace. Amen.</div>
+    <p class="memorial-note">Yumi, you do not need to be strong every moment. Grief is not a failure, and you do not have to rush it. The care and inspiration you have given others still matter, even on days when all you can do is get through the day. This is a quiet tribute offered with respect to you and your family. It is not evidence in the case, and nothing here is meant to turn your loss into a scare.</p>
     <div class="page-buttons"><button id="closeMemorial">Leave the memory in peace</button></div>
   </div>
 </div>
@@ -1800,14 +1960,7 @@ const state={
   realityPulseCooldown:0,
   realityPulseCount:0,
   lastRealityRoom:'',
-  memorialTributeViewed:false,
-  memorialViewedAt:0,
-  bodycamCharges:3,
-  bodycamCooldown:0,
-  bodycamRevealTimer:0,
-  bodycamFlashTimer:0,
-  bodycamTarget:null,
-  bodycamCount:0
+  memorialTributeViewed:false
 };
 let W=innerWidth;
 let H=innerHeight;
@@ -2371,7 +2524,7 @@ function makeObjects(){
     {id:'ammo1',x:1010,y:805,type:'loot',name:'Ammunition box',loot:'ammo',found:false,icon:'▪'},
     {id:'battery1',x:1525,y:520,type:'loot',name:'Flashlight batteries',loot:'battery',found:false,icon:'ϟ'},
     {id:'ammo2',x:2225,y:1590,type:'loot',name:'Emergency ammo pouch',loot:'ammo',found:false,icon:'▪'},
-    {id:'grandfather-tombstone',x:2325,y:1985,type:'memorialStone',name:'A quiet remembrance stone',detail:'A peaceful memorial for Yumi’s grandfather. Planes, cars, and photographs are carved into its base. This is a place for remembrance, not evidence.',icon:'✦'},
+    {id:'yumi-grandfather-tombstone',x:2240,y:2038,type:'memorial',tombstone:true,name:'Quiet memorial stone',detail:'A peaceful tombstone remembers a long life, a love of planes, cars, and photographs, and the family who carries those memories forward.',icon:'✦'},
     {id:'exit',x:2920,y:2300,type:'exit',name:'Emergency extraction beacon',detail:'A portable emergency beacon awaits a completed case file and the relay override key.',icon:'✦'}
   ];
   survivors=[
@@ -2439,6 +2592,8 @@ function makeRoom(name){
 }
 function resetGame(){
   const spec=specs[state.selectedCharacter];
+  state.currentRoomId=null;
+  state.currentRoomId=null;
   player={x:310,y:330,r:10,angle:0,speed:spec.speed,hp:spec.hp,maxHp:spec.hp,stamina:spec.stamina,maxStamina:spec.stamina,step:0,moving:false,hidden:false,invulnerable:0,flash:0,footstep:0};
   health=player.hp;
   stamina=player.stamina;
@@ -2520,13 +2675,11 @@ function resetGame(){
   particles=[];
   crawlers=[];
   for(let i=0;i<2;i++){
-    crawlers.push({x:760+i*760,y:420+(i%2)*620,r:9,hp:2,speed:70+Math.random()*12,phase:Math.random()*8,alert:false,attack:0,dead:false,hiddenUntil:18});
+    crawlers.push({x:1030+i*900,y:690+(i%2)*680,r:9,hp:2,speed:66+Math.random()*9,phase:Math.random()*8,alert:false,attack:0,dead:false,hiddenUntil:22});
   }
   monster={x:2800,y:2080,r:15,stun:0,phase:0,active:false,spotted:false,attack:0,lastMove:0,warpCooldown:0,hidden:false,vanishTimer:0,vanishCooldown:4.5+Math.random()*3.4,activeTime:0,pendingX:0,pendingY:0,reappearGlow:0,blinkCount:0};
   makeObjects();
   state.elapsed=0;
-  state.memorialTributeViewed=false;state.memorialViewedAt=0;
-  state.bodycamCharges=3;state.bodycamCooldown=0;state.bodycamRevealTimer=0;state.bodycamFlashTimer=0;state.bodycamTarget=null;state.bodycamCount=0;
   state.missionClock=137;
   state.toastTimer=0;
   state.radioTimer=0;
@@ -3441,11 +3594,15 @@ function interact(){
     if(evidence>=6&&!state.horrorEventFlags.sixthClueWhisper){state.horrorEventFlags.sixthClueWhisper=true;state.flashlightFlickerTimer=2.3;triggerWhisper('That was the last clue. I was hoping you would never find it.','center','VOICE INSIDE THE FILE');toast('THE SIXTH CLUE HAS YOUR HANDWRITING ON IT.',3.8);}
     return;
   }
-  if(target.type==='memorial'||target.type==='memorialStone'){
+  if(target.type==='memorial'){
     state.memorialTributeViewed=true;
-    state.memorialViewedAt=state.elapsed;
-    state.horrorEventFlags.memorialVisited=true;
-    state.horrorEventFlags.memorialCondolenceAt=state.elapsed+4.5;
+    state.horrorEventFlags=state.horrorEventFlags||{};
+    if(!state.horrorEventFlags.memorialCondolence){
+      state.horrorEventFlags.memorialCondolence=true;
+      const condolence=state.selectedCharacter==='yumi'?'How is life, Yumi? I heard about your lolo. I offer my condolences. Even a long life leaves a sudden silence; you do not need to carry it alone.':'How is life, Hugo? I heard about Yumi’s lolo. I offer my condolences. Be gentle with your friend. Grief is not weakness, and memories deserve kindness.';
+      if(state.options.voiceWhispers)triggerWhisper(condolence,'center','THE SMILER — A QUIET MOMENT');
+      toast('A rare, quiet voice offers condolences. This moment will not trigger an attack.',3.2);
+    }
     enterScreen('memorial');
     return;
   }
@@ -3541,6 +3698,7 @@ function enterBuilding(target){
   state.lastBuildingExit={x:target.x,y:target.y+target.h/2+16};
   state.floor='inside';
   state.room=makeRoom(target.room);
+  state.currentRoomId=target.room;
   state.indoorPresence={timer:0,cooldown:6+Math.random()*4,x:clamp(player.x+choose([-1,1])*Math.min(280,state.room.w*.34),80,state.room.w-80),y:clamp(player.y-180,80,state.room.h-80),phase:Math.random()*9,arming:0,appearances:0};
   indoorEchoHistory=[];indoorEcho={active:false,timer:0,cooldown:8+Math.random()*5,x:0,y:0,angle:0,phase:Math.random()*9,roomId:target.room,roomAge:0};indoorEchoSampleTimer=.2;indoorEchoRoomId=target.room;
   if(target.room==='farmhouse'){state.indoorPresence.timer=1.2;state.indoorPresence.cooldown=8;state.intensity=1;state.screenShake=Math.max(state.screenShake,.28);voiceNoise(choose(['left','right']),.19);toast('THE UPSTAIRS FLOOR CREAKS. YOU ARE STILL ON THE GROUND FLOOR.',3.2);}
@@ -3569,6 +3727,7 @@ function leaveBuilding(){
   const exitName=state.room.title;
   state.floor='outside';
   state.room=null;
+  state.currentRoomId=null;
   player.speed=specs[state.selectedCharacter].speed;
   player.x=clamp(player.x+0,50,WORLD.w-50);
   player.y=clamp(player.y+0,50,WORLD.h-50);
@@ -3620,8 +3779,7 @@ function spawnCrawlerWave(count=2,minRadius=180,speedBase=92,hp=2){
   if(state.anchorsDisabled&&state.extractionStarted)count=Math.max(1,count-1);
   let alive=crawlers.filter(c=>!c.dead).length;
   let made=0;
-  const activeLimit=4;
-  for(let i=0;i<count&&alive<activeLimit;i++){
+  for(let i=0;i<count&&alive<6;i++){
     const angle=(Math.PI*2*i/Math.max(1,count))+Math.random()*.55;
     const radius=minRadius+Math.random()*70;
     let x=clamp(player.x+Math.cos(angle)*radius,70,WORLD.w-70);
@@ -4065,10 +4223,6 @@ function drawScreamPulse(){
   ctx.strokeStyle='rgba(223,194,168,'+(.55*(1-progress))+')';ctx.lineWidth=1;ctx.beginPath();ctx.arc(x,y,radius*.78,0,Math.PI*2);ctx.stroke();ctx.restore();
 }
 function updateSurvivalActions(dt){
-  state.bodycamCooldown=Math.max(0,state.bodycamCooldown-dt);
-  state.bodycamRevealTimer=Math.max(0,state.bodycamRevealTimer-dt);
-  state.bodycamFlashTimer=Math.max(0,state.bodycamFlashTimer-dt);
-  if(state.bodycamRevealTimer<=0)state.bodycamTarget=null;
   state.screamCooldown=Math.max(0,state.screamCooldown-dt);
   state.helpCooldown=Math.max(0,state.helpCooldown-dt);
   state.helpTimer=Math.max(0,state.helpTimer-dt);
@@ -4085,53 +4239,17 @@ function updateSurvivalActions(dt){
   }
   const moving=keys.w||keys.a||keys.s||keys.d||keys.arrowup||keys.arrowdown||keys.arrowleft||keys.arrowright;
   if(state.hideSpotActive&&moving){state.hideSpotActive=false;player.hidden=false;state.hideSpotName='';state.hideElapsed=0;state.hideRisk=0;state.noise=Math.max(state.noise,.35);if(state.hideRestoreFlashlight&&flashlightBattery>0)flashlight=true;state.hideRestoreFlashlight=false;toast('YOU SCRAMBLE OUT OF COVER. IT HEARD YOU.',1.9);}
-  const hideBtn=$('hideAction'),screamBtn=$('screamAction'),helpBtn=$('helpAction'),camBtn=$('bodycamAction'),status=$('survivalStatus');
+  const hideBtn=$('hideAction'),screamBtn=$('screamAction'),helpBtn=$('helpAction'),status=$('survivalStatus');
   if(hideBtn){hideBtn.textContent=state.hideSpotActive?'C · EMERGE':'C · HIDE';hideBtn.setAttribute('aria-label',state.hideSpotActive?'Leave hiding place':'Hide in nearby cover');}
   if(screamBtn){screamBtn.disabled=state.screamCooldown>0;screamBtn.textContent=state.screamCooldown>0?'G · SCREAM '+Math.ceil(state.screamCooldown)+'s':'G · SCREAM';}
   if(helpBtn){helpBtn.disabled=state.helpCooldown>0;helpBtn.textContent=state.helpCooldown>0?'H · HELP '+Math.ceil(state.helpCooldown)+'s':'H · HELP';}
-  if(camBtn){camBtn.disabled=state.bodycamCooldown>0||state.bodycamCharges<=0;camBtn.textContent=state.bodycamCooldown>0?'V · CAM '+Math.ceil(state.bodycamCooldown)+'s':'V · CAM '+state.bodycamCharges;camBtn.title=state.bodycamCharges+' bodycam bursts remain. Reveals movement but attracts the Smiler.';}
   if(status){
     if(state.hideSpotActive)status.textContent='HIDDEN '+Math.min(100,Math.floor(state.hideElapsed/13.5*100))+'% · STAY STILL';
     else if(state.helpTimer>0)status.textContent='RADIO PULSE ACTIVE · '+Math.ceil(state.helpTimer)+'s';
-    else status.textContent='RUN · HIDE · SCREAM · BODYCAM '+state.bodycamCharges+'/3 · HELP';
+    else status.textContent='RUN · HIDE · SCREAM · CALL FOR HELP';
   }
 }
 
-function useBodycamBurst(){
-  if(!state.running||state.paused||state.gameOver||state.screen!=='game'||state.prologueStage!=='swamp')return;
-  if(state.hideSpotActive){toast('DO NOT FLASH WHILE HIDING. THE LIGHT WILL GIVE YOU AWAY.',1.8);return;}
-  if(state.bodycamCooldown>0){toast('BODYCAM RECHARGING: '+Math.ceil(state.bodycamCooldown)+'s.',1.2);return;}
-  if(state.bodycamCharges<=0){toast('NO BODYCAM FLASHES REMAIN.',1.6);return;}
-  state.bodycamCharges--;
-  state.bodycamCooldown=2.8;
-  state.bodycamRevealTimer=2.65;
-  state.bodycamFlashTimer=.17;
-  state.bodycamCount++;
-  state.noise=Math.max(state.noise,.58);
-  state.intensity=Math.max(state.intensity,.82);
-  state.screenShake=Math.max(state.screenShake,.12);
-  sound('radio');tone(1260,.055,'square',.045,-860);tone(73,.22,'triangle',.045,-30);
-  let target=null;
-  if(state.floor==='inside'&&state.indoorPresence&&state.indoorPresence.timer>0){
-    target={x:state.indoorPresence.x,y:state.indoorPresence.y,real:true,label:'INDOOR PRESENCE'};
-  }else if(monster&&monster.active){
-    target={x:monster.hidden?monster.pendingX:monster.x,y:monster.hidden?monster.pendingY:monster.y,real:true,label:monster.hidden?'REAPPEARANCE VECTOR':'THE SMILER'};
-  }else if(state.falseSignal&&state.falseSignal.active){
-    target={x:state.falseSignal.x,y:state.falseSignal.y,real:false,label:'FALSE SIGNAL'};
-  }else{
-    const a=(player.angle||0)+Math.PI+(Math.random()-.5)*1.4;
-    const r=135+Math.random()*155;
-    const localW=state.floor==='inside'&&state.room?state.room.w:WORLD.w;
-    const localH=state.floor==='inside'&&state.room?state.room.h:WORLD.h;
-    target={x:clamp(player.x+Math.cos(a)*r,55,localW-55),y:clamp(player.y+Math.sin(a)*r,55,localH-55),real:false,label:'UNIDENTIFIED SHAPE'};
-  }
-  state.bodycamTarget=target;
-  for(const c of crawlers){if(!c.dead&&dist(player.x,player.y,c.x,c.y)<145)c.stunned=Math.max(c.stunned||0,.75);}
-  if(monster&&monster.active&&!state.huntActive)state.nextHuntAt=Math.min(state.nextHuntAt,state.elapsed+7.5);
-  caseRecords.push({id:'bodycam-negative-'+state.bodycamCount,name:'Bodycam negative frame '+state.bodycamCount,detail:'The camera flash captured an outline that was not visible to the naked eye at the moment the shutter fired.',analysis:target.real?'Motion appears across more than one frame. The figure relocated without a continuous path between positions.':'The silhouette has no matching movement signature. The camera recorded a person-shaped outline that may not have been there.',kind:'anomaly',studied:false});
-  toast('BODYCAM BURST SAVED · '+state.bodycamCharges+' FLASHES LEFT. THE SNAPSHOT HAS A SECOND OUTLINE.',2.8);
-  updateHUD();updateObjectives();
-}
 function useMedkit(){
   if(medkits<=0){toast('NO MEDICAL PACKS LEFT.');return;}
   if(player.hp>=player.maxHp){toast('YOU ARE ALREADY IN GOOD CONDITION.');return;}
@@ -5998,23 +6116,6 @@ function drawLoot(o){
   px(x-5,y-4,10,7,'#b09b67');
   px(x-3,y-2,6,3,pulse?'#e8d49b':'#7e764f');
 }
-function drawMemorialStone(o){
-  const x=o.x-camera.x+shakeX,y=o.y-camera.y+shakeY;
-  if(x<-90||y<-90||x>W+90||y>H+90)return;
-  const pulse=.5+.5*Math.sin(state.elapsed*1.2);
-  ctx.save();
-  ctx.fillStyle='rgba(0,0,0,.72)';ctx.beginPath();ctx.ellipse(x,y+18,30,9,0,0,Math.PI*2);ctx.fill();
-  poly([[x-23,y+11],[x-19,y-18],[x-11,y-30],[x+11,y-30],[x+20,y-18],[x+23,y+11]],'#40483f');
-  poly([[x-18,y+7],[x-15,y-17],[x-8,y-25],[x+8,y-25],[x+15,y-17],[x+18,y+7]],'#707767');
-  px(x-13,y-14,26,1,'#afb29a');px(x-2,y-23,4,13,'#b8bba1');px(x-7,y-19,14,4,'#b8bba1');
-  ctx.fillStyle='#d7d4bd';ctx.font='bold 5px monospace';ctx.textAlign='center';ctx.fillText('IN MEMORY',x,y-3);ctx.fillText('LOVE REMAINS',x,y+4);
-  px(x-24,y+11,48,5,'#262d25');px(x-19,y+16,38,4,'#121713');
-  const candle=state.memorialTributeViewed?'#d5b771':'#8b987c';
-  ctx.shadowColor=candle;ctx.shadowBlur=7+7*pulse;px(x-30,y+7,4,8,'#b5b09a');px(x+27,y+7,4,8,'#b5b09a');
-  ctx.fillStyle=candle;ctx.fillRect(x-29,y+3,2,3);ctx.fillRect(x+28,y+3,2,3);ctx.shadowBlur=0;
-  if(dist(player.x,player.y,o.x,o.y)<210){ctx.fillStyle='#e5d7a8';ctx.font='bold 8px monospace';ctx.textAlign='center';ctx.fillText('QUIET MEMORIAL · PRESS E',x,y-42);}
-  ctx.restore();
-}
 function drawExit(o){
   const x=o.x-camera.x;
   const y=o.y-camera.y;
@@ -6451,24 +6552,6 @@ function drawThreatMarkers(){
   ctx.restore();
 }
 
-function drawBodycamOverlay(){
-  if(!state.bodycamRevealTimer&&!state.bodycamFlashTimer)return;
-  if(state.bodycamFlashTimer>0){ctx.save();ctx.globalAlpha=Math.min(.52,state.bodycamFlashTimer/.17*.52);ctx.fillStyle='#d5e6d1';ctx.fillRect(0,0,W,H);ctx.restore();}
-  if(state.bodycamRevealTimer<=0||!state.bodycamTarget)return;
-  const t=state.bodycamTarget;
-  const sx=t.x-camera.x+shakeX,sy=t.y-camera.y+shakeY;
-  const margin=28;
-  const onScreen=sx>margin&&sy>margin&&sx<W-margin&&sy<H-margin;
-  const x=onScreen?sx:clamp(sx,margin,W-margin),y=onScreen?sy:clamp(sy,margin,H-margin);
-  const left=x-21,top=y-38,alpha=Math.min(1,state.bodycamRevealTimer/.45);
-  ctx.save();ctx.globalAlpha=.38*alpha;ctx.fillStyle='#99d5b6';for(let yy=0;yy<H;yy+=7)ctx.fillRect(0,yy,W,1);ctx.restore();
-  ctx.save();ctx.globalAlpha=.92*alpha;ctx.strokeStyle=t.real?'#c5f6d6':'#e6c9a0';ctx.lineWidth=1.5;ctx.setLineDash([5,4]);ctx.strokeRect(left,top,42,76);ctx.setLineDash([]);
-  ctx.beginPath();ctx.moveTo(x-30,y);ctx.lineTo(x-20,y);ctx.moveTo(x+20,y);ctx.lineTo(x+30,y);ctx.moveTo(x,y-49);ctx.lineTo(x,y-39);ctx.moveTo(x,y+39);ctx.lineTo(x,y+49);ctx.stroke();
-  ctx.fillStyle='#030806';ctx.fillRect(Math.max(8,Math.min(W-266,x-130)),Math.max(8,top-24),260,17);
-  ctx.fillStyle=t.real?'#c6f2d1':'#e8d4af';ctx.font='bold 9px monospace';ctx.textAlign='center';ctx.fillText((t.real?'MOTION CAPTURED / ':'NO MATCHING BODY / ')+t.label,Math.max(138,Math.min(W-138,x)),Math.max(20,top-12));
-  ctx.fillStyle='#a6baa8';ctx.font='8px monospace';ctx.textAlign='left';ctx.fillText('BODYCAM BURST 0'+state.bodycamCount+' · BUFFER '+state.bodycamRevealTimer.toFixed(1)+'s',12,H-42);
-  ctx.fillStyle='rgba(139,26,31,.68)';ctx.fillRect(10,H-29,Math.max(6,(W-20)*(state.bodycamRevealTimer/2.65)),3);ctx.restore();
-}
 function drawWorld(){
   if(state.prologueStage!=='swamp'){drawPrologue();return;}
   screenJitter();
@@ -6486,7 +6569,6 @@ function drawWorld(){
     drawIndoorWayfinding();
     drawMini();
     drawRealityText();
-    drawBodycamOverlay();
     if(state.sceneFade>0){ctx.fillStyle='rgba(0,0,0,'+state.sceneFade+')';ctx.fillRect(0,0,W,H);}
     return;
   }
@@ -6502,7 +6584,6 @@ function drawWorld(){
     if(o.type==='evidence')drawEvidence(o);
     if(o.type==='loot')drawLoot(o);
     if(o.type==='exit')drawExit(o);
-    if(o.type==='memorialStone')drawMemorialStone(o);
   }
   drawSurvivors();
   for(const c of crawlers)drawCrawler(c);
@@ -6522,7 +6603,6 @@ function drawWorld(){
   drawMini();
   drawRealityText();
   drawSmilerContactLost();
-  drawBodycamOverlay();
   if(state.sceneFade>0){ctx.fillStyle='rgba(0,0,0,'+state.sceneFade+')';ctx.fillRect(0,0,W,H);}
 }
 function drawInteriorBase(room,sx,sy){
@@ -6592,14 +6672,26 @@ function drawInterior(){
     }else if(item.type==='memorial'){
       const halo=.42+.22*Math.sin(state.elapsed*1.15);
       ctx.save();ctx.globalCompositeOperation='screen';
-      const memorialGlow=ctx.createRadialGradient(x,y,2,x,y,42);
+      const memorialGlow=ctx.createRadialGradient(x,y,2,x,y,48);
       memorialGlow.addColorStop(0,'rgba(213,190,126,'+halo+')');memorialGlow.addColorStop(1,'rgba(0,0,0,0)');
-      ctx.fillStyle=memorialGlow;ctx.fillRect(x-44,y-44,88,88);ctx.restore();
-      px(x-23,y-27,46,48,'#2a281f');px(x-20,y-24,40,42,'#a18b5e');px(x-17,y-21,34,36,'#111811');
-      px(x-14,y-18,12,11,'#7f8b78');px(x-12,y-16,8,2,'#c4b88e');px(x-8,y-14,2,6,'#c4b88e');px(x-15,y-12,14,2,'#c4b88e');
-      px(x+3,y-18,12,11,'#464a3c');px(x+5,y-15,8,4,'#b3a477');px(x+4,y-10,3,3,'#080a08');px(x+12,y-10,3,3,'#080a08');
-      px(x-14,y-3,28,2,'#655b3e');px(x-13,y+1,26,2,'#8f8057');px(x-9,y+5,18,2,'#cabb91');
-      ctx.fillStyle='#e6d4a8';ctx.font='bold 7px monospace';ctx.textAlign='center';ctx.fillText('REMEMBER',x,y+31);
+      ctx.fillStyle=memorialGlow;ctx.fillRect(x-50,y-52,100,104);ctx.restore();
+      if(item.tombstone){
+        px(x-18,y-22,36,40,'#171b17');
+        px(x-16,y-25,32,41,'#383d37');
+        px(x-13,y-22,26,35,'#252c25');
+        px(x-3,y-18,6,18,'#7e826e');
+        px(x-9,y-12,18,5,'#858774');
+        px(x-10,y-2,20,2,'#777b68');
+        px(x-8,y+4,16,2,'#686d5e');
+        px(x-22,y+17,44,5,'#141814');
+        ctx.fillStyle='#d9d2b4';ctx.font='bold 6px monospace';ctx.textAlign='center';ctx.fillText('REMEMBER',x,y+31);
+      }else{
+        px(x-23,y-27,46,48,'#2a281f');px(x-20,y-24,40,42,'#a18b5e');px(x-17,y-21,34,36,'#111811');
+        px(x-14,y-18,12,11,'#7f8b78');px(x-12,y-16,8,2,'#c4b88e');px(x-8,y-14,2,6,'#c4b88e');px(x-15,y-12,14,2,'#c4b88e');
+        px(x+3,y-18,12,11,'#464a3c');px(x+5,y-15,8,4,'#b3a477');px(x+4,y-10,3,3,'#080a08');px(x+12,y-10,3,3,'#080a08');
+        px(x-14,y-3,28,2,'#655b3e');px(x-13,y+1,26,2,'#8f8057');px(x-9,y+5,18,2,'#cabb91');
+        ctx.fillStyle='#e6d4a8';ctx.font='bold 7px monospace';ctx.textAlign='center';ctx.fillText('REMEMBER',x,y+31);
+      }
     }else if(item.type==='witness'){
       px(x-8,y-14,16,14,'#080b08');
       px(x-6,y-22,12,10,'#8b8064');
@@ -6864,13 +6956,6 @@ function updateNightmareAtmosphere(dt){
 function updateHauntingDirector(dt){
   if(!state.running||state.paused||state.gameOver||state.prologueStage!=='swamp')return;
   const flags=state.horrorEventFlags;
-  if(flags.memorialVisited&&!flags.smilerCondolenceSpoken&&state.memorialTributeViewed&&state.elapsed>=(flags.memorialCondolenceAt||Infinity)&&monster&&monster.active&&state.floor==='outside'&&!state.radioIncidentActive&&!state.huntActive){
-    flags.smilerCondolenceSpoken=true;
-    const line=state.selectedCharacter==='yumi'?'How is life, Yumi? I heard about your lolo. I offer my condolences. Even I know some memories should be left in peace.':'How is life, Hugo? I heard about Yumi’s lolo. I offer my condolences. Do not let this night take the kindness you came here with.';
-    triggerWhisper(line,'center','THE SMILER / A QUIET WORD');
-    toast('A QUIET VOICE COMES THROUGH THE STATIC. IT DOES NOT LAUGH.',3.2);
-    state.intensity=Math.max(state.intensity,.62);
-  }
   if(state.elapsed>48&&collectedClueCount()>=2&&!flags.unknownPartnerTransmission&&!state.radioIncidentActive){
     flags.unknownPartnerTransmission=true;
     state.intensity=Math.max(state.intensity,.83);
@@ -7480,8 +7565,6 @@ function bindEvents(){
   $('hideAction').addEventListener('click',toggleHide);
   $('screamAction').addEventListener('click',playerScream);
   $('helpAction').addEventListener('click',callPartnerForHelp);
-  $('bodycamAction').addEventListener('click',useBodycamBurst);
-  $('touchBodycam').addEventListener('pointerdown',e=>{e.preventDefault();useBodycamBurst();});
   $('touchInteract').addEventListener('pointerdown',e=>{e.preventDefault();interact();});
   $('touchShoot').addEventListener('pointerdown',e=>{e.preventDefault();shoot();});
   $('touchLight').addEventListener('pointerdown',e=>{e.preventDefault();toggleFlashlight();});
@@ -7570,7 +7653,6 @@ function onKeyDown(e){
   if(key==='c')toggleHide();
   if(key==='g')playerScream();
   if(key==='h')callPartnerForHelp();
-  if(key==='v')useBodycamBurst();
   if(key==='f')toggleFlashlight();
   if(key==='r'){
     state.reloadActive=true;
@@ -7582,6 +7664,9 @@ function onKeyDown(e){
   }
   if(key==='i')openInventory();
   if(key===' '&&state.floor==='outside')shoot();
+  if(key==='v'){
+    try{localStorage.setItem('florida-shadows-save-v3-main',JSON.stringify(window.FSGameBridge.getSnapshot()));toast('LOCAL CHECKPOINT SAVED. OPEN ACCOUNT / CLOUD SAVE TO RESTORE IT.',2.2);}catch(error){toast('CHECKPOINT SAVE FAILED.',1.5);}
+  }
   if(key==='q'){
     if(batteryCells>0){
       batteryCells--;
@@ -7619,7 +7704,5113 @@ function boot(){
   updateObjectives();
   menuFrame();
 }
+window.FSGameBridge={
+  getSnapshot:function(){
+    return {
+      schema:1,
+      selectedCharacter:state.selectedCharacter,
+      controlMode:state.controlMode,
+      screen:state.screen,
+      prologueStage:state.prologueStage,
+      floor:state.floor,
+      roomId:state.currentRoomId||null,
+      elapsed:Number(state.elapsed||0),
+      missionClock:Number(state.missionClock||0),
+      player:player?{x:Number(player.x||0),y:Number(player.y||0),hp:Number(player.hp||0),maxHp:Number(player.maxHp||0),stamina:Number(player.stamina||0),maxStamina:Number(player.maxStamina||0),angle:Number(player.angle||0)}:null,
+      ammo:Number(ammo||0),
+      reserve:Number(reserve||0),
+      medkits:Number(medkits||0),
+      batteryCells:Number(batteryCells||0),
+      flashlightBattery:Number(flashlightBattery||0),
+      flashlightEnabled:!!flashlight,
+      evidence:Number(evidence||0),
+      caseRecords:caseRecords.map(r=>({id:r.id,name:r.name,detail:r.detail,analysis:r.analysis,kind:r.kind,studied:!!r.studied})),
+      objectsFound:objects.filter(o=>o.found&&o.id).map(o=>o.id),
+      roomItemStates:state.roomItemStates||{},
+      survivors:survivors.map(p=>({id:p.id,x:p.x,y:p.y,found:!!p.found,following:!!p.following,delivered:!!p.delivered,hp:p.hp})),
+      crawlers:crawlers.map(c=>({x:c.x,y:c.y,r:c.r,hp:c.hp,speed:c.speed,phase:c.phase,alert:!!c.alert,attack:c.attack,dead:!!c.dead,hiddenUntil:c.hiddenUntil,stunned:c.stunned||0})),
+      smiler:monster?{x:monster.x,y:monster.y,active:!!monster.active,spotted:!!monster.spotted,attack:monster.attack,lastMove:monster.lastMove,warpCooldown:monster.warpCooldown,hidden:!!monster.hidden,vanishTimer:monster.vanishTimer,vanishCooldown:monster.vanishCooldown,activeTime:monster.activeTime,pendingX:monster.pendingX,pendingY:monster.pendingY,reappearGlow:monster.reappearGlow,blinkCount:monster.blinkCount}:null,
+      crawlers:crawlers.map(c=>({x:c.x,y:c.y,r:c.r,hp:c.hp,speed:c.speed,phase:c.phase,alert:!!c.alert,attack:c.attack,dead:!!c.dead,hiddenUntil:c.hiddenUntil,stunned:c.stunned||0})),
+      smiler:monster?{x:monster.x,y:monster.y,active:!!monster.active,spotted:!!monster.spotted,attack:monster.attack,lastMove:monster.lastMove,warpCooldown:monster.warpCooldown,hidden:!!monster.hidden,vanishTimer:monster.vanishTimer,vanishCooldown:monster.vanishCooldown,activeTime:monster.activeTime,pendingX:monster.pendingX,pendingY:monster.pendingY,reappearGlow:monster.reappearGlow,blinkCount:monster.blinkCount}:null,
+      flags:{witnessInterviewed:!!state.witnessInterviewed,witnessTrust:Number(state.witnessTrust||0),stationComplete:!!state.stationComplete,stationDecisions:state.stationDecisions||{},stationChecks:state.stationChecks||{},stationProcessed:Number(state.stationProcessed||0),stationCorrect:Number(state.stationCorrect||0),keysFound:!!state.keysFound,caseComparisons:state.caseComparisons||[],caseTheory:state.caseTheory||'',theoryAttempts:Number(state.theoryAttempts||0),exploredRoomIds:state.exploredRoomIds||[],missingCount:Number(state.missingCount||0),missingIds:state.missingIds||[],disappearanceLog:state.disappearanceLog||[],anchorsDestroyed:state.anchorsDestroyed||[],anchorsDisabled:!!state.anchorsDisabled,memorialTributeViewed:!!state.memorialTributeViewed,huntsSurvived:Number(state.huntsSurvived||0),kills:Number(state.kills||0),shots:Number(state.shots||0),helpCount:Number(state.helpCount||0),shoutCount:Number(state.shoutCount||0),trueEnding:!!state.trueEnding,gameOver:!!state.gameOver,won:!!state.won},
+      statistics:{health:player?Number(player.hp||0):0,stamina:player?Number(player.stamina||0):0,studyCount:typeof studyCount==='function'?studyCount():0,buildings:state.exploredRoomIds.length},
+      savedAt:new Date().toISOString()
+    };
+  },
+  restoreSnapshot:function(snapshot){
+    if(!snapshot||snapshot.schema!==1||!snapshot.player||!Number.isFinite(Number(snapshot.player.x))||!Number.isFinite(Number(snapshot.player.y)))return false;
+    state.running=false;
+    state.selectedCharacter=snapshot.selectedCharacter==='yumi'?'yumi':'hugo';
+    state.controlMode=snapshot.controlMode==='mobile'?'mobile':'desktop';
+    state.pendingCharacter=state.selectedCharacter;
+    resetGame();
+    setPrologueStage('swamp');
+    state.prologueStage='swamp';
+    state.floor='outside';
+    state.room=null;
+    state.currentRoomId=null;
+    const savedObjects=new Set(Array.isArray(snapshot.objectsFound)?snapshot.objectsFound:[]);
+    for(const item of objects)if(item.id&&savedObjects.has(item.id))item.found=true;
+    const f=snapshot.flags||{};
+    state.witnessInterviewed=!!f.witnessInterviewed;
+    state.witnessTrust=clamp(Number(f.witnessTrust)||0,0,5);
+    state.stationComplete=!!f.stationComplete;
+    state.stationDecisions=f.stationDecisions||{};
+    state.stationChecks=f.stationChecks||{};
+    state.stationProcessed=clamp(Number(f.stationProcessed)||0,0,6);
+    state.stationCorrect=clamp(Number(f.stationCorrect)||0,0,6);
+    state.keysFound=!!f.keysFound;
+    state.caseComparisons=Array.isArray(f.caseComparisons)?f.caseComparisons:[];
+    state.caseTheory=typeof f.caseTheory==='string'?f.caseTheory:'';
+    state.theoryAttempts=clamp(Number(f.theoryAttempts)||0,0,100);
+    state.exploredRoomIds=Array.isArray(f.exploredRoomIds)?f.exploredRoomIds:[];
+    state.missingCount=clamp(Number(f.missingCount)||0,0,100);
+    state.missingIds=Array.isArray(f.missingIds)?f.missingIds:[];
+    state.disappearanceLog=Array.isArray(f.disappearanceLog)?f.disappearanceLog:[];
+    state.anchorsDestroyed=Array.isArray(f.anchorsDestroyed)?f.anchorsDestroyed:[];
+    state.anchorsDisabled=!!f.anchorsDisabled;
+    state.memorialTributeViewed=!!f.memorialTributeViewed;
+    state.huntsSurvived=clamp(Number(f.huntsSurvived)||0,0,100);
+    state.kills=clamp(Number(f.kills)||0,0,10000);
+    state.shots=clamp(Number(f.shots)||0,0,100000);
+    state.helpCount=clamp(Number(f.helpCount)||0,0,10000);
+    state.shoutCount=clamp(Number(f.shoutCount)||0,0,10000);
+    state.trueEnding=!!f.trueEnding;
+    state.gameOver=false;
+    state.won=false;
+    evidence=clamp(Number(snapshot.evidence)||0,0,100);
+    ammo=clamp(Number(snapshot.ammo)||0,0,999);
+    reserve=clamp(Number(snapshot.reserve)||0,0,9999);
+    medkits=clamp(Number(snapshot.medkits)||0,0,999);
+    batteryCells=clamp(Number(snapshot.batteryCells)||0,0,999);
+    flashlightBattery=clamp(Number(snapshot.flashlightBattery)||0,0,100);
+    flashlight=!!snapshot.flashlightEnabled;
+    if(Array.isArray(snapshot.crawlers))crawlers=snapshot.crawlers.slice(0,6).map(c=>({x:clamp(Number(c.x)||100,20,WORLD.w-20),y:clamp(Number(c.y)||100,20,WORLD.h-20),r:clamp(Number(c.r)||9,5,24),hp:clamp(Number(c.hp)||1,0,20),speed:clamp(Number(c.speed)||60,10,200),phase:Number(c.phase)||0,alert:!!c.alert,attack:clamp(Number(c.attack)||0,0,30),dead:!!c.dead,hiddenUntil:clamp(Number(c.hiddenUntil)||0,0,1000),stunned:clamp(Number(c.stunned)||0,0,30)}));
+    if(snapshot.smiler&&typeof snapshot.smiler==='object')monster={...monster,...snapshot.smiler,x:clamp(Number(snapshot.smiler.x)||100,20,WORLD.w-20),y:clamp(Number(snapshot.smiler.y)||100,20,WORLD.h-20)};
+    caseRecords=Array.isArray(snapshot.caseRecords)?snapshot.caseRecords.filter(r=>r&&typeof r.id==='string').slice(0,250):[];
+    state.roomItemStates=snapshot.roomItemStates&&typeof snapshot.roomItemStates==='object'?snapshot.roomItemStates:{};
+    if(Array.isArray(snapshot.survivors))for(const saved of snapshot.survivors){const live=survivors.find(p=>p.id===saved.id);if(live){live.x=clamp(Number(saved.x)||live.x,20,WORLD.w-20);live.y=clamp(Number(saved.y)||live.y,20,WORLD.h-20);live.found=!!saved.found;live.following=!!saved.following;live.delivered=!!saved.delivered;live.hp=clamp(Number(saved.hp)||1,0,100);}}
+    state.elapsed=clamp(Number(snapshot.elapsed)||0,0,86400);
+    state.missionClock=clamp(Number(snapshot.missionClock)||137,0,10000);
+    player.x=clamp(Number(snapshot.player.x)||100,30,WORLD.w-30);
+    player.y=clamp(Number(snapshot.player.y)||100,30,WORLD.h-30);
+    player.hp=clamp(Number(snapshot.player.hp)||specs[state.selectedCharacter].hp,1,player.maxHp);
+    player.stamina=clamp(Number(snapshot.player.stamina)||player.maxStamina,0,player.maxStamina);
+    player.angle=Number.isFinite(Number(snapshot.player.angle))?Number(snapshot.player.angle):0;
+    if(snapshot.floor==='inside'&&typeof snapshot.roomId==='string'){
+      const door=objects.find(o=>o.type==='building'&&o.room===snapshot.roomId);
+      if(door){enterBuilding(door);state.currentRoomId=snapshot.roomId;player.x=clamp(Number(snapshot.player.x)||state.room.spawn.x,22,state.room.w-22);player.y=clamp(Number(snapshot.player.y)||state.room.spawn.y,22,state.room.h-22);if(state.room.items)for(const item of state.room.items)if(item.id&&state.roomItemStates[item.id]&&state.roomItemStates[item.id].found)item.found=true;}
+    }
+    state.screen='game';state.running=true;state.paused=false;state.gameOver=false;
+    $('hud').style.display='block';document.body.classList.add('game-active');document.body.classList.remove('prologue-mode','prologue-call','prologue-drive','prologue-arrival');
+    updateHUD();updateObjectives();updateInventory();
+    camera={x:clamp(player.x-W/2,0,WORLD.w-W),y:clamp(player.y-H/2,0,WORLD.h-H)};
+    state.lastFrame=performance.now();requestAnimationFrame(loop);
+    toast('CLOUD CHECKPOINT RESTORED. CASE FS-07 RESUMED.',2.8);
+    return true;
+  },
+  unlockCandidates:function(){
+    const f=state;
+    const found=collectedClueCount();
+    const studied=studyCount();
+    const result=[];
+    if(found>=1)result.push('first_trace');
+    if(studied>=6&&f.caseTheory)result.push('forensic_mind');
+    if(f.witnessInterviewed&&f.witnessTrust>=2)result.push('cross_examiner');
+    if(f.stationComplete)result.push('night_auditor');
+    if((f.exploredRoomIds||[]).length>=5)result.push('five_roofs');
+    if(survivors.filter(p=>p.found||p.following||p.delivered).length>=2)result.push('two_lives');
+    if((f.anchorsDestroyed||[]).length>=3)result.push('signal_breaker');
+    if(f.memorialTributeViewed)result.push('quiet_observer');
+    if(f.gameOver&&f.won)result.push('nightmare_survivor','unbroken');
+    if(f.gameOver&&f.won&&f.anchorsDisabled)result.push('anchorless');
+    if(window.FSArchiveRead)result.push('archive_reader');
+    return [...new Set(result)];
+  }
+};
+
 boot();
+})();
+</script>
+<div id="accountPanel" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="accountHeading">
+  <div class="panel account-panel">
+    <div class="kicker">Field services network</div>
+    <h2 id="accountHeading" class="section-title">Account & Cloud Save</h2>
+    <p class="intro">Create an account to sync checkpoints, achievements, and scores across devices. MongoDB is optional during local play; without a configured database, the local checkpoint still works in this browser.</p>
+    <div id="accountDatabaseStatus" class="account-status">Checking database connection…</div>
+    <div class="account-grid">
+      <section class="account-card">
+        <h3>OFFICER ACCOUNT</h3>
+        <label class="account-field">Username<input id="accountUsername" minlength="3" maxlength="18" autocomplete="username" placeholder="3–18 letters, numbers, underscores"></label>
+        <label class="account-field">Password<input id="accountPassword" type="password" minlength="8" maxlength="128" autocomplete="current-password" placeholder="At least 8 characters"></label>
+        <div class="account-actions"><button id="accountRegister" type="button">Create account</button><button id="accountLogin" type="button">Sign in</button><button id="accountLogout" type="button">Sign out</button></div>
+        <div id="accountIdentity" class="account-status">Not signed in.</div>
+      </section>
+      <section class="account-card">
+        <h3>CHECKPOINT</h3>
+        <label class="account-field">Save slot<select id="saveSlot" class="archive-select"><option value="main">Main checkpoint</option><option value="backup">Backup checkpoint</option><option value="challenge">Challenge run</option></select></label>
+        <div class="account-actions"><button id="saveLocalButton" type="button">Save locally</button><button id="loadLocalButton" type="button">Load local</button><button id="saveCloudButton" type="button">Save to cloud</button><button id="loadCloudButton" type="button">Load from cloud</button></div>
+        <div id="saveStatus" class="account-status">Save your progress before leaving the patrol.</div>
+      </section>
+    </div>
+    <div class="account-grid">
+      <section class="account-card">
+        <h3>FIELD LEADERBOARD</h3>
+        <div class="account-actions"><button id="leaderboardRefresh" type="button">Refresh rankings</button><button id="scoreSubmit" type="button">Submit current run</button></div>
+        <div id="leaderboardArea" class="account-status">Sign in and submit a run to record your best attempt.</div>
+      </section>
+      <section class="account-card">
+        <h3>ACHIEVEMENTS</h3>
+        <div class="account-actions"><button id="achievementRefresh" type="button">Refresh achievements</button><button id="achievementSync" type="button">Sync unlocked</button></div>
+        <div id="achievementArea" class="account-status">Achievements are recorded when you sync a checkpoint or submit a run.</div>
+      </section>
+    </div>
+    <div class="page-buttons"><button id="accountBack" type="button">Return to menu</button></div>
+  </div>
+</div>
+<div id="archivePanel" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="archiveHeading">
+  <div class="panel archive-panel">
+    <div class="kicker">Recovered archive · Case FS-07</div>
+    <h2 id="archiveHeading" class="section-title">Night Archive</h2>
+    <p class="intro">Recovered dispatch records, witness fragments, station reports, chapel notes, and sealed analyst memos. Some entries contradict one another; the contradiction is part of the case.</p>
+    <div class="archive-toolbar"><input id="archiveSearch" class="archive-search" placeholder="Search names, locations, or phrases…" aria-label="Search archive"><select id="archiveFilter" class="archive-select" aria-label="Filter archive"><option value="all">All records</option><option value="dispatch">Dispatch</option><option value="station">Station</option><option value="witness">Witness</option><option value="forest">Forest</option><option value="memorial">Memorial</option><option value="signal">Signal</option><option value="medical">Medical</option><option value="photography">Photography</option></select></div>
+    <div id="archiveCount" class="archive-count">Loading recovered records…</div>
+    <div id="archiveList" class="archive-list">
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="call sign fourteen dispatch accepted a call from a unit that had been logged out of service eleven years earlier. the operator’s voice was calm, but the waveform began six seconds before the microphone opened. the item was logged at mile marker 9; the associated witness was listed as officer hugo. officer hugo mile marker 9 “do not follow a voice just because it knows the case number.” the report is corroborated by the physical trace, but its chronology remains unstable. record the contradiction and do not resolve it by guessing. the sealed note warns that this item should not be played through station speakers. during the original review, every clock in the building advanced by the same number of seconds.">
+        <div class="archive-meta">
+          <span>FS-ARC-001</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>Call Sign Fourteen</h3>
+        <p>Dispatch accepted a call from a unit that had been logged out of service eleven years earlier. The operator’s voice was calm, but the waveform began six seconds before the microphone opened. The item was logged at Mile Marker 9; the associated witness was listed as Officer Hugo.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Do not follow a voice just because it knows the case number.”</p>
+            <p>Recovered location: Mile Marker 9. The assigned reader was Officer Hugo.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The report is corroborated by the physical trace, but its chronology remains unstable. Record the contradiction and do not resolve it by guessing.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed note warns that this item should not be played through station speakers. During the original review, every clock in the building advanced by the same number of seconds.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>MILE MARKER 9</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="the second timestamp two copies of the same call arrived with different timestamps. the older file contains a response from the officer who had not yet received the call. the item was logged at last stop diner; the associated witness was listed as aaron pike. aaron pike last stop diner “if the radio repeats your breathing, stop transmitting.” the time discrepancy is consistent across independent copies. a simple clock malfunction cannot explain why the answer arrives before the question. the last annotation is unexpectedly ordinary: “take a breath. drink some water. call someone you trust before continuing.”">
+        <div class="archive-meta">
+          <span>FS-ARC-002</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>The Second Timestamp</h3>
+        <p>Two copies of the same call arrived with different timestamps. The older file contains a response from the officer who had not yet received the call. The item was logged at Last Stop Diner; the associated witness was listed as Aaron Pike.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“If the radio repeats your breathing, stop transmitting.”</p>
+            <p>Recovered location: Last Stop Diner. The assigned reader was Aaron Pike.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The time discrepancy is consistent across independent copies. A simple clock malfunction cannot explain why the answer arrives before the question.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The last annotation is unexpectedly ordinary: “Take a breath. Drink some water. Call someone you trust before continuing.”</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>LAST STOP DINER</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="camera 04 camera 04 records seven arrivals on a night when only six visitors are expected. the seventh figure enters through a wall that has no door. the item was logged at ranger trail; the associated witness was listed as unit 14. unit 14 ranger trail “someone asked for condolences through a disconnected speaker.” the evidence supports the presence of a second observer, not necessarily a second living person. avoid labeling the subject before completing the interview. the reviewer requested that this file be kept available for anyone struggling to make sense of the night. uncertainty should not be mistaken for personal failure.">
+        <div class="archive-meta">
+          <span>FS-ARC-003</span>
+          <span>STATION</span>
+        </div>
+        <h3>Camera 04</h3>
+        <p>Camera 04 records seven arrivals on a night when only six visitors are expected. The seventh figure enters through a wall that has no door. The item was logged at Ranger Trail; the associated witness was listed as Unit 14.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Someone asked for condolences through a disconnected speaker.”</p>
+            <p>Recovered location: Ranger Trail. The assigned reader was Unit 14.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The evidence supports the presence of a second observer, not necessarily a second living person. Avoid labeling the subject before completing the interview.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The reviewer requested that this file be kept available for anyone struggling to make sense of the night. Uncertainty should not be mistaken for personal failure.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>RANGER TRAIL</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="the blank badge a badge printer produced a blank card after the station network was disconnected. the card warmed whenever it was held near the interview room. the item was logged at st. mercy chapel; the associated witness was listed as the unnamed witness. the unnamed witness st. mercy chapel “we closed the gate at midnight. something opened it from the other side.” the statement may be truthful about the location but false about the time. compare it against the dispatch log and the environmental evidence. the sealed attachment is absent, but its shadow remains visible in every scan of the page. no physical object was recovered from the envelope.">
+        <div class="archive-meta">
+          <span>FS-ARC-004</span>
+          <span>STATION</span>
+        </div>
+        <h3>The Blank Badge</h3>
+        <p>A badge printer produced a blank card after the station network was disconnected. The card warmed whenever it was held near the interview room. The item was logged at St. Mercy Chapel; the associated witness was listed as the unnamed witness.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“We closed the gate at midnight. Something opened it from the other side.”</p>
+            <p>Recovered location: St. Mercy Chapel. The assigned reader was the unnamed witness.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The statement may be truthful about the location but false about the time. Compare it against the dispatch log and the environmental evidence.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed attachment is absent, but its shadow remains visible in every scan of the page. No physical object was recovered from the envelope.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>ST. MERCY CHAPEL</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="witness" data-search="silas venn’s first statement silas says he never entered the farmhouse. mud on his cuffs matches the upstairs landing, where the windows have been nailed shut from within. the item was logged at swamp gas stop; the associated witness was listed as aaron pike. aaron pike swamp gas stop “the footprints stopped at the wall and resumed in the room behind it.” the witness is frightened, but fear does not prove deception. ask a neutral follow-up and compare the response with the recorded details. the evidence locker log records two people entering and one leaving. both signatures match the same employee file.">
+        <div class="archive-meta">
+          <span>FS-ARC-005</span>
+          <span>WITNESS</span>
+        </div>
+        <h3>Silas Venn’s First Statement</h3>
+        <p>Silas says he never entered the farmhouse. Mud on his cuffs matches the upstairs landing, where the windows have been nailed shut from within. The item was logged at Swamp Gas Stop; the associated witness was listed as Aaron Pike.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The footprints stopped at the wall and resumed in the room behind it.”</p>
+            <p>Recovered location: Swamp Gas Stop. The assigned reader was Aaron Pike.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The witness is frightened, but fear does not prove deception. Ask a neutral follow-up and compare the response with the recorded details.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The evidence locker log records two people entering and one leaving. Both signatures match the same employee file.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>WITNESS</span>
+          <span>SWAMP GAS STOP</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="forest" data-search="the dry footprints a line of wet boot prints crosses the forest floor, then continues over a fallen tree without disturbing the moss. the item was logged at mile marker 9; the associated witness was listed as unit 14. unit 14 mile marker 9 “keep the family photographs dry. the faces blur when the paper becomes wet.” the record should be handled as a lead rather than a conclusion. a similar phrase appears in an unrelated case file, though the files were sealed years apart. the record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.">
+        <div class="archive-meta">
+          <span>FS-ARC-006</span>
+          <span>FOREST</span>
+        </div>
+        <h3>The Dry Footprints</h3>
+        <p>A line of wet boot prints crosses the forest floor, then continues over a fallen tree without disturbing the moss. The item was logged at Mile Marker 9; the associated witness was listed as Unit 14.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Keep the family photographs dry. The faces blur when the paper becomes wet.”</p>
+            <p>Recovered location: Mile Marker 9. The assigned reader was Unit 14.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The record should be handled as a lead rather than a conclusion. A similar phrase appears in an unrelated case file, though the files were sealed years apart.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>FOREST</span>
+          <span>MILE MARKER 9</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="signal" data-search="the relay that answers the emergency relay responds to questions before the operator finishes speaking. engineers find no return path in the wiring diagram. the item was logged at leaning cabin; the associated witness was listed as the unnamed witness. the unnamed witness leaning cabin “the lamp was on, but there was no shadow under the chair.” the source is uncertain. no ordinary device listed in the station inventory can produce the recorded signal without an active input. the final line is written in a different hand: “if you are reading this alone, you are not alone.” the ink has not been matched to any station employee.">
+        <div class="archive-meta">
+          <span>FS-ARC-007</span>
+          <span>SIGNAL</span>
+        </div>
+        <h3>The Relay That Answers</h3>
+        <p>The emergency relay responds to questions before the operator finishes speaking. Engineers find no return path in the wiring diagram. The item was logged at Leaning Cabin; the associated witness was listed as the unnamed witness.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The lamp was on, but there was no shadow under the chair.”</p>
+            <p>Recovered location: Leaning Cabin. The assigned reader was the unnamed witness.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The source is uncertain. No ordinary device listed in the station inventory can produce the recorded signal without an active input.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The final line is written in a different hand: “If you are reading this alone, you are not alone.” The ink has not been matched to any station employee.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>SIGNAL</span>
+          <span>LEANING CABIN</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="medical" data-search="the empty bed the clinic bed is strapped down and still bears the impression of a body. the patient ledger has an entry for tomorrow with no patient name. the item was logged at flood gate; the associated witness was listed as eli. eli flood gate “the first set of footprints belongs to the person who has not arrived.” the report is corroborated by the physical trace, but its chronology remains unstable. record the contradiction and do not resolve it by guessing. the final line is written in a different hand: “if you are reading this alone, you are not alone.” the ink has not been matched to any station employee.">
+        <div class="archive-meta">
+          <span>FS-ARC-008</span>
+          <span>MEDICAL</span>
+        </div>
+        <h3>The Empty Bed</h3>
+        <p>The clinic bed is strapped down and still bears the impression of a body. The patient ledger has an entry for tomorrow with no patient name. The item was logged at Flood Gate; the associated witness was listed as Eli.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The first set of footprints belongs to the person who has not arrived.”</p>
+            <p>Recovered location: Flood Gate. The assigned reader was Eli.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The report is corroborated by the physical trace, but its chronology remains unstable. Record the contradiction and do not resolve it by guessing.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The final line is written in a different hand: “If you are reading this alone, you are not alone.” The ink has not been matched to any station employee.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEDICAL</span>
+          <span>FLOOD GATE</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="photography" data-search="the photograph with one extra person a family photograph contains one more person each time it is developed. the extra face looks toward the camera in every version. the item was logged at st. mercy chapel; the associated witness was listed as unit 14. unit 14 st. mercy chapel “the light did not fail. the room simply stopped being visible.” the time discrepancy is consistent across independent copies. a simple clock malfunction cannot explain why the answer arrives before the question. a later inventory lists this record as destroyed. the archive copy bears a scan date from the following week, before the destruction order was signed.">
+        <div class="archive-meta">
+          <span>FS-ARC-009</span>
+          <span>PHOTOGRAPHY</span>
+        </div>
+        <h3>The Photograph With One Extra Person</h3>
+        <p>A family photograph contains one more person each time it is developed. The extra face looks toward the camera in every version. The item was logged at St. Mercy Chapel; the associated witness was listed as Unit 14.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The light did not fail. The room simply stopped being visible.”</p>
+            <p>Recovered location: St. Mercy Chapel. The assigned reader was Unit 14.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The time discrepancy is consistent across independent copies. A simple clock malfunction cannot explain why the answer arrives before the question.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>A later inventory lists this record as destroyed. The archive copy bears a scan date from the following week, before the destruction order was signed.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>PHOTOGRAPHY</span>
+          <span>ST. MERCY CHAPEL</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="memorial" data-search="a long life remembered a quiet remembrance records the things a loved one cherished: planes crossing the sky, cars on long roads, and photographs that preserve ordinary days. the item was logged at north culvert; the associated witness was listed as the unnamed witness. the unnamed witness north culvert “the witness knew what the investigator would ask.” the evidence supports the presence of a second observer, not necessarily a second living person. avoid labeling the subject before completing the interview. the file was re-opened after a technician heard a familiar voice from a device with its speaker removed. the technician recognized the voice as their own.">
+        <div class="archive-meta">
+          <span>FS-ARC-010</span>
+          <span>MEMORIAL</span>
+        </div>
+        <h3>A Long Life Remembered</h3>
+        <p>A quiet remembrance records the things a loved one cherished: planes crossing the sky, cars on long roads, and photographs that preserve ordinary days. The item was logged at North Culvert; the associated witness was listed as the unnamed witness.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The witness knew what the investigator would ask.”</p>
+            <p>Recovered location: North Culvert. The assigned reader was the unnamed witness.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The evidence supports the presence of a second observer, not necessarily a second living person. Avoid labeling the subject before completing the interview.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The file was re-opened after a technician heard a familiar voice from a device with its speaker removed. The technician recognized the voice as their own.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEMORIAL</span>
+          <span>NORTH CULVERT</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="the reply before the question a recorded reply begins before the dispatch operator presses the transmit key. the reply includes a sentence that is not spoken until six minutes later. the item was logged at cypress farmhouse; the associated witness was listed as eli. eli cypress farmhouse “the clock was correct. it was the morning that was wrong.” the statement may be truthful about the location but false about the time. compare it against the dispatch log and the environmental evidence. the analyst requested that a second officer observe the next test. both officers later wrote that the other person had never been present.">
+        <div class="archive-meta">
+          <span>FS-ARC-011</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>The Reply Before the Question</h3>
+        <p>A recorded reply begins before the dispatch operator presses the transmit key. The reply includes a sentence that is not spoken until six minutes later. The item was logged at Cypress Farmhouse; the associated witness was listed as Eli.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The clock was correct. It was the morning that was wrong.”</p>
+            <p>Recovered location: Cypress Farmhouse. The assigned reader was Eli.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The statement may be truthful about the location but false about the time. Compare it against the dispatch log and the environmental evidence.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The analyst requested that a second officer observe the next test. Both officers later wrote that the other person had never been present.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>CYPRESS FARMHOUSE</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="the chair behind the glass the intake camera shows an empty chair. the interview audio contains the chair scraping backwards and someone thanking the officer for letting them in. the item was logged at leaning cabin; the associated witness was listed as owen dyer. owen dyer leaning cabin “the signal became louder when everyone stopped talking.” the witness is frightened, but fear does not prove deception. ask a neutral follow-up and compare the response with the recorded details. the sealed note warns that this item should not be played through station speakers. during the original review, every clock in the building advanced by the same number of seconds.">
+        <div class="archive-meta">
+          <span>FS-ARC-012</span>
+          <span>STATION</span>
+        </div>
+        <h3>The Chair Behind the Glass</h3>
+        <p>The intake camera shows an empty chair. The interview audio contains the chair scraping backwards and someone thanking the officer for letting them in. The item was logged at Leaning Cabin; the associated witness was listed as Owen Dyer.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The signal became louder when everyone stopped talking.”</p>
+            <p>Recovered location: Leaning Cabin. The assigned reader was Owen Dyer.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The witness is frightened, but fear does not prove deception. Ask a neutral follow-up and compare the response with the recorded details.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed note warns that this item should not be played through station speakers. During the original review, every clock in the building advanced by the same number of seconds.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>LEANING CABIN</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="witness" data-search="the missing minute silas remembers the farmhouse clock stopping at 02:17. every witness statement places the event at a different minute, but each watches the same clock. the item was logged at records annex; the associated witness was listed as the unnamed witness. the unnamed witness records annex “we counted six visitors. the door counted seven.” the room inventory does not agree with the bodycam. the missing object may have been moved, removed, or omitted before the inventory was written. the last annotation is unexpectedly ordinary: “take a breath. drink some water. call someone you trust before continuing.”">
+        <div class="archive-meta">
+          <span>FS-ARC-013</span>
+          <span>WITNESS</span>
+        </div>
+        <h3>The Missing Minute</h3>
+        <p>Silas remembers the farmhouse clock stopping at 02:17. Every witness statement places the event at a different minute, but each watches the same clock. The item was logged at Records Annex; the associated witness was listed as the unnamed witness.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“We counted six visitors. The door counted seven.”</p>
+            <p>Recovered location: Records Annex. The assigned reader was the unnamed witness.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The room inventory does not agree with the bodycam. The missing object may have been moved, removed, or omitted before the inventory was written.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The last annotation is unexpectedly ordinary: “Take a breath. Drink some water. Call someone you trust before continuing.”</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>WITNESS</span>
+          <span>RECORDS ANNEX</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="forest" data-search="the trees that move tree trunks appear in different positions on the bodycam after a short blackout. no camera movement accounts for the change. the item was logged at radio relay hut; the associated witness was listed as eli. eli radio relay hut “the photograph was developed twice. the second negative had a reflection.” the source is uncertain. no ordinary device listed in the station inventory can produce the recorded signal without an active input. the reviewer requested that this file be kept available for anyone struggling to make sense of the night. uncertainty should not be mistaken for personal failure.">
+        <div class="archive-meta">
+          <span>FS-ARC-014</span>
+          <span>FOREST</span>
+        </div>
+        <h3>The Trees That Move</h3>
+        <p>Tree trunks appear in different positions on the bodycam after a short blackout. No camera movement accounts for the change. The item was logged at Radio Relay Hut; the associated witness was listed as Eli.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The photograph was developed twice. The second negative had a reflection.”</p>
+            <p>Recovered location: Radio Relay Hut. The assigned reader was Eli.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The source is uncertain. No ordinary device listed in the station inventory can produce the recorded signal without an active input.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The reviewer requested that this file be kept available for anyone struggling to make sense of the night. Uncertainty should not be mistaken for personal failure.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>FOREST</span>
+          <span>RADIO RELAY HUT</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="signal" data-search="anchor three the final signal anchor carries a pulse resembling a human heartbeat. cutting power interrupts the pulse, but the connected speaker keeps ticking. the item was logged at north culvert; the associated witness was listed as owen dyer. owen dyer north culvert “do not destroy the original record until both copies agree.” the report is corroborated by the physical trace, but its chronology remains unstable. record the contradiction and do not resolve it by guessing. the reviewer requested that this file be kept available for anyone struggling to make sense of the night. uncertainty should not be mistaken for personal failure.">
+        <div class="archive-meta">
+          <span>FS-ARC-015</span>
+          <span>SIGNAL</span>
+        </div>
+        <h3>Anchor Three</h3>
+        <p>The final signal anchor carries a pulse resembling a human heartbeat. Cutting power interrupts the pulse, but the connected speaker keeps ticking. The item was logged at North Culvert; the associated witness was listed as Owen Dyer.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Do not destroy the original record until both copies agree.”</p>
+            <p>Recovered location: North Culvert. The assigned reader was Owen Dyer.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The report is corroborated by the physical trace, but its chronology remains unstable. Record the contradiction and do not resolve it by guessing.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The reviewer requested that this file be kept available for anyone struggling to make sense of the night. Uncertainty should not be mistaken for personal failure.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>SIGNAL</span>
+          <span>NORTH CULVERT</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="medical" data-search="the nurse’s photograph the night nurse’s badge photo shows a different person when viewed in a mirror. the image on the badge does not change; the reflection does. the item was logged at county police station; the associated witness was listed as the station operator. the station operator county police station “the footprints stopped at the wall and resumed in the room behind it.” the time discrepancy is consistent across independent copies. a simple clock malfunction cannot explain why the answer arrives before the question. the sealed attachment is absent, but its shadow remains visible in every scan of the page. no physical object was recovered from the envelope.">
+        <div class="archive-meta">
+          <span>FS-ARC-016</span>
+          <span>MEDICAL</span>
+        </div>
+        <h3>The Nurse’s Photograph</h3>
+        <p>The night nurse’s badge photo shows a different person when viewed in a mirror. The image on the badge does not change; the reflection does. The item was logged at County Police Station; the associated witness was listed as the station operator.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The footprints stopped at the wall and resumed in the room behind it.”</p>
+            <p>Recovered location: County Police Station. The assigned reader was the station operator.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The time discrepancy is consistent across independent copies. A simple clock malfunction cannot explain why the answer arrives before the question.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed attachment is absent, but its shadow remains visible in every scan of the page. No physical object was recovered from the envelope.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEDICAL</span>
+          <span>COUNTY POLICE STATION</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="photography" data-search="the last frame the last frame from a missing deputy’s camera shows the camera lying on the ground and still filming the person holding it. the item was logged at flood control warehouse; the associated witness was listed as eli. eli flood control warehouse “a long life is not measured by its final morning.” the evidence supports the presence of a second observer, not necessarily a second living person. avoid labeling the subject before completing the interview. the evidence locker log records two people entering and one leaving. both signatures match the same employee file.">
+        <div class="archive-meta">
+          <span>FS-ARC-017</span>
+          <span>PHOTOGRAPHY</span>
+        </div>
+        <h3>The Last Frame</h3>
+        <p>The last frame from a missing deputy’s camera shows the camera lying on the ground and still filming the person holding it. The item was logged at Flood Control Warehouse; the associated witness was listed as Eli.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“A long life is not measured by its final morning.”</p>
+            <p>Recovered location: Flood Control Warehouse. The assigned reader was Eli.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The evidence supports the presence of a second observer, not necessarily a second living person. Avoid labeling the subject before completing the interview.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The evidence locker log records two people entering and one leaving. Both signatures match the same employee file.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>PHOTOGRAPHY</span>
+          <span>FLOOD CONTROL WAREHOUSE</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="memorial" data-search="the prayer card a folded prayer card was left by the chapel candle. it asks for comfort for the grieving, peace for the departed, and patience for everyone who cannot find the right words. the item was logged at records annex; the associated witness was listed as owen dyer. owen dyer records annex “do not follow a voice just because it knows the case number.” the statement may be truthful about the location but false about the time. compare it against the dispatch log and the environmental evidence. the record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.">
+        <div class="archive-meta">
+          <span>FS-ARC-018</span>
+          <span>MEMORIAL</span>
+        </div>
+        <h3>The Prayer Card</h3>
+        <p>A folded prayer card was left by the chapel candle. It asks for comfort for the grieving, peace for the departed, and patience for everyone who cannot find the right words. The item was logged at Records Annex; the associated witness was listed as Owen Dyer.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Do not follow a voice just because it knows the case number.”</p>
+            <p>Recovered location: Records Annex. The assigned reader was Owen Dyer.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The statement may be truthful about the location but false about the time. Compare it against the dispatch log and the environmental evidence.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEMORIAL</span>
+          <span>RECORDS ANNEX</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="call sign fourteen · supplement 019 dispatch accepted a call from a unit that had been logged out of service eleven years earlier. the operator’s voice was calm, but the waveform began six seconds before the microphone opened. the item was logged at county clinic; the associated witness was listed as the station operator. the station operator county clinic “if the radio repeats your breathing, stop transmitting.” the signature appears authentic on the first inspection. under magnification, the ink strokes continue beyond the edge of the paper. the final line is written in a different hand: “if you are reading this alone, you are not alone.” the ink has not been matched to any station employee.">
+        <div class="archive-meta">
+          <span>FS-ARC-019</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>Call Sign Fourteen · Supplement 019</h3>
+        <p>Dispatch accepted a call from a unit that had been logged out of service eleven years earlier. The operator’s voice was calm, but the waveform began six seconds before the microphone opened. The item was logged at County Clinic; the associated witness was listed as the station operator.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“If the radio repeats your breathing, stop transmitting.”</p>
+            <p>Recovered location: County Clinic. The assigned reader was the station operator.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The signature appears authentic on the first inspection. Under magnification, the ink strokes continue beyond the edge of the paper.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The final line is written in a different hand: “If you are reading this alone, you are not alone.” The ink has not been matched to any station employee.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>COUNTY CLINIC</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="the second timestamp · supplement 020 two copies of the same call arrived with different timestamps. the older file contains a response from the officer who had not yet received the call. the item was logged at interview room two; the associated witness was listed as mara. mara interview room two “someone asked for condolences through a disconnected speaker.” the room inventory does not agree with the bodycam. the missing object may have been moved, removed, or omitted before the inventory was written. a later inventory lists this record as destroyed. the archive copy bears a scan date from the following week, before the destruction order was signed.">
+        <div class="archive-meta">
+          <span>FS-ARC-020</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>The Second Timestamp · Supplement 020</h3>
+        <p>Two copies of the same call arrived with different timestamps. The older file contains a response from the officer who had not yet received the call. The item was logged at Interview Room Two; the associated witness was listed as Mara.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Someone asked for condolences through a disconnected speaker.”</p>
+            <p>Recovered location: Interview Room Two. The assigned reader was Mara.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The room inventory does not agree with the bodycam. The missing object may have been moved, removed, or omitted before the inventory was written.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>A later inventory lists this record as destroyed. The archive copy bears a scan date from the following week, before the destruction order was signed.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>INTERVIEW ROOM TWO</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="camera 04 · supplement 021 camera 04 records seven arrivals on a night when only six visitors are expected. the seventh figure enters through a wall that has no door. the item was logged at county police station; the associated witness was listed as owen dyer. owen dyer county police station “the witness knew what the investigator would ask.” the source is uncertain. no ordinary device listed in the station inventory can produce the recorded signal without an active input. the file was re-opened after a technician heard a familiar voice from a device with its speaker removed. the technician recognized the voice as their own.">
+        <div class="archive-meta">
+          <span>FS-ARC-021</span>
+          <span>STATION</span>
+        </div>
+        <h3>Camera 04 · Supplement 021</h3>
+        <p>Camera 04 records seven arrivals on a night when only six visitors are expected. The seventh figure enters through a wall that has no door. The item was logged at County Police Station; the associated witness was listed as Owen Dyer.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The witness knew what the investigator would ask.”</p>
+            <p>Recovered location: County Police Station. The assigned reader was Owen Dyer.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The source is uncertain. No ordinary device listed in the station inventory can produce the recorded signal without an active input.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The file was re-opened after a technician heard a familiar voice from a device with its speaker removed. The technician recognized the voice as their own.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>COUNTY POLICE STATION</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="the blank badge · supplement 022 a badge printer produced a blank card after the station network was disconnected. the card warmed whenever it was held near the interview room. the item was logged at checkpoint shack; the associated witness was listed as the station operator. the station operator checkpoint shack “i heard my own voice reporting that i was safe. i was hiding when it spoke.” the report is corroborated by the physical trace, but its chronology remains unstable. record the contradiction and do not resolve it by guessing. the file was re-opened after a technician heard a familiar voice from a device with its speaker removed. the technician recognized the voice as their own.">
+        <div class="archive-meta">
+          <span>FS-ARC-022</span>
+          <span>STATION</span>
+        </div>
+        <h3>The Blank Badge · Supplement 022</h3>
+        <p>A badge printer produced a blank card after the station network was disconnected. The card warmed whenever it was held near the interview room. The item was logged at Checkpoint Shack; the associated witness was listed as the station operator.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“I heard my own voice reporting that I was safe. I was hiding when it spoke.”</p>
+            <p>Recovered location: Checkpoint Shack. The assigned reader was the station operator.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The report is corroborated by the physical trace, but its chronology remains unstable. Record the contradiction and do not resolve it by guessing.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The file was re-opened after a technician heard a familiar voice from a device with its speaker removed. The technician recognized the voice as their own.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>CHECKPOINT SHACK</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="witness" data-search="silas venn’s first statement · supplement 023 silas says he never entered the farmhouse. mud on his cuffs matches the upstairs landing, where the windows have been nailed shut from within. the item was logged at old footbridge; the associated witness was listed as mara. mara old footbridge “keep the family photographs dry. the faces blur when the paper becomes wet.” the time discrepancy is consistent across independent copies. a simple clock malfunction cannot explain why the answer arrives before the question. the analyst requested that a second officer observe the next test. both officers later wrote that the other person had never been present.">
+        <div class="archive-meta">
+          <span>FS-ARC-023</span>
+          <span>WITNESS</span>
+        </div>
+        <h3>Silas Venn’s First Statement · Supplement 023</h3>
+        <p>Silas says he never entered the farmhouse. Mud on his cuffs matches the upstairs landing, where the windows have been nailed shut from within. The item was logged at Old Footbridge; the associated witness was listed as Mara.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Keep the family photographs dry. The faces blur when the paper becomes wet.”</p>
+            <p>Recovered location: Old Footbridge. The assigned reader was Mara.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The time discrepancy is consistent across independent copies. A simple clock malfunction cannot explain why the answer arrives before the question.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The analyst requested that a second officer observe the next test. Both officers later wrote that the other person had never been present.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>WITNESS</span>
+          <span>OLD FOOTBRIDGE</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="forest" data-search="the dry footprints · supplement 024 a line of wet boot prints crosses the forest floor, then continues over a fallen tree without disturbing the moss. the item was logged at county clinic; the associated witness was listed as irena holt. irena holt county clinic “the lamp was on, but there was no shadow under the chair.” the evidence supports the presence of a second observer, not necessarily a second living person. avoid labeling the subject before completing the interview. the sealed note warns that this item should not be played through station speakers. during the original review, every clock in the building advanced by the same number of seconds.">
+        <div class="archive-meta">
+          <span>FS-ARC-024</span>
+          <span>FOREST</span>
+        </div>
+        <h3>The Dry Footprints · Supplement 024</h3>
+        <p>A line of wet boot prints crosses the forest floor, then continues over a fallen tree without disturbing the moss. The item was logged at County Clinic; the associated witness was listed as Irena Holt.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The lamp was on, but there was no shadow under the chair.”</p>
+            <p>Recovered location: County Clinic. The assigned reader was Irena Holt.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The evidence supports the presence of a second observer, not necessarily a second living person. Avoid labeling the subject before completing the interview.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed note warns that this item should not be played through station speakers. During the original review, every clock in the building advanced by the same number of seconds.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>FOREST</span>
+          <span>COUNTY CLINIC</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="signal" data-search="the relay that answers · supplement 025 the emergency relay responds to questions before the operator finishes speaking. engineers find no return path in the wiring diagram. the item was logged at ranger trail; the associated witness was listed as the station operator. the station operator ranger trail “the first set of footprints belongs to the person who has not arrived.” the anomaly appears to react to attention. repeating the observation changes the result, so the first record must remain in the case file. the last annotation is unexpectedly ordinary: “take a breath. drink some water. call someone you trust before continuing.”">
+        <div class="archive-meta">
+          <span>FS-ARC-025</span>
+          <span>SIGNAL</span>
+        </div>
+        <h3>The Relay That Answers · Supplement 025</h3>
+        <p>The emergency relay responds to questions before the operator finishes speaking. Engineers find no return path in the wiring diagram. The item was logged at Ranger Trail; the associated witness was listed as the station operator.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The first set of footprints belongs to the person who has not arrived.”</p>
+            <p>Recovered location: Ranger Trail. The assigned reader was the station operator.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The anomaly appears to react to attention. Repeating the observation changes the result, so the first record must remain in the case file.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The last annotation is unexpectedly ordinary: “Take a breath. Drink some water. Call someone you trust before continuing.”</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>SIGNAL</span>
+          <span>RANGER TRAIL</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="medical" data-search="the empty bed · supplement 026 the clinic bed is strapped down and still bears the impression of a body. the patient ledger has an entry for tomorrow with no patient name. the item was logged at pine rest motel; the associated witness was listed as mara. mara pine rest motel “do not destroy the original record until both copies agree.” the signature appears authentic on the first inspection. under magnification, the ink strokes continue beyond the edge of the paper. the reviewer requested that this file be kept available for anyone struggling to make sense of the night. uncertainty should not be mistaken for personal failure.">
+        <div class="archive-meta">
+          <span>FS-ARC-026</span>
+          <span>MEDICAL</span>
+        </div>
+        <h3>The Empty Bed · Supplement 026</h3>
+        <p>The clinic bed is strapped down and still bears the impression of a body. The patient ledger has an entry for tomorrow with no patient name. The item was logged at Pine Rest Motel; the associated witness was listed as Mara.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Do not destroy the original record until both copies agree.”</p>
+            <p>Recovered location: Pine Rest Motel. The assigned reader was Mara.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The signature appears authentic on the first inspection. Under magnification, the ink strokes continue beyond the edge of the paper.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The reviewer requested that this file be kept available for anyone struggling to make sense of the night. Uncertainty should not be mistaken for personal failure.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEDICAL</span>
+          <span>PINE REST MOTEL</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="photography" data-search="the photograph with one extra person · supplement 027 a family photograph contains one more person each time it is developed. the extra face looks toward the camera in every version. the item was logged at checkpoint shack; the associated witness was listed as irena holt. irena holt checkpoint shack “the chair was warm even though no one had sat there.” the room inventory does not agree with the bodycam. the missing object may have been moved, removed, or omitted before the inventory was written. the sealed attachment is absent, but its shadow remains visible in every scan of the page. no physical object was recovered from the envelope.">
+        <div class="archive-meta">
+          <span>FS-ARC-027</span>
+          <span>PHOTOGRAPHY</span>
+        </div>
+        <h3>The Photograph With One Extra Person · Supplement 027</h3>
+        <p>A family photograph contains one more person each time it is developed. The extra face looks toward the camera in every version. The item was logged at Checkpoint Shack; the associated witness was listed as Irena Holt.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The chair was warm even though no one had sat there.”</p>
+            <p>Recovered location: Checkpoint Shack. The assigned reader was Irena Holt.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The room inventory does not agree with the bodycam. The missing object may have been moved, removed, or omitted before the inventory was written.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed attachment is absent, but its shadow remains visible in every scan of the page. No physical object was recovered from the envelope.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>PHOTOGRAPHY</span>
+          <span>CHECKPOINT SHACK</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="memorial" data-search="a long life remembered · supplement 028 a quiet remembrance records the things a loved one cherished: planes crossing the sky, cars on long roads, and photographs that preserve ordinary days. the item was logged at mile marker 9; the associated witness was listed as the missing deputy. the missing deputy mile marker 9 “the clock was correct. it was the morning that was wrong.” the source is uncertain. no ordinary device listed in the station inventory can produce the recorded signal without an active input. the evidence locker log records two people entering and one leaving. both signatures match the same employee file.">
+        <div class="archive-meta">
+          <span>FS-ARC-028</span>
+          <span>MEMORIAL</span>
+        </div>
+        <h3>A Long Life Remembered · Supplement 028</h3>
+        <p>A quiet remembrance records the things a loved one cherished: planes crossing the sky, cars on long roads, and photographs that preserve ordinary days. The item was logged at Mile Marker 9; the associated witness was listed as the missing deputy.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The clock was correct. It was the morning that was wrong.”</p>
+            <p>Recovered location: Mile Marker 9. The assigned reader was the missing deputy.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The source is uncertain. No ordinary device listed in the station inventory can produce the recorded signal without an active input.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The evidence locker log records two people entering and one leaving. Both signatures match the same employee file.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEMORIAL</span>
+          <span>MILE MARKER 9</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="the reply before the question · supplement 029 a recorded reply begins before the dispatch operator presses the transmit key. the reply includes a sentence that is not spoken until six minutes later. the item was logged at last stop diner; the associated witness was listed as mara. mara last stop diner “the signal became louder when everyone stopped talking.” the report is corroborated by the physical trace, but its chronology remains unstable. record the contradiction and do not resolve it by guessing. the evidence locker log records two people entering and one leaving. both signatures match the same employee file.">
+        <div class="archive-meta">
+          <span>FS-ARC-029</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>The Reply Before the Question · Supplement 029</h3>
+        <p>A recorded reply begins before the dispatch operator presses the transmit key. The reply includes a sentence that is not spoken until six minutes later. The item was logged at Last Stop Diner; the associated witness was listed as Mara.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The signal became louder when everyone stopped talking.”</p>
+            <p>Recovered location: Last Stop Diner. The assigned reader was Mara.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The report is corroborated by the physical trace, but its chronology remains unstable. Record the contradiction and do not resolve it by guessing.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The evidence locker log records two people entering and one leaving. Both signatures match the same employee file.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>LAST STOP DINER</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="the chair behind the glass · supplement 030 the intake camera shows an empty chair. the interview audio contains the chair scraping backwards and someone thanking the officer for letting them in. the item was logged at ranger trail; the associated witness was listed as irena holt. irena holt ranger trail “we counted six visitors. the door counted seven.” the time discrepancy is consistent across independent copies. a simple clock malfunction cannot explain why the answer arrives before the question. the record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.">
+        <div class="archive-meta">
+          <span>FS-ARC-030</span>
+          <span>STATION</span>
+        </div>
+        <h3>The Chair Behind the Glass · Supplement 030</h3>
+        <p>The intake camera shows an empty chair. The interview audio contains the chair scraping backwards and someone thanking the officer for letting them in. The item was logged at Ranger Trail; the associated witness was listed as Irena Holt.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“We counted six visitors. The door counted seven.”</p>
+            <p>Recovered location: Ranger Trail. The assigned reader was Irena Holt.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The time discrepancy is consistent across independent copies. A simple clock malfunction cannot explain why the answer arrives before the question.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>RANGER TRAIL</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="witness" data-search="the missing minute · supplement 031 silas remembers the farmhouse clock stopping at 02:17. every witness statement places the event at a different minute, but each watches the same clock. the item was logged at st. mercy chapel; the associated witness was listed as the missing deputy. the missing deputy st. mercy chapel “someone asked for condolences through a disconnected speaker.” the record should be handled as a lead rather than a conclusion. a similar phrase appears in an unrelated case file, though the files were sealed years apart. the final line is written in a different hand: “if you are reading this alone, you are not alone.” the ink has not been matched to any station employee.">
+        <div class="archive-meta">
+          <span>FS-ARC-031</span>
+          <span>WITNESS</span>
+        </div>
+        <h3>The Missing Minute · Supplement 031</h3>
+        <p>Silas remembers the farmhouse clock stopping at 02:17. Every witness statement places the event at a different minute, but each watches the same clock. The item was logged at St. Mercy Chapel; the associated witness was listed as the missing deputy.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Someone asked for condolences through a disconnected speaker.”</p>
+            <p>Recovered location: St. Mercy Chapel. The assigned reader was the missing deputy.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The record should be handled as a lead rather than a conclusion. A similar phrase appears in an unrelated case file, though the files were sealed years apart.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The final line is written in a different hand: “If you are reading this alone, you are not alone.” The ink has not been matched to any station employee.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>WITNESS</span>
+          <span>ST. MERCY CHAPEL</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="forest" data-search="the trees that move · supplement 032 tree trunks appear in different positions on the bodycam after a short blackout. no camera movement accounts for the change. the item was logged at swamp gas stop; the associated witness was listed as silas venn. silas venn swamp gas stop “we closed the gate at midnight. something opened it from the other side.” the anomaly appears to react to attention. repeating the observation changes the result, so the first record must remain in the case file. a later inventory lists this record as destroyed. the archive copy bears a scan date from the following week, before the destruction order was signed.">
+        <div class="archive-meta">
+          <span>FS-ARC-032</span>
+          <span>FOREST</span>
+        </div>
+        <h3>The Trees That Move · Supplement 032</h3>
+        <p>Tree trunks appear in different positions on the bodycam after a short blackout. No camera movement accounts for the change. The item was logged at Swamp Gas Stop; the associated witness was listed as Silas Venn.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“We closed the gate at midnight. Something opened it from the other side.”</p>
+            <p>Recovered location: Swamp Gas Stop. The assigned reader was Silas Venn.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The anomaly appears to react to attention. Repeating the observation changes the result, so the first record must remain in the case file.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>A later inventory lists this record as destroyed. The archive copy bears a scan date from the following week, before the destruction order was signed.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>FOREST</span>
+          <span>SWAMP GAS STOP</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="signal" data-search="anchor three · supplement 033 the final signal anchor carries a pulse resembling a human heartbeat. cutting power interrupts the pulse, but the connected speaker keeps ticking. the item was logged at mile marker 9; the associated witness was listed as irena holt. irena holt mile marker 9 “the footprints stopped at the wall and resumed in the room behind it.” the signature appears authentic on the first inspection. under magnification, the ink strokes continue beyond the edge of the paper. the file was re-opened after a technician heard a familiar voice from a device with its speaker removed. the technician recognized the voice as their own.">
+        <div class="archive-meta">
+          <span>FS-ARC-033</span>
+          <span>SIGNAL</span>
+        </div>
+        <h3>Anchor Three · Supplement 033</h3>
+        <p>The final signal anchor carries a pulse resembling a human heartbeat. Cutting power interrupts the pulse, but the connected speaker keeps ticking. The item was logged at Mile Marker 9; the associated witness was listed as Irena Holt.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The footprints stopped at the wall and resumed in the room behind it.”</p>
+            <p>Recovered location: Mile Marker 9. The assigned reader was Irena Holt.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The signature appears authentic on the first inspection. Under magnification, the ink strokes continue beyond the edge of the paper.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The file was re-opened after a technician heard a familiar voice from a device with its speaker removed. The technician recognized the voice as their own.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>SIGNAL</span>
+          <span>MILE MARKER 9</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="medical" data-search="the nurse’s photograph · supplement 034 the night nurse’s badge photo shows a different person when viewed in a mirror. the image on the badge does not change; the reflection does. the item was logged at leaning cabin; the associated witness was listed as the missing deputy. the missing deputy leaning cabin “a long life is not measured by its final morning.” the room inventory does not agree with the bodycam. the missing object may have been moved, removed, or omitted before the inventory was written. the analyst requested that a second officer observe the next test. both officers later wrote that the other person had never been present.">
+        <div class="archive-meta">
+          <span>FS-ARC-034</span>
+          <span>MEDICAL</span>
+        </div>
+        <h3>The Nurse’s Photograph · Supplement 034</h3>
+        <p>The night nurse’s badge photo shows a different person when viewed in a mirror. The image on the badge does not change; the reflection does. The item was logged at Leaning Cabin; the associated witness was listed as the missing deputy.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“A long life is not measured by its final morning.”</p>
+            <p>Recovered location: Leaning Cabin. The assigned reader was the missing deputy.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The room inventory does not agree with the bodycam. The missing object may have been moved, removed, or omitted before the inventory was written.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The analyst requested that a second officer observe the next test. Both officers later wrote that the other person had never been present.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEDICAL</span>
+          <span>LEANING CABIN</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="photography" data-search="the last frame · supplement 035 the last frame from a missing deputy’s camera shows the camera lying on the ground and still filming the person holding it. the item was logged at flood gate; the associated witness was listed as silas venn. silas venn flood gate “do not follow a voice just because it knows the case number.” the source is uncertain. no ordinary device listed in the station inventory can produce the recorded signal without an active input. the sealed note warns that this item should not be played through station speakers. during the original review, every clock in the building advanced by the same number of seconds.">
+        <div class="archive-meta">
+          <span>FS-ARC-035</span>
+          <span>PHOTOGRAPHY</span>
+        </div>
+        <h3>The Last Frame · Supplement 035</h3>
+        <p>The last frame from a missing deputy’s camera shows the camera lying on the ground and still filming the person holding it. The item was logged at Flood Gate; the associated witness was listed as Silas Venn.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Do not follow a voice just because it knows the case number.”</p>
+            <p>Recovered location: Flood Gate. The assigned reader was Silas Venn.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The source is uncertain. No ordinary device listed in the station inventory can produce the recorded signal without an active input.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed note warns that this item should not be played through station speakers. During the original review, every clock in the building advanced by the same number of seconds.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>PHOTOGRAPHY</span>
+          <span>FLOOD GATE</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="memorial" data-search="the prayer card · supplement 036 a folded prayer card was left by the chapel candle. it asks for comfort for the grieving, peace for the departed, and patience for everyone who cannot find the right words. the item was logged at st. mercy chapel; the associated witness was listed as tomas reed. tomas reed st. mercy chapel “the first set of footprints belongs to the person who has not arrived.” the report is corroborated by the physical trace, but its chronology remains unstable. record the contradiction and do not resolve it by guessing. the sealed note warns that this item should not be played through station speakers. during the original review, every clock in the building advanced by the same number of seconds.">
+        <div class="archive-meta">
+          <span>FS-ARC-036</span>
+          <span>MEMORIAL</span>
+        </div>
+        <h3>The Prayer Card · Supplement 036</h3>
+        <p>A folded prayer card was left by the chapel candle. It asks for comfort for the grieving, peace for the departed, and patience for everyone who cannot find the right words. The item was logged at St. Mercy Chapel; the associated witness was listed as Tomas Reed.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The first set of footprints belongs to the person who has not arrived.”</p>
+            <p>Recovered location: St. Mercy Chapel. The assigned reader was Tomas Reed.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The report is corroborated by the physical trace, but its chronology remains unstable. Record the contradiction and do not resolve it by guessing.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed note warns that this item should not be played through station speakers. During the original review, every clock in the building advanced by the same number of seconds.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEMORIAL</span>
+          <span>ST. MERCY CHAPEL</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="call sign fourteen · supplement 037 dispatch accepted a call from a unit that had been logged out of service eleven years earlier. the operator’s voice was calm, but the waveform began six seconds before the microphone opened. the item was logged at north culvert; the associated witness was listed as the missing deputy. the missing deputy north culvert “the light did not fail. the room simply stopped being visible.” the witness is frightened, but fear does not prove deception. ask a neutral follow-up and compare the response with the recorded details. the last annotation is unexpectedly ordinary: “take a breath. drink some water. call someone you trust before continuing.”">
+        <div class="archive-meta">
+          <span>FS-ARC-037</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>Call Sign Fourteen · Supplement 037</h3>
+        <p>Dispatch accepted a call from a unit that had been logged out of service eleven years earlier. The operator’s voice was calm, but the waveform began six seconds before the microphone opened. The item was logged at North Culvert; the associated witness was listed as the missing deputy.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The light did not fail. The room simply stopped being visible.”</p>
+            <p>Recovered location: North Culvert. The assigned reader was the missing deputy.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The witness is frightened, but fear does not prove deception. Ask a neutral follow-up and compare the response with the recorded details.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The last annotation is unexpectedly ordinary: “Take a breath. Drink some water. Call someone you trust before continuing.”</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>NORTH CULVERT</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="the second timestamp · supplement 038 two copies of the same call arrived with different timestamps. the older file contains a response from the officer who had not yet received the call. the item was logged at cypress farmhouse; the associated witness was listed as silas venn. silas venn cypress farmhouse “the witness knew what the investigator would ask.” the record should be handled as a lead rather than a conclusion. a similar phrase appears in an unrelated case file, though the files were sealed years apart. the reviewer requested that this file be kept available for anyone struggling to make sense of the night. uncertainty should not be mistaken for personal failure.">
+        <div class="archive-meta">
+          <span>FS-ARC-038</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>The Second Timestamp · Supplement 038</h3>
+        <p>Two copies of the same call arrived with different timestamps. The older file contains a response from the officer who had not yet received the call. The item was logged at Cypress Farmhouse; the associated witness was listed as Silas Venn.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The witness knew what the investigator would ask.”</p>
+            <p>Recovered location: Cypress Farmhouse. The assigned reader was Silas Venn.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The record should be handled as a lead rather than a conclusion. A similar phrase appears in an unrelated case file, though the files were sealed years apart.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The reviewer requested that this file be kept available for anyone struggling to make sense of the night. Uncertainty should not be mistaken for personal failure.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>CYPRESS FARMHOUSE</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="camera 04 · supplement 039 camera 04 records seven arrivals on a night when only six visitors are expected. the seventh figure enters through a wall that has no door. the item was logged at leaning cabin; the associated witness was listed as tomas reed. tomas reed leaning cabin “i heard my own voice reporting that i was safe. i was hiding when it spoke.” the anomaly appears to react to attention. repeating the observation changes the result, so the first record must remain in the case file. the sealed attachment is absent, but its shadow remains visible in every scan of the page. no physical object was recovered from the envelope.">
+        <div class="archive-meta">
+          <span>FS-ARC-039</span>
+          <span>STATION</span>
+        </div>
+        <h3>Camera 04 · Supplement 039</h3>
+        <p>Camera 04 records seven arrivals on a night when only six visitors are expected. The seventh figure enters through a wall that has no door. The item was logged at Leaning Cabin; the associated witness was listed as Tomas Reed.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“I heard my own voice reporting that I was safe. I was hiding when it spoke.”</p>
+            <p>Recovered location: Leaning Cabin. The assigned reader was Tomas Reed.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The anomaly appears to react to attention. Repeating the observation changes the result, so the first record must remain in the case file.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed attachment is absent, but its shadow remains visible in every scan of the page. No physical object was recovered from the envelope.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>LEANING CABIN</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="the blank badge · supplement 040 a badge printer produced a blank card after the station network was disconnected. the card warmed whenever it was held near the interview room. the item was logged at records annex; the associated witness was listed as the night clerk. the night clerk records annex “keep the family photographs dry. the faces blur when the paper becomes wet.” the signature appears authentic on the first inspection. under magnification, the ink strokes continue beyond the edge of the paper. the evidence locker log records two people entering and one leaving. both signatures match the same employee file.">
+        <div class="archive-meta">
+          <span>FS-ARC-040</span>
+          <span>STATION</span>
+        </div>
+        <h3>The Blank Badge · Supplement 040</h3>
+        <p>A badge printer produced a blank card after the station network was disconnected. The card warmed whenever it was held near the interview room. The item was logged at Records Annex; the associated witness was listed as the night clerk.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Keep the family photographs dry. The faces blur when the paper becomes wet.”</p>
+            <p>Recovered location: Records Annex. The assigned reader was the night clerk.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The signature appears authentic on the first inspection. Under magnification, the ink strokes continue beyond the edge of the paper.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The evidence locker log records two people entering and one leaving. Both signatures match the same employee file.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>RECORDS ANNEX</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="witness" data-search="silas venn’s first statement · supplement 041 silas says he never entered the farmhouse. mud on his cuffs matches the upstairs landing, where the windows have been nailed shut from within. the item was logged at radio relay hut; the associated witness was listed as silas venn. silas venn radio relay hut “we counted six visitors. the door counted seven.” the room inventory does not agree with the bodycam. the missing object may have been moved, removed, or omitted before the inventory was written. the record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.">
+        <div class="archive-meta">
+          <span>FS-ARC-041</span>
+          <span>WITNESS</span>
+        </div>
+        <h3>Silas Venn’s First Statement · Supplement 041</h3>
+        <p>Silas says he never entered the farmhouse. Mud on his cuffs matches the upstairs landing, where the windows have been nailed shut from within. The item was logged at Radio Relay Hut; the associated witness was listed as Silas Venn.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“We counted six visitors. The door counted seven.”</p>
+            <p>Recovered location: Radio Relay Hut. The assigned reader was Silas Venn.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The room inventory does not agree with the bodycam. The missing object may have been moved, removed, or omitted before the inventory was written.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>WITNESS</span>
+          <span>RADIO RELAY HUT</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="forest" data-search="the dry footprints · supplement 042 a line of wet boot prints crosses the forest floor, then continues over a fallen tree without disturbing the moss. the item was logged at north culvert; the associated witness was listed as tomas reed. tomas reed north culvert “the photograph was developed twice. the second negative had a reflection.” the source is uncertain. no ordinary device listed in the station inventory can produce the recorded signal without an active input. the final line is written in a different hand: “if you are reading this alone, you are not alone.” the ink has not been matched to any station employee.">
+        <div class="archive-meta">
+          <span>FS-ARC-042</span>
+          <span>FOREST</span>
+        </div>
+        <h3>The Dry Footprints · Supplement 042</h3>
+        <p>A line of wet boot prints crosses the forest floor, then continues over a fallen tree without disturbing the moss. The item was logged at North Culvert; the associated witness was listed as Tomas Reed.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The photograph was developed twice. The second negative had a reflection.”</p>
+            <p>Recovered location: North Culvert. The assigned reader was Tomas Reed.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The source is uncertain. No ordinary device listed in the station inventory can produce the recorded signal without an active input.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The final line is written in a different hand: “If you are reading this alone, you are not alone.” The ink has not been matched to any station employee.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>FOREST</span>
+          <span>NORTH CULVERT</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="signal" data-search="the relay that answers · supplement 043 the emergency relay responds to questions before the operator finishes speaking. engineers find no return path in the wiring diagram. the item was logged at county police station; the associated witness was listed as the night clerk. the night clerk county police station “do not destroy the original record until both copies agree.” the statement may be truthful about the location but false about the time. compare it against the dispatch log and the environmental evidence. the final line is written in a different hand: “if you are reading this alone, you are not alone.” the ink has not been matched to any station employee.">
+        <div class="archive-meta">
+          <span>FS-ARC-043</span>
+          <span>SIGNAL</span>
+        </div>
+        <h3>The Relay That Answers · Supplement 043</h3>
+        <p>The emergency relay responds to questions before the operator finishes speaking. Engineers find no return path in the wiring diagram. The item was logged at County Police Station; the associated witness was listed as the night clerk.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Do not destroy the original record until both copies agree.”</p>
+            <p>Recovered location: County Police Station. The assigned reader was the night clerk.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The statement may be truthful about the location but false about the time. Compare it against the dispatch log and the environmental evidence.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The final line is written in a different hand: “If you are reading this alone, you are not alone.” The ink has not been matched to any station employee.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>SIGNAL</span>
+          <span>COUNTY POLICE STATION</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="medical" data-search="the empty bed · supplement 044 the clinic bed is strapped down and still bears the impression of a body. the patient ledger has an entry for tomorrow with no patient name. the item was logged at flood control warehouse; the associated witness was listed as officer yumi. officer yumi flood control warehouse “the chair was warm even though no one had sat there.” the witness is frightened, but fear does not prove deception. ask a neutral follow-up and compare the response with the recorded details. a later inventory lists this record as destroyed. the archive copy bears a scan date from the following week, before the destruction order was signed.">
+        <div class="archive-meta">
+          <span>FS-ARC-044</span>
+          <span>MEDICAL</span>
+        </div>
+        <h3>The Empty Bed · Supplement 044</h3>
+        <p>The clinic bed is strapped down and still bears the impression of a body. The patient ledger has an entry for tomorrow with no patient name. The item was logged at Flood Control Warehouse; the associated witness was listed as Officer Yumi.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The chair was warm even though no one had sat there.”</p>
+            <p>Recovered location: Flood Control Warehouse. The assigned reader was Officer Yumi.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The witness is frightened, but fear does not prove deception. Ask a neutral follow-up and compare the response with the recorded details.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>A later inventory lists this record as destroyed. The archive copy bears a scan date from the following week, before the destruction order was signed.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEDICAL</span>
+          <span>FLOOD CONTROL WAREHOUSE</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="photography" data-search="the photograph with one extra person · supplement 045 a family photograph contains one more person each time it is developed. the extra face looks toward the camera in every version. the item was logged at records annex; the associated witness was listed as tomas reed. tomas reed records annex “the clock was correct. it was the morning that was wrong.” the record should be handled as a lead rather than a conclusion. a similar phrase appears in an unrelated case file, though the files were sealed years apart. the file was re-opened after a technician heard a familiar voice from a device with its speaker removed. the technician recognized the voice as their own.">
+        <div class="archive-meta">
+          <span>FS-ARC-045</span>
+          <span>PHOTOGRAPHY</span>
+        </div>
+        <h3>The Photograph With One Extra Person · Supplement 045</h3>
+        <p>A family photograph contains one more person each time it is developed. The extra face looks toward the camera in every version. The item was logged at Records Annex; the associated witness was listed as Tomas Reed.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The clock was correct. It was the morning that was wrong.”</p>
+            <p>Recovered location: Records Annex. The assigned reader was Tomas Reed.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The record should be handled as a lead rather than a conclusion. A similar phrase appears in an unrelated case file, though the files were sealed years apart.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The file was re-opened after a technician heard a familiar voice from a device with its speaker removed. The technician recognized the voice as their own.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>PHOTOGRAPHY</span>
+          <span>RECORDS ANNEX</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="memorial" data-search="a long life remembered · supplement 046 a quiet remembrance records the things a loved one cherished: planes crossing the sky, cars on long roads, and photographs that preserve ordinary days. the item was logged at county clinic; the associated witness was listed as the night clerk. the night clerk county clinic “do not follow a voice just because it knows the case number.” the anomaly appears to react to attention. repeating the observation changes the result, so the first record must remain in the case file. the analyst requested that a second officer observe the next test. both officers later wrote that the other person had never been present.">
+        <div class="archive-meta">
+          <span>FS-ARC-046</span>
+          <span>MEMORIAL</span>
+        </div>
+        <h3>A Long Life Remembered · Supplement 046</h3>
+        <p>A quiet remembrance records the things a loved one cherished: planes crossing the sky, cars on long roads, and photographs that preserve ordinary days. The item was logged at County Clinic; the associated witness was listed as the night clerk.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Do not follow a voice just because it knows the case number.”</p>
+            <p>Recovered location: County Clinic. The assigned reader was the night clerk.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The anomaly appears to react to attention. Repeating the observation changes the result, so the first record must remain in the case file.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The analyst requested that a second officer observe the next test. Both officers later wrote that the other person had never been present.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEMORIAL</span>
+          <span>COUNTY CLINIC</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="the reply before the question · supplement 047 a recorded reply begins before the dispatch operator presses the transmit key. the reply includes a sentence that is not spoken until six minutes later. the item was logged at interview room two; the associated witness was listed as officer yumi. officer yumi interview room two “if the radio repeats your breathing, stop transmitting.” the signature appears authentic on the first inspection. under magnification, the ink strokes continue beyond the edge of the paper. the sealed note warns that this item should not be played through station speakers. during the original review, every clock in the building advanced by the same number of seconds.">
+        <div class="archive-meta">
+          <span>FS-ARC-047</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>The Reply Before the Question · Supplement 047</h3>
+        <p>A recorded reply begins before the dispatch operator presses the transmit key. The reply includes a sentence that is not spoken until six minutes later. The item was logged at Interview Room Two; the associated witness was listed as Officer Yumi.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“If the radio repeats your breathing, stop transmitting.”</p>
+            <p>Recovered location: Interview Room Two. The assigned reader was Officer Yumi.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The signature appears authentic on the first inspection. Under magnification, the ink strokes continue beyond the edge of the paper.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed note warns that this item should not be played through station speakers. During the original review, every clock in the building advanced by the same number of seconds.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>INTERVIEW ROOM TWO</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="the chair behind the glass · supplement 048 the intake camera shows an empty chair. the interview audio contains the chair scraping backwards and someone thanking the officer for letting them in. the item was logged at county police station; the associated witness was listed as lena ward. lena ward county police station “someone asked for condolences through a disconnected speaker.” the room inventory does not agree with the bodycam. the missing object may have been moved, removed, or omitted before the inventory was written. the last annotation is unexpectedly ordinary: “take a breath. drink some water. call someone you trust before continuing.”">
+        <div class="archive-meta">
+          <span>FS-ARC-048</span>
+          <span>STATION</span>
+        </div>
+        <h3>The Chair Behind the Glass · Supplement 048</h3>
+        <p>The intake camera shows an empty chair. The interview audio contains the chair scraping backwards and someone thanking the officer for letting them in. The item was logged at County Police Station; the associated witness was listed as Lena Ward.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Someone asked for condolences through a disconnected speaker.”</p>
+            <p>Recovered location: County Police Station. The assigned reader was Lena Ward.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The room inventory does not agree with the bodycam. The missing object may have been moved, removed, or omitted before the inventory was written.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The last annotation is unexpectedly ordinary: “Take a breath. Drink some water. Call someone you trust before continuing.”</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>COUNTY POLICE STATION</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="witness" data-search="the missing minute · supplement 049 silas remembers the farmhouse clock stopping at 02:17. every witness statement places the event at a different minute, but each watches the same clock. the item was logged at checkpoint shack; the associated witness was listed as the night clerk. the night clerk checkpoint shack “we closed the gate at midnight. something opened it from the other side.” the evidence supports the presence of a second observer, not necessarily a second living person. avoid labeling the subject before completing the interview. the reviewer requested that this file be kept available for anyone struggling to make sense of the night. uncertainty should not be mistaken for personal failure.">
+        <div class="archive-meta">
+          <span>FS-ARC-049</span>
+          <span>WITNESS</span>
+        </div>
+        <h3>The Missing Minute · Supplement 049</h3>
+        <p>Silas remembers the farmhouse clock stopping at 02:17. Every witness statement places the event at a different minute, but each watches the same clock. The item was logged at Checkpoint Shack; the associated witness was listed as the night clerk.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“We closed the gate at midnight. Something opened it from the other side.”</p>
+            <p>Recovered location: Checkpoint Shack. The assigned reader was the night clerk.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The evidence supports the presence of a second observer, not necessarily a second living person. Avoid labeling the subject before completing the interview.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The reviewer requested that this file be kept available for anyone struggling to make sense of the night. Uncertainty should not be mistaken for personal failure.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>WITNESS</span>
+          <span>CHECKPOINT SHACK</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="forest" data-search="the trees that move · supplement 050 tree trunks appear in different positions on the bodycam after a short blackout. no camera movement accounts for the change. the item was logged at old footbridge; the associated witness was listed as officer yumi. officer yumi old footbridge “the footprints stopped at the wall and resumed in the room behind it.” the statement may be truthful about the location but false about the time. compare it against the dispatch log and the environmental evidence. the reviewer requested that this file be kept available for anyone struggling to make sense of the night. uncertainty should not be mistaken for personal failure.">
+        <div class="archive-meta">
+          <span>FS-ARC-050</span>
+          <span>FOREST</span>
+        </div>
+        <h3>The Trees That Move · Supplement 050</h3>
+        <p>Tree trunks appear in different positions on the bodycam after a short blackout. No camera movement accounts for the change. The item was logged at Old Footbridge; the associated witness was listed as Officer Yumi.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The footprints stopped at the wall and resumed in the room behind it.”</p>
+            <p>Recovered location: Old Footbridge. The assigned reader was Officer Yumi.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The statement may be truthful about the location but false about the time. Compare it against the dispatch log and the environmental evidence.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The reviewer requested that this file be kept available for anyone struggling to make sense of the night. Uncertainty should not be mistaken for personal failure.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>FOREST</span>
+          <span>OLD FOOTBRIDGE</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="signal" data-search="anchor three · supplement 051 the final signal anchor carries a pulse resembling a human heartbeat. cutting power interrupts the pulse, but the connected speaker keeps ticking. the item was logged at county clinic; the associated witness was listed as lena ward. lena ward county clinic “keep the family photographs dry. the faces blur when the paper becomes wet.” the witness is frightened, but fear does not prove deception. ask a neutral follow-up and compare the response with the recorded details. the sealed attachment is absent, but its shadow remains visible in every scan of the page. no physical object was recovered from the envelope.">
+        <div class="archive-meta">
+          <span>FS-ARC-051</span>
+          <span>SIGNAL</span>
+        </div>
+        <h3>Anchor Three · Supplement 051</h3>
+        <p>The final signal anchor carries a pulse resembling a human heartbeat. Cutting power interrupts the pulse, but the connected speaker keeps ticking. The item was logged at County Clinic; the associated witness was listed as Lena Ward.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Keep the family photographs dry. The faces blur when the paper becomes wet.”</p>
+            <p>Recovered location: County Clinic. The assigned reader was Lena Ward.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The witness is frightened, but fear does not prove deception. Ask a neutral follow-up and compare the response with the recorded details.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed attachment is absent, but its shadow remains visible in every scan of the page. No physical object was recovered from the envelope.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>SIGNAL</span>
+          <span>COUNTY CLINIC</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="medical" data-search="the nurse’s photograph · supplement 052 the night nurse’s badge photo shows a different person when viewed in a mirror. the image on the badge does not change; the reflection does. the item was logged at ranger trail; the associated witness was listed as the seventh arrival. the seventh arrival ranger trail “the lamp was on, but there was no shadow under the chair.” the record should be handled as a lead rather than a conclusion. a similar phrase appears in an unrelated case file, though the files were sealed years apart. the evidence locker log records two people entering and one leaving. both signatures match the same employee file.">
+        <div class="archive-meta">
+          <span>FS-ARC-052</span>
+          <span>MEDICAL</span>
+        </div>
+        <h3>The Nurse’s Photograph · Supplement 052</h3>
+        <p>The night nurse’s badge photo shows a different person when viewed in a mirror. The image on the badge does not change; the reflection does. The item was logged at Ranger Trail; the associated witness was listed as The Seventh Arrival.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The lamp was on, but there was no shadow under the chair.”</p>
+            <p>Recovered location: Ranger Trail. The assigned reader was The Seventh Arrival.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The record should be handled as a lead rather than a conclusion. A similar phrase appears in an unrelated case file, though the files were sealed years apart.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The evidence locker log records two people entering and one leaving. Both signatures match the same employee file.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEDICAL</span>
+          <span>RANGER TRAIL</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="photography" data-search="the last frame · supplement 053 the last frame from a missing deputy’s camera shows the camera lying on the ground and still filming the person holding it. the item was logged at pine rest motel; the associated witness was listed as officer yumi. officer yumi pine rest motel “the first set of footprints belongs to the person who has not arrived.” the anomaly appears to react to attention. repeating the observation changes the result, so the first record must remain in the case file. the record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.">
+        <div class="archive-meta">
+          <span>FS-ARC-053</span>
+          <span>PHOTOGRAPHY</span>
+        </div>
+        <h3>The Last Frame · Supplement 053</h3>
+        <p>The last frame from a missing deputy’s camera shows the camera lying on the ground and still filming the person holding it. The item was logged at Pine Rest Motel; the associated witness was listed as Officer Yumi.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The first set of footprints belongs to the person who has not arrived.”</p>
+            <p>Recovered location: Pine Rest Motel. The assigned reader was Officer Yumi.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The anomaly appears to react to attention. Repeating the observation changes the result, so the first record must remain in the case file.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>PHOTOGRAPHY</span>
+          <span>PINE REST MOTEL</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="memorial" data-search="the prayer card · supplement 054 a folded prayer card was left by the chapel candle. it asks for comfort for the grieving, peace for the departed, and patience for everyone who cannot find the right words. the item was logged at checkpoint shack; the associated witness was listed as lena ward. lena ward checkpoint shack “the light did not fail. the room simply stopped being visible.” the signature appears authentic on the first inspection. under magnification, the ink strokes continue beyond the edge of the paper. the final line is written in a different hand: “if you are reading this alone, you are not alone.” the ink has not been matched to any station employee.">
+        <div class="archive-meta">
+          <span>FS-ARC-054</span>
+          <span>MEMORIAL</span>
+        </div>
+        <h3>The Prayer Card · Supplement 054</h3>
+        <p>A folded prayer card was left by the chapel candle. It asks for comfort for the grieving, peace for the departed, and patience for everyone who cannot find the right words. The item was logged at Checkpoint Shack; the associated witness was listed as Lena Ward.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The light did not fail. The room simply stopped being visible.”</p>
+            <p>Recovered location: Checkpoint Shack. The assigned reader was Lena Ward.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The signature appears authentic on the first inspection. Under magnification, the ink strokes continue beyond the edge of the paper.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The final line is written in a different hand: “If you are reading this alone, you are not alone.” The ink has not been matched to any station employee.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEMORIAL</span>
+          <span>CHECKPOINT SHACK</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="call sign fourteen · supplement 055 dispatch accepted a call from a unit that had been logged out of service eleven years earlier. the operator’s voice was calm, but the waveform began six seconds before the microphone opened. the item was logged at mile marker 9; the associated witness was listed as the seventh arrival. the seventh arrival mile marker 9 “the witness knew what the investigator would ask.” the time discrepancy is consistent across independent copies. a simple clock malfunction cannot explain why the answer arrives before the question. a later inventory lists this record as destroyed. the archive copy bears a scan date from the following week, before the destruction order was signed.">
+        <div class="archive-meta">
+          <span>FS-ARC-055</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>Call Sign Fourteen · Supplement 055</h3>
+        <p>Dispatch accepted a call from a unit that had been logged out of service eleven years earlier. The operator’s voice was calm, but the waveform began six seconds before the microphone opened. The item was logged at Mile Marker 9; the associated witness was listed as The Seventh Arrival.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The witness knew what the investigator would ask.”</p>
+            <p>Recovered location: Mile Marker 9. The assigned reader was The Seventh Arrival.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The time discrepancy is consistent across independent copies. A simple clock malfunction cannot explain why the answer arrives before the question.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>A later inventory lists this record as destroyed. The archive copy bears a scan date from the following week, before the destruction order was signed.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>MILE MARKER 9</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="the second timestamp · supplement 056 two copies of the same call arrived with different timestamps. the older file contains a response from the officer who had not yet received the call. the item was logged at last stop diner; the associated witness was listed as officer hugo. officer hugo last stop diner “the clock was correct. it was the morning that was wrong.” the evidence supports the presence of a second observer, not necessarily a second living person. avoid labeling the subject before completing the interview. the file was re-opened after a technician heard a familiar voice from a device with its speaker removed. the technician recognized the voice as their own.">
+        <div class="archive-meta">
+          <span>FS-ARC-056</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>The Second Timestamp · Supplement 056</h3>
+        <p>Two copies of the same call arrived with different timestamps. The older file contains a response from the officer who had not yet received the call. The item was logged at Last Stop Diner; the associated witness was listed as Officer Hugo.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The clock was correct. It was the morning that was wrong.”</p>
+            <p>Recovered location: Last Stop Diner. The assigned reader was Officer Hugo.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The evidence supports the presence of a second observer, not necessarily a second living person. Avoid labeling the subject before completing the interview.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The file was re-opened after a technician heard a familiar voice from a device with its speaker removed. The technician recognized the voice as their own.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>LAST STOP DINER</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="camera 04 · supplement 057 camera 04 records seven arrivals on a night when only six visitors are expected. the seventh figure enters through a wall that has no door. the item was logged at ranger trail; the associated witness was listed as lena ward. lena ward ranger trail “the signal became louder when everyone stopped talking.” the statement may be truthful about the location but false about the time. compare it against the dispatch log and the environmental evidence. the file was re-opened after a technician heard a familiar voice from a device with its speaker removed. the technician recognized the voice as their own.">
+        <div class="archive-meta">
+          <span>FS-ARC-057</span>
+          <span>STATION</span>
+        </div>
+        <h3>Camera 04 · Supplement 057</h3>
+        <p>Camera 04 records seven arrivals on a night when only six visitors are expected. The seventh figure enters through a wall that has no door. The item was logged at Ranger Trail; the associated witness was listed as Lena Ward.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The signal became louder when everyone stopped talking.”</p>
+            <p>Recovered location: Ranger Trail. The assigned reader was Lena Ward.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The statement may be truthful about the location but false about the time. Compare it against the dispatch log and the environmental evidence.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The file was re-opened after a technician heard a familiar voice from a device with its speaker removed. The technician recognized the voice as their own.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>RANGER TRAIL</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="the blank badge · supplement 058 a badge printer produced a blank card after the station network was disconnected. the card warmed whenever it was held near the interview room. the item was logged at st. mercy chapel; the associated witness was listed as the seventh arrival. the seventh arrival st. mercy chapel “we counted six visitors. the door counted seven.” the witness is frightened, but fear does not prove deception. ask a neutral follow-up and compare the response with the recorded details. the analyst requested that a second officer observe the next test. both officers later wrote that the other person had never been present.">
+        <div class="archive-meta">
+          <span>FS-ARC-058</span>
+          <span>STATION</span>
+        </div>
+        <h3>The Blank Badge · Supplement 058</h3>
+        <p>A badge printer produced a blank card after the station network was disconnected. The card warmed whenever it was held near the interview room. The item was logged at St. Mercy Chapel; the associated witness was listed as The Seventh Arrival.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“We counted six visitors. The door counted seven.”</p>
+            <p>Recovered location: St. Mercy Chapel. The assigned reader was The Seventh Arrival.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The witness is frightened, but fear does not prove deception. Ask a neutral follow-up and compare the response with the recorded details.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The analyst requested that a second officer observe the next test. Both officers later wrote that the other person had never been present.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>ST. MERCY CHAPEL</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="witness" data-search="silas venn’s first statement · supplement 059 silas says he never entered the farmhouse. mud on his cuffs matches the upstairs landing, where the windows have been nailed shut from within. the item was logged at swamp gas stop; the associated witness was listed as officer hugo. officer hugo swamp gas stop “the photograph was developed twice. the second negative had a reflection.” the record should be handled as a lead rather than a conclusion. a similar phrase appears in an unrelated case file, though the files were sealed years apart. the sealed note warns that this item should not be played through station speakers. during the original review, every clock in the building advanced by the same number of seconds.">
+        <div class="archive-meta">
+          <span>FS-ARC-059</span>
+          <span>WITNESS</span>
+        </div>
+        <h3>Silas Venn’s First Statement · Supplement 059</h3>
+        <p>Silas says he never entered the farmhouse. Mud on his cuffs matches the upstairs landing, where the windows have been nailed shut from within. The item was logged at Swamp Gas Stop; the associated witness was listed as Officer Hugo.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The photograph was developed twice. The second negative had a reflection.”</p>
+            <p>Recovered location: Swamp Gas Stop. The assigned reader was Officer Hugo.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The record should be handled as a lead rather than a conclusion. A similar phrase appears in an unrelated case file, though the files were sealed years apart.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed note warns that this item should not be played through station speakers. During the original review, every clock in the building advanced by the same number of seconds.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>WITNESS</span>
+          <span>SWAMP GAS STOP</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="forest" data-search="the dry footprints · supplement 060 a line of wet boot prints crosses the forest floor, then continues over a fallen tree without disturbing the moss. the item was logged at mile marker 9; the associated witness was listed as aaron pike. aaron pike mile marker 9 “do not destroy the original record until both copies agree.” the anomaly appears to react to attention. repeating the observation changes the result, so the first record must remain in the case file. the last annotation is unexpectedly ordinary: “take a breath. drink some water. call someone you trust before continuing.”">
+        <div class="archive-meta">
+          <span>FS-ARC-060</span>
+          <span>FOREST</span>
+        </div>
+        <h3>The Dry Footprints · Supplement 060</h3>
+        <p>A line of wet boot prints crosses the forest floor, then continues over a fallen tree without disturbing the moss. The item was logged at Mile Marker 9; the associated witness was listed as Aaron Pike.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Do not destroy the original record until both copies agree.”</p>
+            <p>Recovered location: Mile Marker 9. The assigned reader was Aaron Pike.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The anomaly appears to react to attention. Repeating the observation changes the result, so the first record must remain in the case file.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The last annotation is unexpectedly ordinary: “Take a breath. Drink some water. Call someone you trust before continuing.”</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>FOREST</span>
+          <span>MILE MARKER 9</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="signal" data-search="the relay that answers · supplement 061 the emergency relay responds to questions before the operator finishes speaking. engineers find no return path in the wiring diagram. the item was logged at leaning cabin; the associated witness was listed as the seventh arrival. the seventh arrival leaning cabin “the footprints stopped at the wall and resumed in the room behind it.” the report is corroborated by the physical trace, but its chronology remains unstable. record the contradiction and do not resolve it by guessing. the reviewer requested that this file be kept available for anyone struggling to make sense of the night. uncertainty should not be mistaken for personal failure.">
+        <div class="archive-meta">
+          <span>FS-ARC-061</span>
+          <span>SIGNAL</span>
+        </div>
+        <h3>The Relay That Answers · Supplement 061</h3>
+        <p>The emergency relay responds to questions before the operator finishes speaking. Engineers find no return path in the wiring diagram. The item was logged at Leaning Cabin; the associated witness was listed as The Seventh Arrival.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The footprints stopped at the wall and resumed in the room behind it.”</p>
+            <p>Recovered location: Leaning Cabin. The assigned reader was The Seventh Arrival.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The report is corroborated by the physical trace, but its chronology remains unstable. Record the contradiction and do not resolve it by guessing.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The reviewer requested that this file be kept available for anyone struggling to make sense of the night. Uncertainty should not be mistaken for personal failure.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>SIGNAL</span>
+          <span>LEANING CABIN</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="medical" data-search="the empty bed · supplement 062 the clinic bed is strapped down and still bears the impression of a body. the patient ledger has an entry for tomorrow with no patient name. the item was logged at flood gate; the associated witness was listed as officer hugo. officer hugo flood gate “a long life is not measured by its final morning.” the time discrepancy is consistent across independent copies. a simple clock malfunction cannot explain why the answer arrives before the question. the sealed attachment is absent, but its shadow remains visible in every scan of the page. no physical object was recovered from the envelope.">
+        <div class="archive-meta">
+          <span>FS-ARC-062</span>
+          <span>MEDICAL</span>
+        </div>
+        <h3>The Empty Bed · Supplement 062</h3>
+        <p>The clinic bed is strapped down and still bears the impression of a body. The patient ledger has an entry for tomorrow with no patient name. The item was logged at Flood Gate; the associated witness was listed as Officer Hugo.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“A long life is not measured by its final morning.”</p>
+            <p>Recovered location: Flood Gate. The assigned reader was Officer Hugo.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The time discrepancy is consistent across independent copies. A simple clock malfunction cannot explain why the answer arrives before the question.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed attachment is absent, but its shadow remains visible in every scan of the page. No physical object was recovered from the envelope.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEDICAL</span>
+          <span>FLOOD GATE</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="photography" data-search="the photograph with one extra person · supplement 063 a family photograph contains one more person each time it is developed. the extra face looks toward the camera in every version. the item was logged at st. mercy chapel; the associated witness was listed as aaron pike. aaron pike st. mercy chapel “do not follow a voice just because it knows the case number.” the evidence supports the presence of a second observer, not necessarily a second living person. avoid labeling the subject before completing the interview. the evidence locker log records two people entering and one leaving. both signatures match the same employee file.">
+        <div class="archive-meta">
+          <span>FS-ARC-063</span>
+          <span>PHOTOGRAPHY</span>
+        </div>
+        <h3>The Photograph With One Extra Person · Supplement 063</h3>
+        <p>A family photograph contains one more person each time it is developed. The extra face looks toward the camera in every version. The item was logged at St. Mercy Chapel; the associated witness was listed as Aaron Pike.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Do not follow a voice just because it knows the case number.”</p>
+            <p>Recovered location: St. Mercy Chapel. The assigned reader was Aaron Pike.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The evidence supports the presence of a second observer, not necessarily a second living person. Avoid labeling the subject before completing the interview.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The evidence locker log records two people entering and one leaving. Both signatures match the same employee file.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>PHOTOGRAPHY</span>
+          <span>ST. MERCY CHAPEL</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="memorial" data-search="a long life remembered · supplement 064 a quiet remembrance records the things a loved one cherished: planes crossing the sky, cars on long roads, and photographs that preserve ordinary days. the item was logged at north culvert; the associated witness was listed as unit 14. unit 14 north culvert “if the radio repeats your breathing, stop transmitting.” the statement may be truthful about the location but false about the time. compare it against the dispatch log and the environmental evidence. the evidence locker log records two people entering and one leaving. both signatures match the same employee file.">
+        <div class="archive-meta">
+          <span>FS-ARC-064</span>
+          <span>MEMORIAL</span>
+        </div>
+        <h3>A Long Life Remembered · Supplement 064</h3>
+        <p>A quiet remembrance records the things a loved one cherished: planes crossing the sky, cars on long roads, and photographs that preserve ordinary days. The item was logged at North Culvert; the associated witness was listed as Unit 14.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“If the radio repeats your breathing, stop transmitting.”</p>
+            <p>Recovered location: North Culvert. The assigned reader was Unit 14.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The statement may be truthful about the location but false about the time. Compare it against the dispatch log and the environmental evidence.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The evidence locker log records two people entering and one leaving. Both signatures match the same employee file.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEMORIAL</span>
+          <span>NORTH CULVERT</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="the reply before the question · supplement 065 a recorded reply begins before the dispatch operator presses the transmit key. the reply includes a sentence that is not spoken until six minutes later. the item was logged at cypress farmhouse; the associated witness was listed as officer hugo. officer hugo cypress farmhouse “someone asked for condolences through a disconnected speaker.” the witness is frightened, but fear does not prove deception. ask a neutral follow-up and compare the response with the recorded details. the record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.">
+        <div class="archive-meta">
+          <span>FS-ARC-065</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>The Reply Before the Question · Supplement 065</h3>
+        <p>A recorded reply begins before the dispatch operator presses the transmit key. The reply includes a sentence that is not spoken until six minutes later. The item was logged at Cypress Farmhouse; the associated witness was listed as Officer Hugo.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Someone asked for condolences through a disconnected speaker.”</p>
+            <p>Recovered location: Cypress Farmhouse. The assigned reader was Officer Hugo.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The witness is frightened, but fear does not prove deception. Ask a neutral follow-up and compare the response with the recorded details.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>CYPRESS FARMHOUSE</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="the chair behind the glass · supplement 066 the intake camera shows an empty chair. the interview audio contains the chair scraping backwards and someone thanking the officer for letting them in. the item was logged at leaning cabin; the associated witness was listed as aaron pike. aaron pike leaning cabin “the witness knew what the investigator would ask.” the record should be handled as a lead rather than a conclusion. a similar phrase appears in an unrelated case file, though the files were sealed years apart. the final line is written in a different hand: “if you are reading this alone, you are not alone.” the ink has not been matched to any station employee.">
+        <div class="archive-meta">
+          <span>FS-ARC-066</span>
+          <span>STATION</span>
+        </div>
+        <h3>The Chair Behind the Glass · Supplement 066</h3>
+        <p>The intake camera shows an empty chair. The interview audio contains the chair scraping backwards and someone thanking the officer for letting them in. The item was logged at Leaning Cabin; the associated witness was listed as Aaron Pike.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The witness knew what the investigator would ask.”</p>
+            <p>Recovered location: Leaning Cabin. The assigned reader was Aaron Pike.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The record should be handled as a lead rather than a conclusion. A similar phrase appears in an unrelated case file, though the files were sealed years apart.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The final line is written in a different hand: “If you are reading this alone, you are not alone.” The ink has not been matched to any station employee.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>LEANING CABIN</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="witness" data-search="the missing minute · supplement 067 silas remembers the farmhouse clock stopping at 02:17. every witness statement places the event at a different minute, but each watches the same clock. the item was logged at records annex; the associated witness was listed as unit 14. unit 14 records annex “i heard my own voice reporting that i was safe. i was hiding when it spoke.” the source is uncertain. no ordinary device listed in the station inventory can produce the recorded signal without an active input. a later inventory lists this record as destroyed. the archive copy bears a scan date from the following week, before the destruction order was signed.">
+        <div class="archive-meta">
+          <span>FS-ARC-067</span>
+          <span>WITNESS</span>
+        </div>
+        <h3>The Missing Minute · Supplement 067</h3>
+        <p>Silas remembers the farmhouse clock stopping at 02:17. Every witness statement places the event at a different minute, but each watches the same clock. The item was logged at Records Annex; the associated witness was listed as Unit 14.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“I heard my own voice reporting that I was safe. I was hiding when it spoke.”</p>
+            <p>Recovered location: Records Annex. The assigned reader was Unit 14.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The source is uncertain. No ordinary device listed in the station inventory can produce the recorded signal without an active input.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>A later inventory lists this record as destroyed. The archive copy bears a scan date from the following week, before the destruction order was signed.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>WITNESS</span>
+          <span>RECORDS ANNEX</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="forest" data-search="the trees that move · supplement 068 tree trunks appear in different positions on the bodycam after a short blackout. no camera movement accounts for the change. the item was logged at radio relay hut; the associated witness was listed as the unnamed witness. the unnamed witness radio relay hut “keep the family photographs dry. the faces blur when the paper becomes wet.” the report is corroborated by the physical trace, but its chronology remains unstable. record the contradiction and do not resolve it by guessing. the file was re-opened after a technician heard a familiar voice from a device with its speaker removed. the technician recognized the voice as their own.">
+        <div class="archive-meta">
+          <span>FS-ARC-068</span>
+          <span>FOREST</span>
+        </div>
+        <h3>The Trees That Move · Supplement 068</h3>
+        <p>Tree trunks appear in different positions on the bodycam after a short blackout. No camera movement accounts for the change. The item was logged at Radio Relay Hut; the associated witness was listed as the unnamed witness.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Keep the family photographs dry. The faces blur when the paper becomes wet.”</p>
+            <p>Recovered location: Radio Relay Hut. The assigned reader was the unnamed witness.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The report is corroborated by the physical trace, but its chronology remains unstable. Record the contradiction and do not resolve it by guessing.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The file was re-opened after a technician heard a familiar voice from a device with its speaker removed. The technician recognized the voice as their own.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>FOREST</span>
+          <span>RADIO RELAY HUT</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="signal" data-search="anchor three · supplement 069 the final signal anchor carries a pulse resembling a human heartbeat. cutting power interrupts the pulse, but the connected speaker keeps ticking. the item was logged at north culvert; the associated witness was listed as aaron pike. aaron pike north culvert “the lamp was on, but there was no shadow under the chair.” the time discrepancy is consistent across independent copies. a simple clock malfunction cannot explain why the answer arrives before the question. the analyst requested that a second officer observe the next test. both officers later wrote that the other person had never been present.">
+        <div class="archive-meta">
+          <span>FS-ARC-069</span>
+          <span>SIGNAL</span>
+        </div>
+        <h3>Anchor Three · Supplement 069</h3>
+        <p>The final signal anchor carries a pulse resembling a human heartbeat. Cutting power interrupts the pulse, but the connected speaker keeps ticking. The item was logged at North Culvert; the associated witness was listed as Aaron Pike.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The lamp was on, but there was no shadow under the chair.”</p>
+            <p>Recovered location: North Culvert. The assigned reader was Aaron Pike.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The time discrepancy is consistent across independent copies. A simple clock malfunction cannot explain why the answer arrives before the question.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The analyst requested that a second officer observe the next test. Both officers later wrote that the other person had never been present.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>SIGNAL</span>
+          <span>NORTH CULVERT</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="medical" data-search="the nurse’s photograph · supplement 070 the night nurse’s badge photo shows a different person when viewed in a mirror. the image on the badge does not change; the reflection does. the item was logged at county police station; the associated witness was listed as unit 14. unit 14 county police station “the first set of footprints belongs to the person who has not arrived.” the evidence supports the presence of a second observer, not necessarily a second living person. avoid labeling the subject before completing the interview. the sealed note warns that this item should not be played through station speakers. during the original review, every clock in the building advanced by the same number of seconds.">
+        <div class="archive-meta">
+          <span>FS-ARC-070</span>
+          <span>MEDICAL</span>
+        </div>
+        <h3>The Nurse’s Photograph · Supplement 070</h3>
+        <p>The night nurse’s badge photo shows a different person when viewed in a mirror. The image on the badge does not change; the reflection does. The item was logged at County Police Station; the associated witness was listed as Unit 14.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The first set of footprints belongs to the person who has not arrived.”</p>
+            <p>Recovered location: County Police Station. The assigned reader was Unit 14.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The evidence supports the presence of a second observer, not necessarily a second living person. Avoid labeling the subject before completing the interview.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed note warns that this item should not be played through station speakers. During the original review, every clock in the building advanced by the same number of seconds.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEDICAL</span>
+          <span>COUNTY POLICE STATION</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="photography" data-search="the last frame · supplement 071 the last frame from a missing deputy’s camera shows the camera lying on the ground and still filming the person holding it. the item was logged at flood control warehouse; the associated witness was listed as the unnamed witness. the unnamed witness flood control warehouse “do not destroy the original record until both copies agree.” the statement may be truthful about the location but false about the time. compare it against the dispatch log and the environmental evidence. the sealed note warns that this item should not be played through station speakers. during the original review, every clock in the building advanced by the same number of seconds.">
+        <div class="archive-meta">
+          <span>FS-ARC-071</span>
+          <span>PHOTOGRAPHY</span>
+        </div>
+        <h3>The Last Frame · Supplement 071</h3>
+        <p>The last frame from a missing deputy’s camera shows the camera lying on the ground and still filming the person holding it. The item was logged at Flood Control Warehouse; the associated witness was listed as the unnamed witness.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Do not destroy the original record until both copies agree.”</p>
+            <p>Recovered location: Flood Control Warehouse. The assigned reader was the unnamed witness.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The statement may be truthful about the location but false about the time. Compare it against the dispatch log and the environmental evidence.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed note warns that this item should not be played through station speakers. During the original review, every clock in the building advanced by the same number of seconds.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>PHOTOGRAPHY</span>
+          <span>FLOOD CONTROL WAREHOUSE</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="memorial" data-search="the prayer card · supplement 072 a folded prayer card was left by the chapel candle. it asks for comfort for the grieving, peace for the departed, and patience for everyone who cannot find the right words. the item was logged at records annex; the associated witness was listed as eli. eli records annex “the chair was warm even though no one had sat there.” the witness is frightened, but fear does not prove deception. ask a neutral follow-up and compare the response with the recorded details. the last annotation is unexpectedly ordinary: “take a breath. drink some water. call someone you trust before continuing.”">
+        <div class="archive-meta">
+          <span>FS-ARC-072</span>
+          <span>MEMORIAL</span>
+        </div>
+        <h3>The Prayer Card · Supplement 072</h3>
+        <p>A folded prayer card was left by the chapel candle. It asks for comfort for the grieving, peace for the departed, and patience for everyone who cannot find the right words. The item was logged at Records Annex; the associated witness was listed as Eli.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The chair was warm even though no one had sat there.”</p>
+            <p>Recovered location: Records Annex. The assigned reader was Eli.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The witness is frightened, but fear does not prove deception. Ask a neutral follow-up and compare the response with the recorded details.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The last annotation is unexpectedly ordinary: “Take a breath. Drink some water. Call someone you trust before continuing.”</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEMORIAL</span>
+          <span>RECORDS ANNEX</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="call sign fourteen · supplement 073 dispatch accepted a call from a unit that had been logged out of service eleven years earlier. the operator’s voice was calm, but the waveform began six seconds before the microphone opened. the item was logged at county clinic; the associated witness was listed as unit 14. unit 14 county clinic “the clock was correct. it was the morning that was wrong.” the room inventory does not agree with the bodycam. the missing object may have been moved, removed, or omitted before the inventory was written. the reviewer requested that this file be kept available for anyone struggling to make sense of the night. uncertainty should not be mistaken for personal failure.">
+        <div class="archive-meta">
+          <span>FS-ARC-073</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>Call Sign Fourteen · Supplement 073</h3>
+        <p>Dispatch accepted a call from a unit that had been logged out of service eleven years earlier. The operator’s voice was calm, but the waveform began six seconds before the microphone opened. The item was logged at County Clinic; the associated witness was listed as Unit 14.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The clock was correct. It was the morning that was wrong.”</p>
+            <p>Recovered location: County Clinic. The assigned reader was Unit 14.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The room inventory does not agree with the bodycam. The missing object may have been moved, removed, or omitted before the inventory was written.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The reviewer requested that this file be kept available for anyone struggling to make sense of the night. Uncertainty should not be mistaken for personal failure.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>COUNTY CLINIC</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="the second timestamp · supplement 074 two copies of the same call arrived with different timestamps. the older file contains a response from the officer who had not yet received the call. the item was logged at interview room two; the associated witness was listed as the unnamed witness. the unnamed witness interview room two “the signal became louder when everyone stopped talking.” the source is uncertain. no ordinary device listed in the station inventory can produce the recorded signal without an active input. the sealed attachment is absent, but its shadow remains visible in every scan of the page. no physical object was recovered from the envelope.">
+        <div class="archive-meta">
+          <span>FS-ARC-074</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>The Second Timestamp · Supplement 074</h3>
+        <p>Two copies of the same call arrived with different timestamps. The older file contains a response from the officer who had not yet received the call. The item was logged at Interview Room Two; the associated witness was listed as the unnamed witness.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The signal became louder when everyone stopped talking.”</p>
+            <p>Recovered location: Interview Room Two. The assigned reader was the unnamed witness.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The source is uncertain. No ordinary device listed in the station inventory can produce the recorded signal without an active input.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed attachment is absent, but its shadow remains visible in every scan of the page. No physical object was recovered from the envelope.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>INTERVIEW ROOM TWO</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="camera 04 · supplement 075 camera 04 records seven arrivals on a night when only six visitors are expected. the seventh figure enters through a wall that has no door. the item was logged at county police station; the associated witness was listed as eli. eli county police station “we counted six visitors. the door counted seven.” the report is corroborated by the physical trace, but its chronology remains unstable. record the contradiction and do not resolve it by guessing. the evidence locker log records two people entering and one leaving. both signatures match the same employee file.">
+        <div class="archive-meta">
+          <span>FS-ARC-075</span>
+          <span>STATION</span>
+        </div>
+        <h3>Camera 04 · Supplement 075</h3>
+        <p>Camera 04 records seven arrivals on a night when only six visitors are expected. The seventh figure enters through a wall that has no door. The item was logged at County Police Station; the associated witness was listed as Eli.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“We counted six visitors. The door counted seven.”</p>
+            <p>Recovered location: County Police Station. The assigned reader was Eli.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The report is corroborated by the physical trace, but its chronology remains unstable. Record the contradiction and do not resolve it by guessing.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The evidence locker log records two people entering and one leaving. Both signatures match the same employee file.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>COUNTY POLICE STATION</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="the blank badge · supplement 076 a badge printer produced a blank card after the station network was disconnected. the card warmed whenever it was held near the interview room. the item was logged at checkpoint shack; the associated witness was listed as owen dyer. owen dyer checkpoint shack “someone asked for condolences through a disconnected speaker.” the time discrepancy is consistent across independent copies. a simple clock malfunction cannot explain why the answer arrives before the question. the record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.">
+        <div class="archive-meta">
+          <span>FS-ARC-076</span>
+          <span>STATION</span>
+        </div>
+        <h3>The Blank Badge · Supplement 076</h3>
+        <p>A badge printer produced a blank card after the station network was disconnected. The card warmed whenever it was held near the interview room. The item was logged at Checkpoint Shack; the associated witness was listed as Owen Dyer.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Someone asked for condolences through a disconnected speaker.”</p>
+            <p>Recovered location: Checkpoint Shack. The assigned reader was Owen Dyer.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The time discrepancy is consistent across independent copies. A simple clock malfunction cannot explain why the answer arrives before the question.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>CHECKPOINT SHACK</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="witness" data-search="silas venn’s first statement · supplement 077 silas says he never entered the farmhouse. mud on his cuffs matches the upstairs landing, where the windows have been nailed shut from within. the item was logged at old footbridge; the associated witness was listed as the unnamed witness. the unnamed witness old footbridge “we closed the gate at midnight. something opened it from the other side.” the evidence supports the presence of a second observer, not necessarily a second living person. avoid labeling the subject before completing the interview. the final line is written in a different hand: “if you are reading this alone, you are not alone.” the ink has not been matched to any station employee.">
+        <div class="archive-meta">
+          <span>FS-ARC-077</span>
+          <span>WITNESS</span>
+        </div>
+        <h3>Silas Venn’s First Statement · Supplement 077</h3>
+        <p>Silas says he never entered the farmhouse. Mud on his cuffs matches the upstairs landing, where the windows have been nailed shut from within. The item was logged at Old Footbridge; the associated witness was listed as the unnamed witness.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“We closed the gate at midnight. Something opened it from the other side.”</p>
+            <p>Recovered location: Old Footbridge. The assigned reader was the unnamed witness.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The evidence supports the presence of a second observer, not necessarily a second living person. Avoid labeling the subject before completing the interview.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The final line is written in a different hand: “If you are reading this alone, you are not alone.” The ink has not been matched to any station employee.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>WITNESS</span>
+          <span>OLD FOOTBRIDGE</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="forest" data-search="the dry footprints · supplement 078 a line of wet boot prints crosses the forest floor, then continues over a fallen tree without disturbing the moss. the item was logged at county clinic; the associated witness was listed as eli. eli county clinic “the footprints stopped at the wall and resumed in the room behind it.” the statement may be truthful about the location but false about the time. compare it against the dispatch log and the environmental evidence. the final line is written in a different hand: “if you are reading this alone, you are not alone.” the ink has not been matched to any station employee.">
+        <div class="archive-meta">
+          <span>FS-ARC-078</span>
+          <span>FOREST</span>
+        </div>
+        <h3>The Dry Footprints · Supplement 078</h3>
+        <p>A line of wet boot prints crosses the forest floor, then continues over a fallen tree without disturbing the moss. The item was logged at County Clinic; the associated witness was listed as Eli.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The footprints stopped at the wall and resumed in the room behind it.”</p>
+            <p>Recovered location: County Clinic. The assigned reader was Eli.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The statement may be truthful about the location but false about the time. Compare it against the dispatch log and the environmental evidence.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The final line is written in a different hand: “If you are reading this alone, you are not alone.” The ink has not been matched to any station employee.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>FOREST</span>
+          <span>COUNTY CLINIC</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="signal" data-search="the relay that answers · supplement 079 the emergency relay responds to questions before the operator finishes speaking. engineers find no return path in the wiring diagram. the item was logged at ranger trail; the associated witness was listed as owen dyer. owen dyer ranger trail “a long life is not measured by its final morning.” the signature appears authentic on the first inspection. under magnification, the ink strokes continue beyond the edge of the paper. a later inventory lists this record as destroyed. the archive copy bears a scan date from the following week, before the destruction order was signed.">
+        <div class="archive-meta">
+          <span>FS-ARC-079</span>
+          <span>SIGNAL</span>
+        </div>
+        <h3>The Relay That Answers · Supplement 079</h3>
+        <p>The emergency relay responds to questions before the operator finishes speaking. Engineers find no return path in the wiring diagram. The item was logged at Ranger Trail; the associated witness was listed as Owen Dyer.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“A long life is not measured by its final morning.”</p>
+            <p>Recovered location: Ranger Trail. The assigned reader was Owen Dyer.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The signature appears authentic on the first inspection. Under magnification, the ink strokes continue beyond the edge of the paper.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>A later inventory lists this record as destroyed. The archive copy bears a scan date from the following week, before the destruction order was signed.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>SIGNAL</span>
+          <span>RANGER TRAIL</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="medical" data-search="the empty bed · supplement 080 the clinic bed is strapped down and still bears the impression of a body. the patient ledger has an entry for tomorrow with no patient name. the item was logged at pine rest motel; the associated witness was listed as the station operator. the station operator pine rest motel “do not follow a voice just because it knows the case number.” the room inventory does not agree with the bodycam. the missing object may have been moved, removed, or omitted before the inventory was written. the file was re-opened after a technician heard a familiar voice from a device with its speaker removed. the technician recognized the voice as their own.">
+        <div class="archive-meta">
+          <span>FS-ARC-080</span>
+          <span>MEDICAL</span>
+        </div>
+        <h3>The Empty Bed · Supplement 080</h3>
+        <p>The clinic bed is strapped down and still bears the impression of a body. The patient ledger has an entry for tomorrow with no patient name. The item was logged at Pine Rest Motel; the associated witness was listed as the station operator.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Do not follow a voice just because it knows the case number.”</p>
+            <p>Recovered location: Pine Rest Motel. The assigned reader was the station operator.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The room inventory does not agree with the bodycam. The missing object may have been moved, removed, or omitted before the inventory was written.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The file was re-opened after a technician heard a familiar voice from a device with its speaker removed. The technician recognized the voice as their own.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEDICAL</span>
+          <span>PINE REST MOTEL</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="photography" data-search="the photograph with one extra person · supplement 081 a family photograph contains one more person each time it is developed. the extra face looks toward the camera in every version. the item was logged at checkpoint shack; the associated witness was listed as eli. eli checkpoint shack “the first set of footprints belongs to the person who has not arrived.” the source is uncertain. no ordinary device listed in the station inventory can produce the recorded signal without an active input. the analyst requested that a second officer observe the next test. both officers later wrote that the other person had never been present.">
+        <div class="archive-meta">
+          <span>FS-ARC-081</span>
+          <span>PHOTOGRAPHY</span>
+        </div>
+        <h3>The Photograph With One Extra Person · Supplement 081</h3>
+        <p>A family photograph contains one more person each time it is developed. The extra face looks toward the camera in every version. The item was logged at Checkpoint Shack; the associated witness was listed as Eli.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The first set of footprints belongs to the person who has not arrived.”</p>
+            <p>Recovered location: Checkpoint Shack. The assigned reader was Eli.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The source is uncertain. No ordinary device listed in the station inventory can produce the recorded signal without an active input.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The analyst requested that a second officer observe the next test. Both officers later wrote that the other person had never been present.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>PHOTOGRAPHY</span>
+          <span>CHECKPOINT SHACK</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="memorial" data-search="a long life remembered · supplement 082 a quiet remembrance records the things a loved one cherished: planes crossing the sky, cars on long roads, and photographs that preserve ordinary days. the item was logged at mile marker 9; the associated witness was listed as owen dyer. owen dyer mile marker 9 “the light did not fail. the room simply stopped being visible.” the report is corroborated by the physical trace, but its chronology remains unstable. record the contradiction and do not resolve it by guessing. the sealed note warns that this item should not be played through station speakers. during the original review, every clock in the building advanced by the same number of seconds.">
+        <div class="archive-meta">
+          <span>FS-ARC-082</span>
+          <span>MEMORIAL</span>
+        </div>
+        <h3>A Long Life Remembered · Supplement 082</h3>
+        <p>A quiet remembrance records the things a loved one cherished: planes crossing the sky, cars on long roads, and photographs that preserve ordinary days. The item was logged at Mile Marker 9; the associated witness was listed as Owen Dyer.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The light did not fail. The room simply stopped being visible.”</p>
+            <p>Recovered location: Mile Marker 9. The assigned reader was Owen Dyer.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The report is corroborated by the physical trace, but its chronology remains unstable. Record the contradiction and do not resolve it by guessing.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed note warns that this item should not be played through station speakers. During the original review, every clock in the building advanced by the same number of seconds.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEMORIAL</span>
+          <span>MILE MARKER 9</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="the reply before the question · supplement 083 a recorded reply begins before the dispatch operator presses the transmit key. the reply includes a sentence that is not spoken until six minutes later. the item was logged at last stop diner; the associated witness was listed as the station operator. the station operator last stop diner “the witness knew what the investigator would ask.” the time discrepancy is consistent across independent copies. a simple clock malfunction cannot explain why the answer arrives before the question. the last annotation is unexpectedly ordinary: “take a breath. drink some water. call someone you trust before continuing.”">
+        <div class="archive-meta">
+          <span>FS-ARC-083</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>The Reply Before the Question · Supplement 083</h3>
+        <p>A recorded reply begins before the dispatch operator presses the transmit key. The reply includes a sentence that is not spoken until six minutes later. The item was logged at Last Stop Diner; the associated witness was listed as the station operator.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The witness knew what the investigator would ask.”</p>
+            <p>Recovered location: Last Stop Diner. The assigned reader was the station operator.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The time discrepancy is consistent across independent copies. A simple clock malfunction cannot explain why the answer arrives before the question.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The last annotation is unexpectedly ordinary: “Take a breath. Drink some water. Call someone you trust before continuing.”</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>LAST STOP DINER</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="the chair behind the glass · supplement 084 the intake camera shows an empty chair. the interview audio contains the chair scraping backwards and someone thanking the officer for letting them in. the item was logged at ranger trail; the associated witness was listed as mara. mara ranger trail “i heard my own voice reporting that i was safe. i was hiding when it spoke.” the evidence supports the presence of a second observer, not necessarily a second living person. avoid labeling the subject before completing the interview. the reviewer requested that this file be kept available for anyone struggling to make sense of the night. uncertainty should not be mistaken for personal failure.">
+        <div class="archive-meta">
+          <span>FS-ARC-084</span>
+          <span>STATION</span>
+        </div>
+        <h3>The Chair Behind the Glass · Supplement 084</h3>
+        <p>The intake camera shows an empty chair. The interview audio contains the chair scraping backwards and someone thanking the officer for letting them in. The item was logged at Ranger Trail; the associated witness was listed as Mara.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“I heard my own voice reporting that I was safe. I was hiding when it spoke.”</p>
+            <p>Recovered location: Ranger Trail. The assigned reader was Mara.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The evidence supports the presence of a second observer, not necessarily a second living person. Avoid labeling the subject before completing the interview.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The reviewer requested that this file be kept available for anyone struggling to make sense of the night. Uncertainty should not be mistaken for personal failure.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>RANGER TRAIL</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="witness" data-search="the missing minute · supplement 085 silas remembers the farmhouse clock stopping at 02:17. every witness statement places the event at a different minute, but each watches the same clock. the item was logged at st. mercy chapel; the associated witness was listed as owen dyer. owen dyer st. mercy chapel “keep the family photographs dry. the faces blur when the paper becomes wet.” the anomaly appears to react to attention. repeating the observation changes the result, so the first record must remain in the case file. the reviewer requested that this file be kept available for anyone struggling to make sense of the night. uncertainty should not be mistaken for personal failure.">
+        <div class="archive-meta">
+          <span>FS-ARC-085</span>
+          <span>WITNESS</span>
+        </div>
+        <h3>The Missing Minute · Supplement 085</h3>
+        <p>Silas remembers the farmhouse clock stopping at 02:17. Every witness statement places the event at a different minute, but each watches the same clock. The item was logged at St. Mercy Chapel; the associated witness was listed as Owen Dyer.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Keep the family photographs dry. The faces blur when the paper becomes wet.”</p>
+            <p>Recovered location: St. Mercy Chapel. The assigned reader was Owen Dyer.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The anomaly appears to react to attention. Repeating the observation changes the result, so the first record must remain in the case file.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The reviewer requested that this file be kept available for anyone struggling to make sense of the night. Uncertainty should not be mistaken for personal failure.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>WITNESS</span>
+          <span>ST. MERCY CHAPEL</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="forest" data-search="the trees that move · supplement 086 tree trunks appear in different positions on the bodycam after a short blackout. no camera movement accounts for the change. the item was logged at swamp gas stop; the associated witness was listed as the station operator. the station operator swamp gas stop “we counted six visitors. the door counted seven.” the signature appears authentic on the first inspection. under magnification, the ink strokes continue beyond the edge of the paper. the sealed attachment is absent, but its shadow remains visible in every scan of the page. no physical object was recovered from the envelope.">
+        <div class="archive-meta">
+          <span>FS-ARC-086</span>
+          <span>FOREST</span>
+        </div>
+        <h3>The Trees That Move · Supplement 086</h3>
+        <p>Tree trunks appear in different positions on the bodycam after a short blackout. No camera movement accounts for the change. The item was logged at Swamp Gas Stop; the associated witness was listed as the station operator.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“We counted six visitors. The door counted seven.”</p>
+            <p>Recovered location: Swamp Gas Stop. The assigned reader was the station operator.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The signature appears authentic on the first inspection. Under magnification, the ink strokes continue beyond the edge of the paper.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed attachment is absent, but its shadow remains visible in every scan of the page. No physical object was recovered from the envelope.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>FOREST</span>
+          <span>SWAMP GAS STOP</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="signal" data-search="anchor three · supplement 087 the final signal anchor carries a pulse resembling a human heartbeat. cutting power interrupts the pulse, but the connected speaker keeps ticking. the item was logged at mile marker 9; the associated witness was listed as mara. mara mile marker 9 “the photograph was developed twice. the second negative had a reflection.” the room inventory does not agree with the bodycam. the missing object may have been moved, removed, or omitted before the inventory was written. the evidence locker log records two people entering and one leaving. both signatures match the same employee file.">
+        <div class="archive-meta">
+          <span>FS-ARC-087</span>
+          <span>SIGNAL</span>
+        </div>
+        <h3>Anchor Three · Supplement 087</h3>
+        <p>The final signal anchor carries a pulse resembling a human heartbeat. Cutting power interrupts the pulse, but the connected speaker keeps ticking. The item was logged at Mile Marker 9; the associated witness was listed as Mara.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The photograph was developed twice. The second negative had a reflection.”</p>
+            <p>Recovered location: Mile Marker 9. The assigned reader was Mara.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The room inventory does not agree with the bodycam. The missing object may have been moved, removed, or omitted before the inventory was written.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The evidence locker log records two people entering and one leaving. Both signatures match the same employee file.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>SIGNAL</span>
+          <span>MILE MARKER 9</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="medical" data-search="the nurse’s photograph · supplement 088 the night nurse’s badge photo shows a different person when viewed in a mirror. the image on the badge does not change; the reflection does. the item was logged at leaning cabin; the associated witness was listed as irena holt. irena holt leaning cabin “do not destroy the original record until both copies agree.” the source is uncertain. no ordinary device listed in the station inventory can produce the recorded signal without an active input. the record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.">
+        <div class="archive-meta">
+          <span>FS-ARC-088</span>
+          <span>MEDICAL</span>
+        </div>
+        <h3>The Nurse’s Photograph · Supplement 088</h3>
+        <p>The night nurse’s badge photo shows a different person when viewed in a mirror. The image on the badge does not change; the reflection does. The item was logged at Leaning Cabin; the associated witness was listed as Irena Holt.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Do not destroy the original record until both copies agree.”</p>
+            <p>Recovered location: Leaning Cabin. The assigned reader was Irena Holt.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The source is uncertain. No ordinary device listed in the station inventory can produce the recorded signal without an active input.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEDICAL</span>
+          <span>LEANING CABIN</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="photography" data-search="the last frame · supplement 089 the last frame from a missing deputy’s camera shows the camera lying on the ground and still filming the person holding it. the item was logged at flood gate; the associated witness was listed as the station operator. the station operator flood gate “the chair was warm even though no one had sat there.” the report is corroborated by the physical trace, but its chronology remains unstable. record the contradiction and do not resolve it by guessing. the final line is written in a different hand: “if you are reading this alone, you are not alone.” the ink has not been matched to any station employee.">
+        <div class="archive-meta">
+          <span>FS-ARC-089</span>
+          <span>PHOTOGRAPHY</span>
+        </div>
+        <h3>The Last Frame · Supplement 089</h3>
+        <p>The last frame from a missing deputy’s camera shows the camera lying on the ground and still filming the person holding it. The item was logged at Flood Gate; the associated witness was listed as the station operator.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The chair was warm even though no one had sat there.”</p>
+            <p>Recovered location: Flood Gate. The assigned reader was the station operator.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The report is corroborated by the physical trace, but its chronology remains unstable. Record the contradiction and do not resolve it by guessing.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The final line is written in a different hand: “If you are reading this alone, you are not alone.” The ink has not been matched to any station employee.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>PHOTOGRAPHY</span>
+          <span>FLOOD GATE</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="memorial" data-search="the prayer card · supplement 090 a folded prayer card was left by the chapel candle. it asks for comfort for the grieving, peace for the departed, and patience for everyone who cannot find the right words. the item was logged at st. mercy chapel; the associated witness was listed as mara. mara st. mercy chapel “the clock was correct. it was the morning that was wrong.” the time discrepancy is consistent across independent copies. a simple clock malfunction cannot explain why the answer arrives before the question. a later inventory lists this record as destroyed. the archive copy bears a scan date from the following week, before the destruction order was signed.">
+        <div class="archive-meta">
+          <span>FS-ARC-090</span>
+          <span>MEMORIAL</span>
+        </div>
+        <h3>The Prayer Card · Supplement 090</h3>
+        <p>A folded prayer card was left by the chapel candle. It asks for comfort for the grieving, peace for the departed, and patience for everyone who cannot find the right words. The item was logged at St. Mercy Chapel; the associated witness was listed as Mara.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The clock was correct. It was the morning that was wrong.”</p>
+            <p>Recovered location: St. Mercy Chapel. The assigned reader was Mara.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The time discrepancy is consistent across independent copies. A simple clock malfunction cannot explain why the answer arrives before the question.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>A later inventory lists this record as destroyed. The archive copy bears a scan date from the following week, before the destruction order was signed.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEMORIAL</span>
+          <span>ST. MERCY CHAPEL</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="call sign fourteen · supplement 091 dispatch accepted a call from a unit that had been logged out of service eleven years earlier. the operator’s voice was calm, but the waveform began six seconds before the microphone opened. the item was logged at north culvert; the associated witness was listed as irena holt. irena holt north culvert “do not follow a voice just because it knows the case number.” the record should be handled as a lead rather than a conclusion. a similar phrase appears in an unrelated case file, though the files were sealed years apart. the file was re-opened after a technician heard a familiar voice from a device with its speaker removed. the technician recognized the voice as their own.">
+        <div class="archive-meta">
+          <span>FS-ARC-091</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>Call Sign Fourteen · Supplement 091</h3>
+        <p>Dispatch accepted a call from a unit that had been logged out of service eleven years earlier. The operator’s voice was calm, but the waveform began six seconds before the microphone opened. The item was logged at North Culvert; the associated witness was listed as Irena Holt.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Do not follow a voice just because it knows the case number.”</p>
+            <p>Recovered location: North Culvert. The assigned reader was Irena Holt.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The record should be handled as a lead rather than a conclusion. A similar phrase appears in an unrelated case file, though the files were sealed years apart.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The file was re-opened after a technician heard a familiar voice from a device with its speaker removed. The technician recognized the voice as their own.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>NORTH CULVERT</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="the second timestamp · supplement 092 two copies of the same call arrived with different timestamps. the older file contains a response from the officer who had not yet received the call. the item was logged at cypress farmhouse; the associated witness was listed as the missing deputy. the missing deputy cypress farmhouse “if the radio repeats your breathing, stop transmitting.” the anomaly appears to react to attention. repeating the observation changes the result, so the first record must remain in the case file. the file was re-opened after a technician heard a familiar voice from a device with its speaker removed. the technician recognized the voice as their own.">
+        <div class="archive-meta">
+          <span>FS-ARC-092</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>The Second Timestamp · Supplement 092</h3>
+        <p>Two copies of the same call arrived with different timestamps. The older file contains a response from the officer who had not yet received the call. The item was logged at Cypress Farmhouse; the associated witness was listed as the missing deputy.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“If the radio repeats your breathing, stop transmitting.”</p>
+            <p>Recovered location: Cypress Farmhouse. The assigned reader was the missing deputy.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The anomaly appears to react to attention. Repeating the observation changes the result, so the first record must remain in the case file.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The file was re-opened after a technician heard a familiar voice from a device with its speaker removed. The technician recognized the voice as their own.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>CYPRESS FARMHOUSE</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="camera 04 · supplement 093 camera 04 records seven arrivals on a night when only six visitors are expected. the seventh figure enters through a wall that has no door. the item was logged at leaning cabin; the associated witness was listed as mara. mara leaning cabin “someone asked for condolences through a disconnected speaker.” the signature appears authentic on the first inspection. under magnification, the ink strokes continue beyond the edge of the paper. the analyst requested that a second officer observe the next test. both officers later wrote that the other person had never been present.">
+        <div class="archive-meta">
+          <span>FS-ARC-093</span>
+          <span>STATION</span>
+        </div>
+        <h3>Camera 04 · Supplement 093</h3>
+        <p>Camera 04 records seven arrivals on a night when only six visitors are expected. The seventh figure enters through a wall that has no door. The item was logged at Leaning Cabin; the associated witness was listed as Mara.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Someone asked for condolences through a disconnected speaker.”</p>
+            <p>Recovered location: Leaning Cabin. The assigned reader was Mara.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The signature appears authentic on the first inspection. Under magnification, the ink strokes continue beyond the edge of the paper.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The analyst requested that a second officer observe the next test. Both officers later wrote that the other person had never been present.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>LEANING CABIN</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="the blank badge · supplement 094 a badge printer produced a blank card after the station network was disconnected. the card warmed whenever it was held near the interview room. the item was logged at records annex; the associated witness was listed as irena holt. irena holt records annex “we closed the gate at midnight. something opened it from the other side.” the room inventory does not agree with the bodycam. the missing object may have been moved, removed, or omitted before the inventory was written. the sealed note warns that this item should not be played through station speakers. during the original review, every clock in the building advanced by the same number of seconds.">
+        <div class="archive-meta">
+          <span>FS-ARC-094</span>
+          <span>STATION</span>
+        </div>
+        <h3>The Blank Badge · Supplement 094</h3>
+        <p>A badge printer produced a blank card after the station network was disconnected. The card warmed whenever it was held near the interview room. The item was logged at Records Annex; the associated witness was listed as Irena Holt.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“We closed the gate at midnight. Something opened it from the other side.”</p>
+            <p>Recovered location: Records Annex. The assigned reader was Irena Holt.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The room inventory does not agree with the bodycam. The missing object may have been moved, removed, or omitted before the inventory was written.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed note warns that this item should not be played through station speakers. During the original review, every clock in the building advanced by the same number of seconds.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>RECORDS ANNEX</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="witness" data-search="silas venn’s first statement · supplement 095 silas says he never entered the farmhouse. mud on his cuffs matches the upstairs landing, where the windows have been nailed shut from within. the item was logged at radio relay hut; the associated witness was listed as the missing deputy. the missing deputy radio relay hut “the footprints stopped at the wall and resumed in the room behind it.” the source is uncertain. no ordinary device listed in the station inventory can produce the recorded signal without an active input. the last annotation is unexpectedly ordinary: “take a breath. drink some water. call someone you trust before continuing.”">
+        <div class="archive-meta">
+          <span>FS-ARC-095</span>
+          <span>WITNESS</span>
+        </div>
+        <h3>Silas Venn’s First Statement · Supplement 095</h3>
+        <p>Silas says he never entered the farmhouse. Mud on his cuffs matches the upstairs landing, where the windows have been nailed shut from within. The item was logged at Radio Relay Hut; the associated witness was listed as the missing deputy.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The footprints stopped at the wall and resumed in the room behind it.”</p>
+            <p>Recovered location: Radio Relay Hut. The assigned reader was the missing deputy.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The source is uncertain. No ordinary device listed in the station inventory can produce the recorded signal without an active input.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The last annotation is unexpectedly ordinary: “Take a breath. Drink some water. Call someone you trust before continuing.”</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>WITNESS</span>
+          <span>RADIO RELAY HUT</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="forest" data-search="the dry footprints · supplement 096 a line of wet boot prints crosses the forest floor, then continues over a fallen tree without disturbing the moss. the item was logged at north culvert; the associated witness was listed as silas venn. silas venn north culvert “keep the family photographs dry. the faces blur when the paper becomes wet.” the report is corroborated by the physical trace, but its chronology remains unstable. record the contradiction and do not resolve it by guessing. the reviewer requested that this file be kept available for anyone struggling to make sense of the night. uncertainty should not be mistaken for personal failure.">
+        <div class="archive-meta">
+          <span>FS-ARC-096</span>
+          <span>FOREST</span>
+        </div>
+        <h3>The Dry Footprints · Supplement 096</h3>
+        <p>A line of wet boot prints crosses the forest floor, then continues over a fallen tree without disturbing the moss. The item was logged at North Culvert; the associated witness was listed as Silas Venn.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Keep the family photographs dry. The faces blur when the paper becomes wet.”</p>
+            <p>Recovered location: North Culvert. The assigned reader was Silas Venn.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The report is corroborated by the physical trace, but its chronology remains unstable. Record the contradiction and do not resolve it by guessing.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The reviewer requested that this file be kept available for anyone struggling to make sense of the night. Uncertainty should not be mistaken for personal failure.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>FOREST</span>
+          <span>NORTH CULVERT</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="signal" data-search="the relay that answers · supplement 097 the emergency relay responds to questions before the operator finishes speaking. engineers find no return path in the wiring diagram. the item was logged at county police station; the associated witness was listed as irena holt. irena holt county police station “the lamp was on, but there was no shadow under the chair.” the witness is frightened, but fear does not prove deception. ask a neutral follow-up and compare the response with the recorded details. the sealed attachment is absent, but its shadow remains visible in every scan of the page. no physical object was recovered from the envelope.">
+        <div class="archive-meta">
+          <span>FS-ARC-097</span>
+          <span>SIGNAL</span>
+        </div>
+        <h3>The Relay That Answers · Supplement 097</h3>
+        <p>The emergency relay responds to questions before the operator finishes speaking. Engineers find no return path in the wiring diagram. The item was logged at County Police Station; the associated witness was listed as Irena Holt.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The lamp was on, but there was no shadow under the chair.”</p>
+            <p>Recovered location: County Police Station. The assigned reader was Irena Holt.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The witness is frightened, but fear does not prove deception. Ask a neutral follow-up and compare the response with the recorded details.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed attachment is absent, but its shadow remains visible in every scan of the page. No physical object was recovered from the envelope.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>SIGNAL</span>
+          <span>COUNTY POLICE STATION</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="medical" data-search="the empty bed · supplement 098 the clinic bed is strapped down and still bears the impression of a body. the patient ledger has an entry for tomorrow with no patient name. the item was logged at flood control warehouse; the associated witness was listed as the missing deputy. the missing deputy flood control warehouse “the first set of footprints belongs to the person who has not arrived.” the record should be handled as a lead rather than a conclusion. a similar phrase appears in an unrelated case file, though the files were sealed years apart. the evidence locker log records two people entering and one leaving. both signatures match the same employee file.">
+        <div class="archive-meta">
+          <span>FS-ARC-098</span>
+          <span>MEDICAL</span>
+        </div>
+        <h3>The Empty Bed · Supplement 098</h3>
+        <p>The clinic bed is strapped down and still bears the impression of a body. The patient ledger has an entry for tomorrow with no patient name. The item was logged at Flood Control Warehouse; the associated witness was listed as the missing deputy.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The first set of footprints belongs to the person who has not arrived.”</p>
+            <p>Recovered location: Flood Control Warehouse. The assigned reader was the missing deputy.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The record should be handled as a lead rather than a conclusion. A similar phrase appears in an unrelated case file, though the files were sealed years apart.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The evidence locker log records two people entering and one leaving. Both signatures match the same employee file.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEDICAL</span>
+          <span>FLOOD CONTROL WAREHOUSE</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="photography" data-search="the photograph with one extra person · supplement 099 a family photograph contains one more person each time it is developed. the extra face looks toward the camera in every version. the item was logged at records annex; the associated witness was listed as silas venn. silas venn records annex “the light did not fail. the room simply stopped being visible.” the anomaly appears to react to attention. repeating the observation changes the result, so the first record must remain in the case file. the evidence locker log records two people entering and one leaving. both signatures match the same employee file.">
+        <div class="archive-meta">
+          <span>FS-ARC-099</span>
+          <span>PHOTOGRAPHY</span>
+        </div>
+        <h3>The Photograph With One Extra Person · Supplement 099</h3>
+        <p>A family photograph contains one more person each time it is developed. The extra face looks toward the camera in every version. The item was logged at Records Annex; the associated witness was listed as Silas Venn.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The light did not fail. The room simply stopped being visible.”</p>
+            <p>Recovered location: Records Annex. The assigned reader was Silas Venn.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The anomaly appears to react to attention. Repeating the observation changes the result, so the first record must remain in the case file.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The evidence locker log records two people entering and one leaving. Both signatures match the same employee file.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>PHOTOGRAPHY</span>
+          <span>RECORDS ANNEX</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="memorial" data-search="a long life remembered · supplement 100 a quiet remembrance records the things a loved one cherished: planes crossing the sky, cars on long roads, and photographs that preserve ordinary days. the item was logged at county clinic; the associated witness was listed as tomas reed. tomas reed county clinic “the witness knew what the investigator would ask.” the signature appears authentic on the first inspection. under magnification, the ink strokes continue beyond the edge of the paper. the record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.">
+        <div class="archive-meta">
+          <span>FS-ARC-100</span>
+          <span>MEMORIAL</span>
+        </div>
+        <h3>A Long Life Remembered · Supplement 100</h3>
+        <p>A quiet remembrance records the things a loved one cherished: planes crossing the sky, cars on long roads, and photographs that preserve ordinary days. The item was logged at County Clinic; the associated witness was listed as Tomas Reed.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The witness knew what the investigator would ask.”</p>
+            <p>Recovered location: County Clinic. The assigned reader was Tomas Reed.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The signature appears authentic on the first inspection. Under magnification, the ink strokes continue beyond the edge of the paper.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEMORIAL</span>
+          <span>COUNTY CLINIC</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="the reply before the question · supplement 101 a recorded reply begins before the dispatch operator presses the transmit key. the reply includes a sentence that is not spoken until six minutes later. the item was logged at interview room two; the associated witness was listed as the missing deputy. the missing deputy interview room two “the clock was correct. it was the morning that was wrong.” the room inventory does not agree with the bodycam. the missing object may have been moved, removed, or omitted before the inventory was written. the final line is written in a different hand: “if you are reading this alone, you are not alone.” the ink has not been matched to any station employee.">
+        <div class="archive-meta">
+          <span>FS-ARC-101</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>The Reply Before the Question · Supplement 101</h3>
+        <p>A recorded reply begins before the dispatch operator presses the transmit key. The reply includes a sentence that is not spoken until six minutes later. The item was logged at Interview Room Two; the associated witness was listed as the missing deputy.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The clock was correct. It was the morning that was wrong.”</p>
+            <p>Recovered location: Interview Room Two. The assigned reader was the missing deputy.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The room inventory does not agree with the bodycam. The missing object may have been moved, removed, or omitted before the inventory was written.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The final line is written in a different hand: “If you are reading this alone, you are not alone.” The ink has not been matched to any station employee.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>INTERVIEW ROOM TWO</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="the chair behind the glass · supplement 102 the intake camera shows an empty chair. the interview audio contains the chair scraping backwards and someone thanking the officer for letting them in. the item was logged at county police station; the associated witness was listed as silas venn. silas venn county police station “the signal became louder when everyone stopped talking.” the source is uncertain. no ordinary device listed in the station inventory can produce the recorded signal without an active input. a later inventory lists this record as destroyed. the archive copy bears a scan date from the following week, before the destruction order was signed.">
+        <div class="archive-meta">
+          <span>FS-ARC-102</span>
+          <span>STATION</span>
+        </div>
+        <h3>The Chair Behind the Glass · Supplement 102</h3>
+        <p>The intake camera shows an empty chair. The interview audio contains the chair scraping backwards and someone thanking the officer for letting them in. The item was logged at County Police Station; the associated witness was listed as Silas Venn.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The signal became louder when everyone stopped talking.”</p>
+            <p>Recovered location: County Police Station. The assigned reader was Silas Venn.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The source is uncertain. No ordinary device listed in the station inventory can produce the recorded signal without an active input.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>A later inventory lists this record as destroyed. The archive copy bears a scan date from the following week, before the destruction order was signed.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>COUNTY POLICE STATION</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="witness" data-search="the missing minute · supplement 103 silas remembers the farmhouse clock stopping at 02:17. every witness statement places the event at a different minute, but each watches the same clock. the item was logged at checkpoint shack; the associated witness was listed as tomas reed. tomas reed checkpoint shack “we counted six visitors. the door counted seven.” the statement may be truthful about the location but false about the time. compare it against the dispatch log and the environmental evidence. the file was re-opened after a technician heard a familiar voice from a device with its speaker removed. the technician recognized the voice as their own.">
+        <div class="archive-meta">
+          <span>FS-ARC-103</span>
+          <span>WITNESS</span>
+        </div>
+        <h3>The Missing Minute · Supplement 103</h3>
+        <p>Silas remembers the farmhouse clock stopping at 02:17. Every witness statement places the event at a different minute, but each watches the same clock. The item was logged at Checkpoint Shack; the associated witness was listed as Tomas Reed.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“We counted six visitors. The door counted seven.”</p>
+            <p>Recovered location: Checkpoint Shack. The assigned reader was Tomas Reed.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The statement may be truthful about the location but false about the time. Compare it against the dispatch log and the environmental evidence.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The file was re-opened after a technician heard a familiar voice from a device with its speaker removed. The technician recognized the voice as their own.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>WITNESS</span>
+          <span>CHECKPOINT SHACK</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="forest" data-search="the trees that move · supplement 104 tree trunks appear in different positions on the bodycam after a short blackout. no camera movement accounts for the change. the item was logged at old footbridge; the associated witness was listed as the night clerk. the night clerk old footbridge “the photograph was developed twice. the second negative had a reflection.” the witness is frightened, but fear does not prove deception. ask a neutral follow-up and compare the response with the recorded details. the analyst requested that a second officer observe the next test. both officers later wrote that the other person had never been present.">
+        <div class="archive-meta">
+          <span>FS-ARC-104</span>
+          <span>FOREST</span>
+        </div>
+        <h3>The Trees That Move · Supplement 104</h3>
+        <p>Tree trunks appear in different positions on the bodycam after a short blackout. No camera movement accounts for the change. The item was logged at Old Footbridge; the associated witness was listed as the night clerk.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The photograph was developed twice. The second negative had a reflection.”</p>
+            <p>Recovered location: Old Footbridge. The assigned reader was the night clerk.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The witness is frightened, but fear does not prove deception. Ask a neutral follow-up and compare the response with the recorded details.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The analyst requested that a second officer observe the next test. Both officers later wrote that the other person had never been present.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>FOREST</span>
+          <span>OLD FOOTBRIDGE</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="signal" data-search="anchor three · supplement 105 the final signal anchor carries a pulse resembling a human heartbeat. cutting power interrupts the pulse, but the connected speaker keeps ticking. the item was logged at county clinic; the associated witness was listed as silas venn. silas venn county clinic “do not destroy the original record until both copies agree.” the record should be handled as a lead rather than a conclusion. a similar phrase appears in an unrelated case file, though the files were sealed years apart. the sealed note warns that this item should not be played through station speakers. during the original review, every clock in the building advanced by the same number of seconds.">
+        <div class="archive-meta">
+          <span>FS-ARC-105</span>
+          <span>SIGNAL</span>
+        </div>
+        <h3>Anchor Three · Supplement 105</h3>
+        <p>The final signal anchor carries a pulse resembling a human heartbeat. Cutting power interrupts the pulse, but the connected speaker keeps ticking. The item was logged at County Clinic; the associated witness was listed as Silas Venn.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Do not destroy the original record until both copies agree.”</p>
+            <p>Recovered location: County Clinic. The assigned reader was Silas Venn.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The record should be handled as a lead rather than a conclusion. A similar phrase appears in an unrelated case file, though the files were sealed years apart.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed note warns that this item should not be played through station speakers. During the original review, every clock in the building advanced by the same number of seconds.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>SIGNAL</span>
+          <span>COUNTY CLINIC</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="medical" data-search="the nurse’s photograph · supplement 106 the night nurse’s badge photo shows a different person when viewed in a mirror. the image on the badge does not change; the reflection does. the item was logged at ranger trail; the associated witness was listed as tomas reed. tomas reed ranger trail “the footprints stopped at the wall and resumed in the room behind it.” the anomaly appears to react to attention. repeating the observation changes the result, so the first record must remain in the case file. the sealed note warns that this item should not be played through station speakers. during the original review, every clock in the building advanced by the same number of seconds.">
+        <div class="archive-meta">
+          <span>FS-ARC-106</span>
+          <span>MEDICAL</span>
+        </div>
+        <h3>The Nurse’s Photograph · Supplement 106</h3>
+        <p>The night nurse’s badge photo shows a different person when viewed in a mirror. The image on the badge does not change; the reflection does. The item was logged at Ranger Trail; the associated witness was listed as Tomas Reed.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The footprints stopped at the wall and resumed in the room behind it.”</p>
+            <p>Recovered location: Ranger Trail. The assigned reader was Tomas Reed.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The anomaly appears to react to attention. Repeating the observation changes the result, so the first record must remain in the case file.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed note warns that this item should not be played through station speakers. During the original review, every clock in the building advanced by the same number of seconds.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEDICAL</span>
+          <span>RANGER TRAIL</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="photography" data-search="the last frame · supplement 107 the last frame from a missing deputy’s camera shows the camera lying on the ground and still filming the person holding it. the item was logged at pine rest motel; the associated witness was listed as the night clerk. the night clerk pine rest motel “a long life is not measured by its final morning.” the signature appears authentic on the first inspection. under magnification, the ink strokes continue beyond the edge of the paper. the last annotation is unexpectedly ordinary: “take a breath. drink some water. call someone you trust before continuing.”">
+        <div class="archive-meta">
+          <span>FS-ARC-107</span>
+          <span>PHOTOGRAPHY</span>
+        </div>
+        <h3>The Last Frame · Supplement 107</h3>
+        <p>The last frame from a missing deputy’s camera shows the camera lying on the ground and still filming the person holding it. The item was logged at Pine Rest Motel; the associated witness was listed as the night clerk.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“A long life is not measured by its final morning.”</p>
+            <p>Recovered location: Pine Rest Motel. The assigned reader was the night clerk.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The signature appears authentic on the first inspection. Under magnification, the ink strokes continue beyond the edge of the paper.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The last annotation is unexpectedly ordinary: “Take a breath. Drink some water. Call someone you trust before continuing.”</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>PHOTOGRAPHY</span>
+          <span>PINE REST MOTEL</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="memorial" data-search="the prayer card · supplement 108 a folded prayer card was left by the chapel candle. it asks for comfort for the grieving, peace for the departed, and patience for everyone who cannot find the right words. the item was logged at checkpoint shack; the associated witness was listed as officer yumi. officer yumi checkpoint shack “do not follow a voice just because it knows the case number.” the room inventory does not agree with the bodycam. the missing object may have been moved, removed, or omitted before the inventory was written. the reviewer requested that this file be kept available for anyone struggling to make sense of the night. uncertainty should not be mistaken for personal failure.">
+        <div class="archive-meta">
+          <span>FS-ARC-108</span>
+          <span>MEMORIAL</span>
+        </div>
+        <h3>The Prayer Card · Supplement 108</h3>
+        <p>A folded prayer card was left by the chapel candle. It asks for comfort for the grieving, peace for the departed, and patience for everyone who cannot find the right words. The item was logged at Checkpoint Shack; the associated witness was listed as Officer Yumi.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Do not follow a voice just because it knows the case number.”</p>
+            <p>Recovered location: Checkpoint Shack. The assigned reader was Officer Yumi.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The room inventory does not agree with the bodycam. The missing object may have been moved, removed, or omitted before the inventory was written.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The reviewer requested that this file be kept available for anyone struggling to make sense of the night. Uncertainty should not be mistaken for personal failure.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEMORIAL</span>
+          <span>CHECKPOINT SHACK</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="call sign fourteen · supplement 109 dispatch accepted a call from a unit that had been logged out of service eleven years earlier. the operator’s voice was calm, but the waveform began six seconds before the microphone opened. the item was logged at mile marker 9; the associated witness was listed as tomas reed. tomas reed mile marker 9 “if the radio repeats your breathing, stop transmitting.” the evidence supports the presence of a second observer, not necessarily a second living person. avoid labeling the subject before completing the interview. the sealed attachment is absent, but its shadow remains visible in every scan of the page. no physical object was recovered from the envelope.">
+        <div class="archive-meta">
+          <span>FS-ARC-109</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>Call Sign Fourteen · Supplement 109</h3>
+        <p>Dispatch accepted a call from a unit that had been logged out of service eleven years earlier. The operator’s voice was calm, but the waveform began six seconds before the microphone opened. The item was logged at Mile Marker 9; the associated witness was listed as Tomas Reed.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“If the radio repeats your breathing, stop transmitting.”</p>
+            <p>Recovered location: Mile Marker 9. The assigned reader was Tomas Reed.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The evidence supports the presence of a second observer, not necessarily a second living person. Avoid labeling the subject before completing the interview.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed attachment is absent, but its shadow remains visible in every scan of the page. No physical object was recovered from the envelope.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>MILE MARKER 9</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="the second timestamp · supplement 110 two copies of the same call arrived with different timestamps. the older file contains a response from the officer who had not yet received the call. the item was logged at last stop diner; the associated witness was listed as the night clerk. the night clerk last stop diner “someone asked for condolences through a disconnected speaker.” the statement may be truthful about the location but false about the time. compare it against the dispatch log and the environmental evidence. the evidence locker log records two people entering and one leaving. both signatures match the same employee file.">
+        <div class="archive-meta">
+          <span>FS-ARC-110</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>The Second Timestamp · Supplement 110</h3>
+        <p>Two copies of the same call arrived with different timestamps. The older file contains a response from the officer who had not yet received the call. The item was logged at Last Stop Diner; the associated witness was listed as the night clerk.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Someone asked for condolences through a disconnected speaker.”</p>
+            <p>Recovered location: Last Stop Diner. The assigned reader was the night clerk.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The statement may be truthful about the location but false about the time. Compare it against the dispatch log and the environmental evidence.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The evidence locker log records two people entering and one leaving. Both signatures match the same employee file.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>LAST STOP DINER</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="camera 04 · supplement 111 camera 04 records seven arrivals on a night when only six visitors are expected. the seventh figure enters through a wall that has no door. the item was logged at ranger trail; the associated witness was listed as officer yumi. officer yumi ranger trail “the witness knew what the investigator would ask.” the witness is frightened, but fear does not prove deception. ask a neutral follow-up and compare the response with the recorded details. the record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.">
+        <div class="archive-meta">
+          <span>FS-ARC-111</span>
+          <span>STATION</span>
+        </div>
+        <h3>Camera 04 · Supplement 111</h3>
+        <p>Camera 04 records seven arrivals on a night when only six visitors are expected. The seventh figure enters through a wall that has no door. The item was logged at Ranger Trail; the associated witness was listed as Officer Yumi.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The witness knew what the investigator would ask.”</p>
+            <p>Recovered location: Ranger Trail. The assigned reader was Officer Yumi.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The witness is frightened, but fear does not prove deception. Ask a neutral follow-up and compare the response with the recorded details.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>RANGER TRAIL</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="the blank badge · supplement 112 a badge printer produced a blank card after the station network was disconnected. the card warmed whenever it was held near the interview room. the item was logged at st. mercy chapel; the associated witness was listed as lena ward. lena ward st. mercy chapel “i heard my own voice reporting that i was safe. i was hiding when it spoke.” the record should be handled as a lead rather than a conclusion. a similar phrase appears in an unrelated case file, though the files were sealed years apart. the final line is written in a different hand: “if you are reading this alone, you are not alone.” the ink has not been matched to any station employee.">
+        <div class="archive-meta">
+          <span>FS-ARC-112</span>
+          <span>STATION</span>
+        </div>
+        <h3>The Blank Badge · Supplement 112</h3>
+        <p>A badge printer produced a blank card after the station network was disconnected. The card warmed whenever it was held near the interview room. The item was logged at St. Mercy Chapel; the associated witness was listed as Lena Ward.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“I heard my own voice reporting that I was safe. I was hiding when it spoke.”</p>
+            <p>Recovered location: St. Mercy Chapel. The assigned reader was Lena Ward.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The record should be handled as a lead rather than a conclusion. A similar phrase appears in an unrelated case file, though the files were sealed years apart.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The final line is written in a different hand: “If you are reading this alone, you are not alone.” The ink has not been matched to any station employee.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>ST. MERCY CHAPEL</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="witness" data-search="silas venn’s first statement · supplement 113 silas says he never entered the farmhouse. mud on his cuffs matches the upstairs landing, where the windows have been nailed shut from within. the item was logged at swamp gas stop; the associated witness was listed as the night clerk. the night clerk swamp gas stop “keep the family photographs dry. the faces blur when the paper becomes wet.” the anomaly appears to react to attention. repeating the observation changes the result, so the first record must remain in the case file. the final line is written in a different hand: “if you are reading this alone, you are not alone.” the ink has not been matched to any station employee.">
+        <div class="archive-meta">
+          <span>FS-ARC-113</span>
+          <span>WITNESS</span>
+        </div>
+        <h3>Silas Venn’s First Statement · Supplement 113</h3>
+        <p>Silas says he never entered the farmhouse. Mud on his cuffs matches the upstairs landing, where the windows have been nailed shut from within. The item was logged at Swamp Gas Stop; the associated witness was listed as the night clerk.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Keep the family photographs dry. The faces blur when the paper becomes wet.”</p>
+            <p>Recovered location: Swamp Gas Stop. The assigned reader was the night clerk.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The anomaly appears to react to attention. Repeating the observation changes the result, so the first record must remain in the case file.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The final line is written in a different hand: “If you are reading this alone, you are not alone.” The ink has not been matched to any station employee.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>WITNESS</span>
+          <span>SWAMP GAS STOP</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="forest" data-search="the dry footprints · supplement 114 a line of wet boot prints crosses the forest floor, then continues over a fallen tree without disturbing the moss. the item was logged at mile marker 9; the associated witness was listed as officer yumi. officer yumi mile marker 9 “the lamp was on, but there was no shadow under the chair.” the signature appears authentic on the first inspection. under magnification, the ink strokes continue beyond the edge of the paper. a later inventory lists this record as destroyed. the archive copy bears a scan date from the following week, before the destruction order was signed.">
+        <div class="archive-meta">
+          <span>FS-ARC-114</span>
+          <span>FOREST</span>
+        </div>
+        <h3>The Dry Footprints · Supplement 114</h3>
+        <p>A line of wet boot prints crosses the forest floor, then continues over a fallen tree without disturbing the moss. The item was logged at Mile Marker 9; the associated witness was listed as Officer Yumi.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The lamp was on, but there was no shadow under the chair.”</p>
+            <p>Recovered location: Mile Marker 9. The assigned reader was Officer Yumi.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The signature appears authentic on the first inspection. Under magnification, the ink strokes continue beyond the edge of the paper.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>A later inventory lists this record as destroyed. The archive copy bears a scan date from the following week, before the destruction order was signed.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>FOREST</span>
+          <span>MILE MARKER 9</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="signal" data-search="the relay that answers · supplement 115 the emergency relay responds to questions before the operator finishes speaking. engineers find no return path in the wiring diagram. the item was logged at leaning cabin; the associated witness was listed as lena ward. lena ward leaning cabin “the first set of footprints belongs to the person who has not arrived.” the time discrepancy is consistent across independent copies. a simple clock malfunction cannot explain why the answer arrives before the question. the file was re-opened after a technician heard a familiar voice from a device with its speaker removed. the technician recognized the voice as their own.">
+        <div class="archive-meta">
+          <span>FS-ARC-115</span>
+          <span>SIGNAL</span>
+        </div>
+        <h3>The Relay That Answers · Supplement 115</h3>
+        <p>The emergency relay responds to questions before the operator finishes speaking. Engineers find no return path in the wiring diagram. The item was logged at Leaning Cabin; the associated witness was listed as Lena Ward.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The first set of footprints belongs to the person who has not arrived.”</p>
+            <p>Recovered location: Leaning Cabin. The assigned reader was Lena Ward.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The time discrepancy is consistent across independent copies. A simple clock malfunction cannot explain why the answer arrives before the question.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The file was re-opened after a technician heard a familiar voice from a device with its speaker removed. The technician recognized the voice as their own.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>SIGNAL</span>
+          <span>LEANING CABIN</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="medical" data-search="the empty bed · supplement 116 the clinic bed is strapped down and still bears the impression of a body. the patient ledger has an entry for tomorrow with no patient name. the item was logged at flood gate; the associated witness was listed as the seventh arrival. the seventh arrival flood gate “do not destroy the original record until both copies agree.” the evidence supports the presence of a second observer, not necessarily a second living person. avoid labeling the subject before completing the interview. the analyst requested that a second officer observe the next test. both officers later wrote that the other person had never been present.">
+        <div class="archive-meta">
+          <span>FS-ARC-116</span>
+          <span>MEDICAL</span>
+        </div>
+        <h3>The Empty Bed · Supplement 116</h3>
+        <p>The clinic bed is strapped down and still bears the impression of a body. The patient ledger has an entry for tomorrow with no patient name. The item was logged at Flood Gate; the associated witness was listed as The Seventh Arrival.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Do not destroy the original record until both copies agree.”</p>
+            <p>Recovered location: Flood Gate. The assigned reader was The Seventh Arrival.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The evidence supports the presence of a second observer, not necessarily a second living person. Avoid labeling the subject before completing the interview.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The analyst requested that a second officer observe the next test. Both officers later wrote that the other person had never been present.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEDICAL</span>
+          <span>FLOOD GATE</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="photography" data-search="the photograph with one extra person · supplement 117 a family photograph contains one more person each time it is developed. the extra face looks toward the camera in every version. the item was logged at st. mercy chapel; the associated witness was listed as officer yumi. officer yumi st. mercy chapel “the chair was warm even though no one had sat there.” the statement may be truthful about the location but false about the time. compare it against the dispatch log and the environmental evidence. the sealed note warns that this item should not be played through station speakers. during the original review, every clock in the building advanced by the same number of seconds.">
+        <div class="archive-meta">
+          <span>FS-ARC-117</span>
+          <span>PHOTOGRAPHY</span>
+        </div>
+        <h3>The Photograph With One Extra Person · Supplement 117</h3>
+        <p>A family photograph contains one more person each time it is developed. The extra face looks toward the camera in every version. The item was logged at St. Mercy Chapel; the associated witness was listed as Officer Yumi.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The chair was warm even though no one had sat there.”</p>
+            <p>Recovered location: St. Mercy Chapel. The assigned reader was Officer Yumi.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The statement may be truthful about the location but false about the time. Compare it against the dispatch log and the environmental evidence.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed note warns that this item should not be played through station speakers. During the original review, every clock in the building advanced by the same number of seconds.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>PHOTOGRAPHY</span>
+          <span>ST. MERCY CHAPEL</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="memorial" data-search="a long life remembered · supplement 118 a quiet remembrance records the things a loved one cherished: planes crossing the sky, cars on long roads, and photographs that preserve ordinary days. the item was logged at north culvert; the associated witness was listed as lena ward. lena ward north culvert “the clock was correct. it was the morning that was wrong.” the witness is frightened, but fear does not prove deception. ask a neutral follow-up and compare the response with the recorded details. the last annotation is unexpectedly ordinary: “take a breath. drink some water. call someone you trust before continuing.”">
+        <div class="archive-meta">
+          <span>FS-ARC-118</span>
+          <span>MEMORIAL</span>
+        </div>
+        <h3>A Long Life Remembered · Supplement 118</h3>
+        <p>A quiet remembrance records the things a loved one cherished: planes crossing the sky, cars on long roads, and photographs that preserve ordinary days. The item was logged at North Culvert; the associated witness was listed as Lena Ward.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The clock was correct. It was the morning that was wrong.”</p>
+            <p>Recovered location: North Culvert. The assigned reader was Lena Ward.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The witness is frightened, but fear does not prove deception. Ask a neutral follow-up and compare the response with the recorded details.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The last annotation is unexpectedly ordinary: “Take a breath. Drink some water. Call someone you trust before continuing.”</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEMORIAL</span>
+          <span>NORTH CULVERT</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="the reply before the question · supplement 119 a recorded reply begins before the dispatch operator presses the transmit key. the reply includes a sentence that is not spoken until six minutes later. the item was logged at cypress farmhouse; the associated witness was listed as the seventh arrival. the seventh arrival cypress farmhouse “the signal became louder when everyone stopped talking.” the record should be handled as a lead rather than a conclusion. a similar phrase appears in an unrelated case file, though the files were sealed years apart. the reviewer requested that this file be kept available for anyone struggling to make sense of the night. uncertainty should not be mistaken for personal failure.">
+        <div class="archive-meta">
+          <span>FS-ARC-119</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>The Reply Before the Question · Supplement 119</h3>
+        <p>A recorded reply begins before the dispatch operator presses the transmit key. The reply includes a sentence that is not spoken until six minutes later. The item was logged at Cypress Farmhouse; the associated witness was listed as The Seventh Arrival.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The signal became louder when everyone stopped talking.”</p>
+            <p>Recovered location: Cypress Farmhouse. The assigned reader was The Seventh Arrival.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The record should be handled as a lead rather than a conclusion. A similar phrase appears in an unrelated case file, though the files were sealed years apart.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The reviewer requested that this file be kept available for anyone struggling to make sense of the night. Uncertainty should not be mistaken for personal failure.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>CYPRESS FARMHOUSE</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="the chair behind the glass · supplement 120 the intake camera shows an empty chair. the interview audio contains the chair scraping backwards and someone thanking the officer for letting them in. the item was logged at leaning cabin; the associated witness was listed as officer hugo. officer hugo leaning cabin “we counted six visitors. the door counted seven.” the anomaly appears to react to attention. repeating the observation changes the result, so the first record must remain in the case file. the reviewer requested that this file be kept available for anyone struggling to make sense of the night. uncertainty should not be mistaken for personal failure.">
+        <div class="archive-meta">
+          <span>FS-ARC-120</span>
+          <span>STATION</span>
+        </div>
+        <h3>The Chair Behind the Glass · Supplement 120</h3>
+        <p>The intake camera shows an empty chair. The interview audio contains the chair scraping backwards and someone thanking the officer for letting them in. The item was logged at Leaning Cabin; the associated witness was listed as Officer Hugo.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“We counted six visitors. The door counted seven.”</p>
+            <p>Recovered location: Leaning Cabin. The assigned reader was Officer Hugo.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The anomaly appears to react to attention. Repeating the observation changes the result, so the first record must remain in the case file.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The reviewer requested that this file be kept available for anyone struggling to make sense of the night. Uncertainty should not be mistaken for personal failure.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>LEANING CABIN</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="witness" data-search="the missing minute · supplement 121 silas remembers the farmhouse clock stopping at 02:17. every witness statement places the event at a different minute, but each watches the same clock. the item was logged at records annex; the associated witness was listed as lena ward. lena ward records annex “someone asked for condolences through a disconnected speaker.” the report is corroborated by the physical trace, but its chronology remains unstable. record the contradiction and do not resolve it by guessing. the sealed attachment is absent, but its shadow remains visible in every scan of the page. no physical object was recovered from the envelope.">
+        <div class="archive-meta">
+          <span>FS-ARC-121</span>
+          <span>WITNESS</span>
+        </div>
+        <h3>The Missing Minute · Supplement 121</h3>
+        <p>Silas remembers the farmhouse clock stopping at 02:17. Every witness statement places the event at a different minute, but each watches the same clock. The item was logged at Records Annex; the associated witness was listed as Lena Ward.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Someone asked for condolences through a disconnected speaker.”</p>
+            <p>Recovered location: Records Annex. The assigned reader was Lena Ward.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The report is corroborated by the physical trace, but its chronology remains unstable. Record the contradiction and do not resolve it by guessing.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed attachment is absent, but its shadow remains visible in every scan of the page. No physical object was recovered from the envelope.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>WITNESS</span>
+          <span>RECORDS ANNEX</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="forest" data-search="the trees that move · supplement 122 tree trunks appear in different positions on the bodycam after a short blackout. no camera movement accounts for the change. the item was logged at radio relay hut; the associated witness was listed as the seventh arrival. the seventh arrival radio relay hut “we closed the gate at midnight. something opened it from the other side.” the time discrepancy is consistent across independent copies. a simple clock malfunction cannot explain why the answer arrives before the question. the evidence locker log records two people entering and one leaving. both signatures match the same employee file.">
+        <div class="archive-meta">
+          <span>FS-ARC-122</span>
+          <span>FOREST</span>
+        </div>
+        <h3>The Trees That Move · Supplement 122</h3>
+        <p>Tree trunks appear in different positions on the bodycam after a short blackout. No camera movement accounts for the change. The item was logged at Radio Relay Hut; the associated witness was listed as The Seventh Arrival.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“We closed the gate at midnight. Something opened it from the other side.”</p>
+            <p>Recovered location: Radio Relay Hut. The assigned reader was The Seventh Arrival.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The time discrepancy is consistent across independent copies. A simple clock malfunction cannot explain why the answer arrives before the question.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The evidence locker log records two people entering and one leaving. Both signatures match the same employee file.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>FOREST</span>
+          <span>RADIO RELAY HUT</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="signal" data-search="anchor three · supplement 123 the final signal anchor carries a pulse resembling a human heartbeat. cutting power interrupts the pulse, but the connected speaker keeps ticking. the item was logged at north culvert; the associated witness was listed as officer hugo. officer hugo north culvert “the footprints stopped at the wall and resumed in the room behind it.” the evidence supports the presence of a second observer, not necessarily a second living person. avoid labeling the subject before completing the interview. the record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.">
+        <div class="archive-meta">
+          <span>FS-ARC-123</span>
+          <span>SIGNAL</span>
+        </div>
+        <h3>Anchor Three · Supplement 123</h3>
+        <p>The final signal anchor carries a pulse resembling a human heartbeat. Cutting power interrupts the pulse, but the connected speaker keeps ticking. The item was logged at North Culvert; the associated witness was listed as Officer Hugo.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The footprints stopped at the wall and resumed in the room behind it.”</p>
+            <p>Recovered location: North Culvert. The assigned reader was Officer Hugo.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The evidence supports the presence of a second observer, not necessarily a second living person. Avoid labeling the subject before completing the interview.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>SIGNAL</span>
+          <span>NORTH CULVERT</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="medical" data-search="the nurse’s photograph · supplement 124 the night nurse’s badge photo shows a different person when viewed in a mirror. the image on the badge does not change; the reflection does. the item was logged at county police station; the associated witness was listed as aaron pike. aaron pike county police station “a long life is not measured by its final morning.” the statement may be truthful about the location but false about the time. compare it against the dispatch log and the environmental evidence. the final line is written in a different hand: “if you are reading this alone, you are not alone.” the ink has not been matched to any station employee.">
+        <div class="archive-meta">
+          <span>FS-ARC-124</span>
+          <span>MEDICAL</span>
+        </div>
+        <h3>The Nurse’s Photograph · Supplement 124</h3>
+        <p>The night nurse’s badge photo shows a different person when viewed in a mirror. The image on the badge does not change; the reflection does. The item was logged at County Police Station; the associated witness was listed as Aaron Pike.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“A long life is not measured by its final morning.”</p>
+            <p>Recovered location: County Police Station. The assigned reader was Aaron Pike.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The statement may be truthful about the location but false about the time. Compare it against the dispatch log and the environmental evidence.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The final line is written in a different hand: “If you are reading this alone, you are not alone.” The ink has not been matched to any station employee.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEDICAL</span>
+          <span>COUNTY POLICE STATION</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="photography" data-search="the last frame · supplement 125 the last frame from a missing deputy’s camera shows the camera lying on the ground and still filming the person holding it. the item was logged at flood control warehouse; the associated witness was listed as the seventh arrival. the seventh arrival flood control warehouse “do not follow a voice just because it knows the case number.” the witness is frightened, but fear does not prove deception. ask a neutral follow-up and compare the response with the recorded details. a later inventory lists this record as destroyed. the archive copy bears a scan date from the following week, before the destruction order was signed.">
+        <div class="archive-meta">
+          <span>FS-ARC-125</span>
+          <span>PHOTOGRAPHY</span>
+        </div>
+        <h3>The Last Frame · Supplement 125</h3>
+        <p>The last frame from a missing deputy’s camera shows the camera lying on the ground and still filming the person holding it. The item was logged at Flood Control Warehouse; the associated witness was listed as The Seventh Arrival.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Do not follow a voice just because it knows the case number.”</p>
+            <p>Recovered location: Flood Control Warehouse. The assigned reader was The Seventh Arrival.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The witness is frightened, but fear does not prove deception. Ask a neutral follow-up and compare the response with the recorded details.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>A later inventory lists this record as destroyed. The archive copy bears a scan date from the following week, before the destruction order was signed.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>PHOTOGRAPHY</span>
+          <span>FLOOD CONTROL WAREHOUSE</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="memorial" data-search="the prayer card · supplement 126 a folded prayer card was left by the chapel candle. it asks for comfort for the grieving, peace for the departed, and patience for everyone who cannot find the right words. the item was logged at records annex; the associated witness was listed as officer hugo. officer hugo records annex “the first set of footprints belongs to the person who has not arrived.” the record should be handled as a lead rather than a conclusion. a similar phrase appears in an unrelated case file, though the files were sealed years apart. the file was re-opened after a technician heard a familiar voice from a device with its speaker removed. the technician recognized the voice as their own.">
+        <div class="archive-meta">
+          <span>FS-ARC-126</span>
+          <span>MEMORIAL</span>
+        </div>
+        <h3>The Prayer Card · Supplement 126</h3>
+        <p>A folded prayer card was left by the chapel candle. It asks for comfort for the grieving, peace for the departed, and patience for everyone who cannot find the right words. The item was logged at Records Annex; the associated witness was listed as Officer Hugo.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The first set of footprints belongs to the person who has not arrived.”</p>
+            <p>Recovered location: Records Annex. The assigned reader was Officer Hugo.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The record should be handled as a lead rather than a conclusion. A similar phrase appears in an unrelated case file, though the files were sealed years apart.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The file was re-opened after a technician heard a familiar voice from a device with its speaker removed. The technician recognized the voice as their own.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEMORIAL</span>
+          <span>RECORDS ANNEX</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="call sign fourteen · supplement 127 dispatch accepted a call from a unit that had been logged out of service eleven years earlier. the operator’s voice was calm, but the waveform began six seconds before the microphone opened. the item was logged at county clinic; the associated witness was listed as aaron pike. aaron pike county clinic “the light did not fail. the room simply stopped being visible.” the source is uncertain. no ordinary device listed in the station inventory can produce the recorded signal without an active input. the file was re-opened after a technician heard a familiar voice from a device with its speaker removed. the technician recognized the voice as their own.">
+        <div class="archive-meta">
+          <span>FS-ARC-127</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>Call Sign Fourteen · Supplement 127</h3>
+        <p>Dispatch accepted a call from a unit that had been logged out of service eleven years earlier. The operator’s voice was calm, but the waveform began six seconds before the microphone opened. The item was logged at County Clinic; the associated witness was listed as Aaron Pike.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The light did not fail. The room simply stopped being visible.”</p>
+            <p>Recovered location: County Clinic. The assigned reader was Aaron Pike.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The source is uncertain. No ordinary device listed in the station inventory can produce the recorded signal without an active input.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The file was re-opened after a technician heard a familiar voice from a device with its speaker removed. The technician recognized the voice as their own.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>COUNTY CLINIC</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="the second timestamp · supplement 128 two copies of the same call arrived with different timestamps. the older file contains a response from the officer who had not yet received the call. the item was logged at interview room two; the associated witness was listed as unit 14. unit 14 interview room two “the witness knew what the investigator would ask.” the report is corroborated by the physical trace, but its chronology remains unstable. record the contradiction and do not resolve it by guessing. the analyst requested that a second officer observe the next test. both officers later wrote that the other person had never been present.">
+        <div class="archive-meta">
+          <span>FS-ARC-128</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>The Second Timestamp · Supplement 128</h3>
+        <p>Two copies of the same call arrived with different timestamps. The older file contains a response from the officer who had not yet received the call. The item was logged at Interview Room Two; the associated witness was listed as Unit 14.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The witness knew what the investigator would ask.”</p>
+            <p>Recovered location: Interview Room Two. The assigned reader was Unit 14.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The report is corroborated by the physical trace, but its chronology remains unstable. Record the contradiction and do not resolve it by guessing.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The analyst requested that a second officer observe the next test. Both officers later wrote that the other person had never been present.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>INTERVIEW ROOM TWO</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="camera 04 · supplement 129 camera 04 records seven arrivals on a night when only six visitors are expected. the seventh figure enters through a wall that has no door. the item was logged at county police station; the associated witness was listed as officer hugo. officer hugo county police station “i heard my own voice reporting that i was safe. i was hiding when it spoke.” the time discrepancy is consistent across independent copies. a simple clock malfunction cannot explain why the answer arrives before the question. the sealed note warns that this item should not be played through station speakers. during the original review, every clock in the building advanced by the same number of seconds.">
+        <div class="archive-meta">
+          <span>FS-ARC-129</span>
+          <span>STATION</span>
+        </div>
+        <h3>Camera 04 · Supplement 129</h3>
+        <p>Camera 04 records seven arrivals on a night when only six visitors are expected. The seventh figure enters through a wall that has no door. The item was logged at County Police Station; the associated witness was listed as Officer Hugo.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“I heard my own voice reporting that I was safe. I was hiding when it spoke.”</p>
+            <p>Recovered location: County Police Station. The assigned reader was Officer Hugo.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The time discrepancy is consistent across independent copies. A simple clock malfunction cannot explain why the answer arrives before the question.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed note warns that this item should not be played through station speakers. During the original review, every clock in the building advanced by the same number of seconds.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>COUNTY POLICE STATION</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="the blank badge · supplement 130 a badge printer produced a blank card after the station network was disconnected. the card warmed whenever it was held near the interview room. the item was logged at checkpoint shack; the associated witness was listed as aaron pike. aaron pike checkpoint shack “keep the family photographs dry. the faces blur when the paper becomes wet.” the evidence supports the presence of a second observer, not necessarily a second living person. avoid labeling the subject before completing the interview. the last annotation is unexpectedly ordinary: “take a breath. drink some water. call someone you trust before continuing.”">
+        <div class="archive-meta">
+          <span>FS-ARC-130</span>
+          <span>STATION</span>
+        </div>
+        <h3>The Blank Badge · Supplement 130</h3>
+        <p>A badge printer produced a blank card after the station network was disconnected. The card warmed whenever it was held near the interview room. The item was logged at Checkpoint Shack; the associated witness was listed as Aaron Pike.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Keep the family photographs dry. The faces blur when the paper becomes wet.”</p>
+            <p>Recovered location: Checkpoint Shack. The assigned reader was Aaron Pike.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The evidence supports the presence of a second observer, not necessarily a second living person. Avoid labeling the subject before completing the interview.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The last annotation is unexpectedly ordinary: “Take a breath. Drink some water. Call someone you trust before continuing.”</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>CHECKPOINT SHACK</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="witness" data-search="silas venn’s first statement · supplement 131 silas says he never entered the farmhouse. mud on his cuffs matches the upstairs landing, where the windows have been nailed shut from within. the item was logged at old footbridge; the associated witness was listed as unit 14. unit 14 old footbridge “we counted six visitors. the door counted seven.” the statement may be truthful about the location but false about the time. compare it against the dispatch log and the environmental evidence. the reviewer requested that this file be kept available for anyone struggling to make sense of the night. uncertainty should not be mistaken for personal failure.">
+        <div class="archive-meta">
+          <span>FS-ARC-131</span>
+          <span>WITNESS</span>
+        </div>
+        <h3>Silas Venn’s First Statement · Supplement 131</h3>
+        <p>Silas says he never entered the farmhouse. Mud on his cuffs matches the upstairs landing, where the windows have been nailed shut from within. The item was logged at Old Footbridge; the associated witness was listed as Unit 14.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“We counted six visitors. The door counted seven.”</p>
+            <p>Recovered location: Old Footbridge. The assigned reader was Unit 14.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The statement may be truthful about the location but false about the time. Compare it against the dispatch log and the environmental evidence.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The reviewer requested that this file be kept available for anyone struggling to make sense of the night. Uncertainty should not be mistaken for personal failure.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>WITNESS</span>
+          <span>OLD FOOTBRIDGE</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="forest" data-search="the dry footprints · supplement 132 a line of wet boot prints crosses the forest floor, then continues over a fallen tree without disturbing the moss. the item was logged at county clinic; the associated witness was listed as the unnamed witness. the unnamed witness county clinic “the photograph was developed twice. the second negative had a reflection.” the witness is frightened, but fear does not prove deception. ask a neutral follow-up and compare the response with the recorded details. the sealed attachment is absent, but its shadow remains visible in every scan of the page. no physical object was recovered from the envelope.">
+        <div class="archive-meta">
+          <span>FS-ARC-132</span>
+          <span>FOREST</span>
+        </div>
+        <h3>The Dry Footprints · Supplement 132</h3>
+        <p>A line of wet boot prints crosses the forest floor, then continues over a fallen tree without disturbing the moss. The item was logged at County Clinic; the associated witness was listed as the unnamed witness.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The photograph was developed twice. The second negative had a reflection.”</p>
+            <p>Recovered location: County Clinic. The assigned reader was the unnamed witness.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The witness is frightened, but fear does not prove deception. Ask a neutral follow-up and compare the response with the recorded details.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed attachment is absent, but its shadow remains visible in every scan of the page. No physical object was recovered from the envelope.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>FOREST</span>
+          <span>COUNTY CLINIC</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="signal" data-search="the relay that answers · supplement 133 the emergency relay responds to questions before the operator finishes speaking. engineers find no return path in the wiring diagram. the item was logged at ranger trail; the associated witness was listed as aaron pike. aaron pike ranger trail “do not destroy the original record until both copies agree.” the room inventory does not agree with the bodycam. the missing object may have been moved, removed, or omitted before the inventory was written. the evidence locker log records two people entering and one leaving. both signatures match the same employee file.">
+        <div class="archive-meta">
+          <span>FS-ARC-133</span>
+          <span>SIGNAL</span>
+        </div>
+        <h3>The Relay That Answers · Supplement 133</h3>
+        <p>The emergency relay responds to questions before the operator finishes speaking. Engineers find no return path in the wiring diagram. The item was logged at Ranger Trail; the associated witness was listed as Aaron Pike.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Do not destroy the original record until both copies agree.”</p>
+            <p>Recovered location: Ranger Trail. The assigned reader was Aaron Pike.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The room inventory does not agree with the bodycam. The missing object may have been moved, removed, or omitted before the inventory was written.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The evidence locker log records two people entering and one leaving. Both signatures match the same employee file.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>SIGNAL</span>
+          <span>RANGER TRAIL</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="medical" data-search="the empty bed · supplement 134 the clinic bed is strapped down and still bears the impression of a body. the patient ledger has an entry for tomorrow with no patient name. the item was logged at pine rest motel; the associated witness was listed as unit 14. unit 14 pine rest motel “the chair was warm even though no one had sat there.” the source is uncertain. no ordinary device listed in the station inventory can produce the recorded signal without an active input. the evidence locker log records two people entering and one leaving. both signatures match the same employee file.">
+        <div class="archive-meta">
+          <span>FS-ARC-134</span>
+          <span>MEDICAL</span>
+        </div>
+        <h3>The Empty Bed · Supplement 134</h3>
+        <p>The clinic bed is strapped down and still bears the impression of a body. The patient ledger has an entry for tomorrow with no patient name. The item was logged at Pine Rest Motel; the associated witness was listed as Unit 14.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The chair was warm even though no one had sat there.”</p>
+            <p>Recovered location: Pine Rest Motel. The assigned reader was Unit 14.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The source is uncertain. No ordinary device listed in the station inventory can produce the recorded signal without an active input.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The evidence locker log records two people entering and one leaving. Both signatures match the same employee file.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEDICAL</span>
+          <span>PINE REST MOTEL</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="photography" data-search="the photograph with one extra person · supplement 135 a family photograph contains one more person each time it is developed. the extra face looks toward the camera in every version. the item was logged at checkpoint shack; the associated witness was listed as the unnamed witness. the unnamed witness checkpoint shack “the clock was correct. it was the morning that was wrong.” the report is corroborated by the physical trace, but its chronology remains unstable. record the contradiction and do not resolve it by guessing. the record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.">
+        <div class="archive-meta">
+          <span>FS-ARC-135</span>
+          <span>PHOTOGRAPHY</span>
+        </div>
+        <h3>The Photograph With One Extra Person · Supplement 135</h3>
+        <p>A family photograph contains one more person each time it is developed. The extra face looks toward the camera in every version. The item was logged at Checkpoint Shack; the associated witness was listed as the unnamed witness.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The clock was correct. It was the morning that was wrong.”</p>
+            <p>Recovered location: Checkpoint Shack. The assigned reader was the unnamed witness.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The report is corroborated by the physical trace, but its chronology remains unstable. Record the contradiction and do not resolve it by guessing.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>PHOTOGRAPHY</span>
+          <span>CHECKPOINT SHACK</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="memorial" data-search="a long life remembered · supplement 136 a quiet remembrance records the things a loved one cherished: planes crossing the sky, cars on long roads, and photographs that preserve ordinary days. the item was logged at mile marker 9; the associated witness was listed as eli. eli mile marker 9 “do not follow a voice just because it knows the case number.” the time discrepancy is consistent across independent copies. a simple clock malfunction cannot explain why the answer arrives before the question. the final line is written in a different hand: “if you are reading this alone, you are not alone.” the ink has not been matched to any station employee.">
+        <div class="archive-meta">
+          <span>FS-ARC-136</span>
+          <span>MEMORIAL</span>
+        </div>
+        <h3>A Long Life Remembered · Supplement 136</h3>
+        <p>A quiet remembrance records the things a loved one cherished: planes crossing the sky, cars on long roads, and photographs that preserve ordinary days. The item was logged at Mile Marker 9; the associated witness was listed as Eli.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Do not follow a voice just because it knows the case number.”</p>
+            <p>Recovered location: Mile Marker 9. The assigned reader was Eli.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The time discrepancy is consistent across independent copies. A simple clock malfunction cannot explain why the answer arrives before the question.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The final line is written in a different hand: “If you are reading this alone, you are not alone.” The ink has not been matched to any station employee.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEMORIAL</span>
+          <span>MILE MARKER 9</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="the reply before the question · supplement 137 a recorded reply begins before the dispatch operator presses the transmit key. the reply includes a sentence that is not spoken until six minutes later. the item was logged at last stop diner; the associated witness was listed as unit 14. unit 14 last stop diner “if the radio repeats your breathing, stop transmitting.” the evidence supports the presence of a second observer, not necessarily a second living person. avoid labeling the subject before completing the interview. a later inventory lists this record as destroyed. the archive copy bears a scan date from the following week, before the destruction order was signed.">
+        <div class="archive-meta">
+          <span>FS-ARC-137</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>The Reply Before the Question · Supplement 137</h3>
+        <p>A recorded reply begins before the dispatch operator presses the transmit key. The reply includes a sentence that is not spoken until six minutes later. The item was logged at Last Stop Diner; the associated witness was listed as Unit 14.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“If the radio repeats your breathing, stop transmitting.”</p>
+            <p>Recovered location: Last Stop Diner. The assigned reader was Unit 14.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The evidence supports the presence of a second observer, not necessarily a second living person. Avoid labeling the subject before completing the interview.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>A later inventory lists this record as destroyed. The archive copy bears a scan date from the following week, before the destruction order was signed.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>LAST STOP DINER</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="the chair behind the glass · supplement 138 the intake camera shows an empty chair. the interview audio contains the chair scraping backwards and someone thanking the officer for letting them in. the item was logged at ranger trail; the associated witness was listed as the unnamed witness. the unnamed witness ranger trail “someone asked for condolences through a disconnected speaker.” the statement may be truthful about the location but false about the time. compare it against the dispatch log and the environmental evidence. the file was re-opened after a technician heard a familiar voice from a device with its speaker removed. the technician recognized the voice as their own.">
+        <div class="archive-meta">
+          <span>FS-ARC-138</span>
+          <span>STATION</span>
+        </div>
+        <h3>The Chair Behind the Glass · Supplement 138</h3>
+        <p>The intake camera shows an empty chair. The interview audio contains the chair scraping backwards and someone thanking the officer for letting them in. The item was logged at Ranger Trail; the associated witness was listed as the unnamed witness.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Someone asked for condolences through a disconnected speaker.”</p>
+            <p>Recovered location: Ranger Trail. The assigned reader was the unnamed witness.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The statement may be truthful about the location but false about the time. Compare it against the dispatch log and the environmental evidence.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The file was re-opened after a technician heard a familiar voice from a device with its speaker removed. The technician recognized the voice as their own.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>RANGER TRAIL</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="witness" data-search="the missing minute · supplement 139 silas remembers the farmhouse clock stopping at 02:17. every witness statement places the event at a different minute, but each watches the same clock. the item was logged at st. mercy chapel; the associated witness was listed as eli. eli st. mercy chapel “we closed the gate at midnight. something opened it from the other side.” the signature appears authentic on the first inspection. under magnification, the ink strokes continue beyond the edge of the paper. the analyst requested that a second officer observe the next test. both officers later wrote that the other person had never been present.">
+        <div class="archive-meta">
+          <span>FS-ARC-139</span>
+          <span>WITNESS</span>
+        </div>
+        <h3>The Missing Minute · Supplement 139</h3>
+        <p>Silas remembers the farmhouse clock stopping at 02:17. Every witness statement places the event at a different minute, but each watches the same clock. The item was logged at St. Mercy Chapel; the associated witness was listed as Eli.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“We closed the gate at midnight. Something opened it from the other side.”</p>
+            <p>Recovered location: St. Mercy Chapel. The assigned reader was Eli.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The signature appears authentic on the first inspection. Under magnification, the ink strokes continue beyond the edge of the paper.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The analyst requested that a second officer observe the next test. Both officers later wrote that the other person had never been present.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>WITNESS</span>
+          <span>ST. MERCY CHAPEL</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="forest" data-search="the trees that move · supplement 140 tree trunks appear in different positions on the bodycam after a short blackout. no camera movement accounts for the change. the item was logged at swamp gas stop; the associated witness was listed as owen dyer. owen dyer swamp gas stop “the footprints stopped at the wall and resumed in the room behind it.” the room inventory does not agree with the bodycam. the missing object may have been moved, removed, or omitted before the inventory was written. the sealed note warns that this item should not be played through station speakers. during the original review, every clock in the building advanced by the same number of seconds.">
+        <div class="archive-meta">
+          <span>FS-ARC-140</span>
+          <span>FOREST</span>
+        </div>
+        <h3>The Trees That Move · Supplement 140</h3>
+        <p>Tree trunks appear in different positions on the bodycam after a short blackout. No camera movement accounts for the change. The item was logged at Swamp Gas Stop; the associated witness was listed as Owen Dyer.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The footprints stopped at the wall and resumed in the room behind it.”</p>
+            <p>Recovered location: Swamp Gas Stop. The assigned reader was Owen Dyer.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The room inventory does not agree with the bodycam. The missing object may have been moved, removed, or omitted before the inventory was written.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed note warns that this item should not be played through station speakers. During the original review, every clock in the building advanced by the same number of seconds.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>FOREST</span>
+          <span>SWAMP GAS STOP</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="signal" data-search="anchor three · supplement 141 the final signal anchor carries a pulse resembling a human heartbeat. cutting power interrupts the pulse, but the connected speaker keeps ticking. the item was logged at mile marker 9; the associated witness was listed as the unnamed witness. the unnamed witness mile marker 9 “keep the family photographs dry. the faces blur when the paper becomes wet.” the source is uncertain. no ordinary device listed in the station inventory can produce the recorded signal without an active input. the sealed note warns that this item should not be played through station speakers. during the original review, every clock in the building advanced by the same number of seconds.">
+        <div class="archive-meta">
+          <span>FS-ARC-141</span>
+          <span>SIGNAL</span>
+        </div>
+        <h3>Anchor Three · Supplement 141</h3>
+        <p>The final signal anchor carries a pulse resembling a human heartbeat. Cutting power interrupts the pulse, but the connected speaker keeps ticking. The item was logged at Mile Marker 9; the associated witness was listed as the unnamed witness.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Keep the family photographs dry. The faces blur when the paper becomes wet.”</p>
+            <p>Recovered location: Mile Marker 9. The assigned reader was the unnamed witness.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The source is uncertain. No ordinary device listed in the station inventory can produce the recorded signal without an active input.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed note warns that this item should not be played through station speakers. During the original review, every clock in the building advanced by the same number of seconds.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>SIGNAL</span>
+          <span>MILE MARKER 9</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="medical" data-search="the nurse’s photograph · supplement 142 the night nurse’s badge photo shows a different person when viewed in a mirror. the image on the badge does not change; the reflection does. the item was logged at leaning cabin; the associated witness was listed as eli. eli leaning cabin “the lamp was on, but there was no shadow under the chair.” the report is corroborated by the physical trace, but its chronology remains unstable. record the contradiction and do not resolve it by guessing. the last annotation is unexpectedly ordinary: “take a breath. drink some water. call someone you trust before continuing.”">
+        <div class="archive-meta">
+          <span>FS-ARC-142</span>
+          <span>MEDICAL</span>
+        </div>
+        <h3>The Nurse’s Photograph · Supplement 142</h3>
+        <p>The night nurse’s badge photo shows a different person when viewed in a mirror. The image on the badge does not change; the reflection does. The item was logged at Leaning Cabin; the associated witness was listed as Eli.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The lamp was on, but there was no shadow under the chair.”</p>
+            <p>Recovered location: Leaning Cabin. The assigned reader was Eli.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The report is corroborated by the physical trace, but its chronology remains unstable. Record the contradiction and do not resolve it by guessing.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The last annotation is unexpectedly ordinary: “Take a breath. Drink some water. Call someone you trust before continuing.”</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEDICAL</span>
+          <span>LEANING CABIN</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="photography" data-search="the last frame · supplement 143 the last frame from a missing deputy’s camera shows the camera lying on the ground and still filming the person holding it. the item was logged at flood gate; the associated witness was listed as owen dyer. owen dyer flood gate “the first set of footprints belongs to the person who has not arrived.” the time discrepancy is consistent across independent copies. a simple clock malfunction cannot explain why the answer arrives before the question. the reviewer requested that this file be kept available for anyone struggling to make sense of the night. uncertainty should not be mistaken for personal failure.">
+        <div class="archive-meta">
+          <span>FS-ARC-143</span>
+          <span>PHOTOGRAPHY</span>
+        </div>
+        <h3>The Last Frame · Supplement 143</h3>
+        <p>The last frame from a missing deputy’s camera shows the camera lying on the ground and still filming the person holding it. The item was logged at Flood Gate; the associated witness was listed as Owen Dyer.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The first set of footprints belongs to the person who has not arrived.”</p>
+            <p>Recovered location: Flood Gate. The assigned reader was Owen Dyer.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The time discrepancy is consistent across independent copies. A simple clock malfunction cannot explain why the answer arrives before the question.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The reviewer requested that this file be kept available for anyone struggling to make sense of the night. Uncertainty should not be mistaken for personal failure.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>PHOTOGRAPHY</span>
+          <span>FLOOD GATE</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="memorial" data-search="the prayer card · supplement 144 a folded prayer card was left by the chapel candle. it asks for comfort for the grieving, peace for the departed, and patience for everyone who cannot find the right words. the item was logged at st. mercy chapel; the associated witness was listed as the station operator. the station operator st. mercy chapel “the light did not fail. the room simply stopped being visible.” the evidence supports the presence of a second observer, not necessarily a second living person. avoid labeling the subject before completing the interview. the sealed attachment is absent, but its shadow remains visible in every scan of the page. no physical object was recovered from the envelope.">
+        <div class="archive-meta">
+          <span>FS-ARC-144</span>
+          <span>MEMORIAL</span>
+        </div>
+        <h3>The Prayer Card · Supplement 144</h3>
+        <p>A folded prayer card was left by the chapel candle. It asks for comfort for the grieving, peace for the departed, and patience for everyone who cannot find the right words. The item was logged at St. Mercy Chapel; the associated witness was listed as the station operator.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The light did not fail. The room simply stopped being visible.”</p>
+            <p>Recovered location: St. Mercy Chapel. The assigned reader was the station operator.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The evidence supports the presence of a second observer, not necessarily a second living person. Avoid labeling the subject before completing the interview.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The sealed attachment is absent, but its shadow remains visible in every scan of the page. No physical object was recovered from the envelope.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>MEMORIAL</span>
+          <span>ST. MERCY CHAPEL</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="call sign fourteen · supplement 145 dispatch accepted a call from a unit that had been logged out of service eleven years earlier. the operator’s voice was calm, but the waveform began six seconds before the microphone opened. the item was logged at north culvert; the associated witness was listed as eli. eli north culvert “the witness knew what the investigator would ask.” the anomaly appears to react to attention. repeating the observation changes the result, so the first record must remain in the case file. the evidence locker log records two people entering and one leaving. both signatures match the same employee file.">
+        <div class="archive-meta">
+          <span>FS-ARC-145</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>Call Sign Fourteen · Supplement 145</h3>
+        <p>Dispatch accepted a call from a unit that had been logged out of service eleven years earlier. The operator’s voice was calm, but the waveform began six seconds before the microphone opened. The item was logged at North Culvert; the associated witness was listed as Eli.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The witness knew what the investigator would ask.”</p>
+            <p>Recovered location: North Culvert. The assigned reader was Eli.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The anomaly appears to react to attention. Repeating the observation changes the result, so the first record must remain in the case file.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The evidence locker log records two people entering and one leaving. Both signatures match the same employee file.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>NORTH CULVERT</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="dispatch" data-search="the second timestamp · supplement 146 two copies of the same call arrived with different timestamps. the older file contains a response from the officer who had not yet received the call. the item was logged at cypress farmhouse; the associated witness was listed as owen dyer. owen dyer cypress farmhouse “the clock was correct. it was the morning that was wrong.” the signature appears authentic on the first inspection. under magnification, the ink strokes continue beyond the edge of the paper. the record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.">
+        <div class="archive-meta">
+          <span>FS-ARC-146</span>
+          <span>DISPATCH</span>
+        </div>
+        <h3>The Second Timestamp · Supplement 146</h3>
+        <p>Two copies of the same call arrived with different timestamps. The older file contains a response from the officer who had not yet received the call. The item was logged at Cypress Farmhouse; the associated witness was listed as Owen Dyer.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The clock was correct. It was the morning that was wrong.”</p>
+            <p>Recovered location: Cypress Farmhouse. The assigned reader was Owen Dyer.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The signature appears authentic on the first inspection. Under magnification, the ink strokes continue beyond the edge of the paper.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The record is marked for retention because it contains the only known instance of the signal offering an apology without being prompted.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>DISPATCH</span>
+          <span>CYPRESS FARMHOUSE</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="camera 04 · supplement 147 camera 04 records seven arrivals on a night when only six visitors are expected. the seventh figure enters through a wall that has no door. the item was logged at leaning cabin; the associated witness was listed as the station operator. the station operator leaning cabin “the signal became louder when everyone stopped talking.” the room inventory does not agree with the bodycam. the missing object may have been moved, removed, or omitted before the inventory was written. the final line is written in a different hand: “if you are reading this alone, you are not alone.” the ink has not been matched to any station employee.">
+        <div class="archive-meta">
+          <span>FS-ARC-147</span>
+          <span>STATION</span>
+        </div>
+        <h3>Camera 04 · Supplement 147</h3>
+        <p>Camera 04 records seven arrivals on a night when only six visitors are expected. The seventh figure enters through a wall that has no door. The item was logged at Leaning Cabin; the associated witness was listed as the station operator.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The signal became louder when everyone stopped talking.”</p>
+            <p>Recovered location: Leaning Cabin. The assigned reader was the station operator.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The room inventory does not agree with the bodycam. The missing object may have been moved, removed, or omitted before the inventory was written.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The final line is written in a different hand: “If you are reading this alone, you are not alone.” The ink has not been matched to any station employee.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>LEANING CABIN</span>
+          <span>SEALED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="station" data-search="the blank badge · supplement 148 a badge printer produced a blank card after the station network was disconnected. the card warmed whenever it was held near the interview room. the item was logged at records annex; the associated witness was listed as mara. mara records annex “we counted six visitors. the door counted seven.” the source is uncertain. no ordinary device listed in the station inventory can produce the recorded signal without an active input. the final line is written in a different hand: “if you are reading this alone, you are not alone.” the ink has not been matched to any station employee.">
+        <div class="archive-meta">
+          <span>FS-ARC-148</span>
+          <span>STATION</span>
+        </div>
+        <h3>The Blank Badge · Supplement 148</h3>
+        <p>A badge printer produced a blank card after the station network was disconnected. The card warmed whenever it was held near the interview room. The item was logged at Records Annex; the associated witness was listed as Mara.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“We counted six visitors. The door counted seven.”</p>
+            <p>Recovered location: Records Annex. The assigned reader was Mara.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The source is uncertain. No ordinary device listed in the station inventory can produce the recorded signal without an active input.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The final line is written in a different hand: “If you are reading this alone, you are not alone.” The ink has not been matched to any station employee.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>STATION</span>
+          <span>RECORDS ANNEX</span>
+          <span>CROSS-REFERENCE</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="witness" data-search="silas venn’s first statement · supplement 149 silas says he never entered the farmhouse. mud on his cuffs matches the upstairs landing, where the windows have been nailed shut from within. the item was logged at radio relay hut; the associated witness was listed as owen dyer. owen dyer radio relay hut “the photograph was developed twice. the second negative had a reflection.” the report is corroborated by the physical trace, but its chronology remains unstable. record the contradiction and do not resolve it by guessing. a later inventory lists this record as destroyed. the archive copy bears a scan date from the following week, before the destruction order was signed.">
+        <div class="archive-meta">
+          <span>FS-ARC-149</span>
+          <span>WITNESS</span>
+        </div>
+        <h3>Silas Venn’s First Statement · Supplement 149</h3>
+        <p>Silas says he never entered the farmhouse. Mud on his cuffs matches the upstairs landing, where the windows have been nailed shut from within. The item was logged at Radio Relay Hut; the associated witness was listed as Owen Dyer.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“The photograph was developed twice. The second negative had a reflection.”</p>
+            <p>Recovered location: Radio Relay Hut. The assigned reader was Owen Dyer.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The report is corroborated by the physical trace, but its chronology remains unstable. Record the contradiction and do not resolve it by guessing.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>A later inventory lists this record as destroyed. The archive copy bears a scan date from the following week, before the destruction order was signed.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>WITNESS</span>
+          <span>RADIO RELAY HUT</span>
+          <span>UNVERIFIED</span>
+        </div>
+      </article>
+      <article class="archive-entry" data-archive-entry data-category="forest" data-search="the dry footprints · supplement 150 a line of wet boot prints crosses the forest floor, then continues over a fallen tree without disturbing the moss. the item was logged at north culvert; the associated witness was listed as the station operator. the station operator north culvert “do not destroy the original record until both copies agree.” the time discrepancy is consistent across independent copies. a simple clock malfunction cannot explain why the answer arrives before the question. the file was re-opened after a technician heard a familiar voice from a device with its speaker removed. the technician recognized the voice as their own.">
+        <div class="archive-meta">
+          <span>FS-ARC-150</span>
+          <span>FOREST</span>
+        </div>
+        <h3>The Dry Footprints · Supplement 150</h3>
+        <p>A line of wet boot prints crosses the forest floor, then continues over a fallen tree without disturbing the moss. The item was logged at North Culvert; the associated witness was listed as the station operator.</p>
+        <div class="archive-grid">
+          <section>
+            <h4>RECOVERED FRAGMENT</h4>
+            <p>“Do not destroy the original record until both copies agree.”</p>
+            <p>Recovered location: North Culvert. The assigned reader was the station operator.</p>
+          </section>
+          <section>
+            <h4>ANALYST'S NOTE</h4>
+            <p>The time discrepancy is consistent across independent copies. A simple clock malfunction cannot explain why the answer arrives before the question.</p>
+            <p>Case status: open to review. Keep conflicting copies together and preserve the original wording.</p>
+          </section>
+        </div>
+        <details>
+          <summary>Open sealed analyst note</summary>
+          <p>The file was re-opened after a technician heard a familiar voice from a device with its speaker removed. The technician recognized the voice as their own.</p>
+          <p>The signed copy bears no reliable time marker. This limitation is recorded rather than silently corrected.</p>
+        </details>
+        <div class="archive-tags">
+          <span>FOREST</span>
+          <span>NORTH CULVERT</span>
+          <span>REVIEW REQUIRED</span>
+        </div>
+      </article>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    </div>
+    <div class="page-buttons"><button id="archiveClose" type="button">Close archive</button></div>
+  </div>
+</div>
+<script>
+(()=>{
+"use strict";
+const byId=id=>document.getElementById(id);
+const accountPanel=byId('accountPanel');
+const archivePanel=byId('archivePanel');
+const accountStatus=byId('accountStatus');
+let signedInUser=null;
+let databaseState={configured:false,available:false};
+const localSavePrefix='florida-shadows-save-v3-';
+const achievements={
+  first_trace:{title:'First Trace',description:'Recover your first piece of physical evidence.',icon:'⌕'},
+  forensic_mind:{title:'Forensic Mind',description:'Study six clues and build a supported theory.',icon:'▤'},
+  cross_examiner:{title:'Cross-Examiner',description:'Complete a corroborated witness interview.',icon:'◈'},
+  night_auditor:{title:'Night Auditor',description:'Complete the station visitor audit.',icon:'▣'},
+  five_roofs:{title:'Five Roofs',description:'Search five different buildings.',icon:'⌂'},
+  two_lives:{title:'Two Lives',description:'Find both missing survivors.',icon:'♡'},
+  signal_breaker:{title:'Signal Breaker',description:'Destroy all three signal anchors.',icon:'ϟ'},
+  quiet_observer:{title:'Quiet Observer',description:'Read the memorial and prayer.',icon:'✦'},
+  nightmare_survivor:{title:'Nightmare Survivor',description:'Complete the final defense and escape.',icon:'✧'},
+  archive_reader:{title:'Archive Reader',description:'Open the Night Archive and read a sealed note.',icon:'▥'},
+  unbroken:{title:'Unbroken',description:'Escape without being defeated.',icon:'⌁'},
+  anchorless:{title:'Anchorless Ending',description:'Escape after silencing the signal network.',icon:'☼'}
+};
+async function api(path,options={}){
+  const config={credentials:'same-origin',headers:{'Content-Type':'application/json',...(options.headers||{})},...options};
+  const response=await fetch(path,config);
+  const body=await response.json().catch(()=>({ok:false,error:'The server returned an unreadable response.'}));
+  if(!response.ok||body.ok===false)throw new Error(body.error||('Request failed: '+response.status));
+  return body;
+}
+function accountMessage(text,isError=false){
+  const node=byId('saveStatus');
+  node.textContent=text;
+  node.classList.toggle('error',!!isError);
+}
+function identityMessage(text,isError=false){
+  const node=byId('accountIdentity');
+  node.textContent=text;
+  node.classList.toggle('error',!!isError);
+}
+function databaseMessage(text,isError=false){
+  const node=byId('accountDatabaseStatus');
+  node.textContent=text;
+  node.classList.toggle('error',!!isError);
+}
+function showAccount(){
+  archivePanel.classList.add('hidden');
+  accountPanel.classList.remove('hidden');
+  refreshAccountState();
+}
+function showArchive(){
+  accountPanel.classList.add('hidden');
+  archivePanel.classList.remove('hidden');
+  filterArchive();
+}
+function closeAccount(){accountPanel.classList.add('hidden');}
+function closeArchive(){archivePanel.classList.add('hidden');}
+async function refreshAccountState(){
+  try{
+    const status=await api('/api/status');
+    databaseState=status.database||{configured:false,available:false};
+    if(databaseState.available){
+      databaseMessage('MongoDB connected · '+status.databaseName+' · Accounts, saves, leaderboards and achievements are available.');
+    }else if(databaseState.configured){
+      databaseMessage('MongoDB URI is present but the connection failed. Check MONGODB_URI, MONGODB_DB, and your MongoDB Atlas network access list.',true);
+    }else{
+      databaseMessage('MongoDB is not configured. Add MONGODB_URI and MONGODB_DB in Render environment variables. Local checkpoints will still work in this browser.',false);
+    }
+  }catch(error){
+    databaseMessage('Could not check database status: '+error.message,true);
+  }
+  try{
+    const me=await api('/api/me');
+    signedInUser=me.authenticated?me.user:null;
+    identityMessage(signedInUser?'Signed in as '+signedInUser.username+'. Cloud saves and records will be tied to this account.':'Not signed in. Sign in to sync cloud data.');
+    byId('accountLogout').disabled=!signedInUser;
+    byId('saveCloudButton').disabled=!signedInUser;
+    byId('loadCloudButton').disabled=!signedInUser;
+    byId('scoreSubmit').disabled=!signedInUser;
+  }catch(error){
+    signedInUser=null;
+    identityMessage(error.message,true);
+  }
+  refreshLeaderboard(false);
+  refreshAchievements(false);
+}
+async function registerAccount(){
+  const username=byId('accountUsername').value.trim();
+  const password=byId('accountPassword').value;
+  try{
+    const result=await api('/api/register',{method:'POST',body:JSON.stringify({username,password})});
+    signedInUser=result.user;
+    identityMessage('Account created. Signed in as '+result.user.username+'.');
+    accountMessage('Account created successfully. You can now sync saves and records.');
+    await refreshAccountState();
+  }catch(error){identityMessage(error.message,true);}
+}
+async function loginAccount(){
+  const username=byId('accountUsername').value.trim();
+  const password=byId('accountPassword').value;
+  try{
+    const result=await api('/api/login',{method:'POST',body:JSON.stringify({username,password})});
+    signedInUser=result.user;
+    identityMessage('Signed in as '+result.user.username+'.');
+    accountMessage('Signed in. Cloud services are ready.');
+    await refreshAccountState();
+  }catch(error){identityMessage(error.message,true);}
+}
+async function logoutAccount(){
+  try{
+    await api('/api/logout',{method:'POST',body:'{}'});
+    signedInUser=null;
+    identityMessage('Signed out. Local checkpoint remains on this browser.');
+    await refreshAccountState();
+  }catch(error){identityMessage(error.message,true);}
+}
+function getSnapshot(){
+  if(!window.FSGameBridge||typeof window.FSGameBridge.getSnapshot!=='function')throw new Error('The game save bridge is not available. Refresh the game page.');
+  return window.FSGameBridge.getSnapshot();
+}
+function saveLocal(){
+  try{
+    const slot=byId('saveSlot').value;
+    const snapshot=getSnapshot();
+    if(!snapshot.player)throw new Error('Start a patrol before saving a checkpoint.');
+    if(!snapshot.player)throw new Error('Start a patrol before saving a checkpoint.');
+    localStorage.setItem(localSavePrefix+slot,JSON.stringify(snapshot));
+    accountMessage('Local checkpoint saved to this browser. Slot: '+slot+'.');
+  }catch(error){accountMessage('Could not save locally: '+error.message,true);}
+}
+function loadLocal(){
+  try{
+    const slot=byId('saveSlot').value;
+    const raw=localStorage.getItem(localSavePrefix+slot);
+    if(!raw)throw new Error('No local checkpoint exists in this slot.');
+    const snapshot=JSON.parse(raw);
+    if(!window.FSGameBridge.restoreSnapshot(snapshot))throw new Error('The checkpoint format is not supported.');
+    closeAccount();
+    accountMessage('Local checkpoint loaded.');
+  }catch(error){accountMessage('Could not load local checkpoint: '+error.message,true);}
+}
+async function saveCloud(){
+  try{
+    const slot=byId('saveSlot').value;
+    const snapshot=getSnapshot();
+    if(!snapshot.player)throw new Error('Start a patrol before saving a checkpoint.');
+    if(!snapshot.player)throw new Error('Start a patrol before saving a checkpoint.');
+    const result=await api('/api/save',{method:'POST',body:JSON.stringify({slot,snapshot})});
+    accountMessage('Cloud checkpoint saved · '+result.slot+' · '+result.updatedAt+'.');
+    await syncAchievements(snapshot);
+  }catch(error){accountMessage(error.message,true);}
+}
+async function loadCloud(){
+  try{
+    const slot=byId('saveSlot').value;
+    const result=await api('/api/save?slot='+encodeURIComponent(slot));
+    if(!result.snapshot)throw new Error('There is no cloud checkpoint in this slot.');
+    if(!window.FSGameBridge.restoreSnapshot(result.snapshot))throw new Error('The cloud checkpoint is not supported by this game version.');
+    closeAccount();
+    accountMessage('Cloud checkpoint restored from '+result.updatedAt+'.');
+  }catch(error){accountMessage(error.message,true);}
+}
+function deriveScore(snapshot){
+  const f=snapshot.flags||{};
+  const found=Number(snapshot.evidence)||0;
+  const studied=Number(snapshot.statistics&&snapshot.statistics.studyCount)||0;
+  const kills=Number(f.kills)||0;
+  const anchors=Array.isArray(f.anchorsDestroyed)?f.anchorsDestroyed.length:0;
+  const survivors=Array.isArray(snapshot.survivors)?snapshot.survivors.filter(x=>x.found||x.following||x.delivered).length:0;
+  const seconds=Math.floor(Number(snapshot.elapsed)||0);
+  const escaped=!!(f.gameOver&&f.won);
+  return Math.max(0,Math.min(10000000,found*180+studied*220+kills*35+anchors*450+survivors*650+Math.floor(seconds/10)+(escaped?5000:0)));
+}
+async function submitScore(){
+  try{
+    const snapshot=getSnapshot();
+    if(!snapshot.player)throw new Error('Start a patrol before submitting a run.');
+    if(!snapshot.player)throw new Error('Start a patrol before submitting a run.');
+    const f=snapshot.flags||{};
+    const score=deriveScore(snapshot);
+    const result=await api('/api/leaderboard',{method:'POST',body:JSON.stringify({score,won:!!(f.gameOver&&f.won),elapsed:Number(snapshot.elapsed)||0,evidence:Number(snapshot.evidence)||0,studied:Number(snapshot.statistics&&snapshot.statistics.studyCount)||0,kills:Number(f.kills)||0,survivors:Array.isArray(snapshot.survivors)?snapshot.survivors.filter(x=>x.found||x.following||x.delivered).length:0,anchors:Array.isArray(f.anchorsDestroyed)?f.anchorsDestroyed.length:0,difficulty:'definitive-nightmare'})});
+    accountMessage('Run submitted to the leaderboard. Score: '+score+'.');
+    await syncAchievements(snapshot);
+    await refreshLeaderboard(true);
+  }catch(error){accountMessage(error.message,true);}
+}
+async function refreshLeaderboard(showMessage=true){
+  const node=byId('leaderboardArea');
+  try{
+    const result=await api('/api/leaderboard');
+    const entries=result.entries||[];
+    if(!entries.length){node.textContent='No scores recorded yet. Complete a run and submit your score to start the board.';return;}
+    const table=document.createElement('table');table.className='account-table';
+    const head=document.createElement('thead');
+    head.innerHTML='<tr><th>#</th><th>OFFICER</th><th>SCORE</th><th>RESULT</th></tr>';
+    table.appendChild(head);
+    const body=document.createElement('tbody');
+    entries.forEach((entry,index)=>{
+      const row=document.createElement('tr');
+      [String(index+1),String(entry.username||'UNKNOWN'),String(entry.score||0),entry.won?'ESCAPED':'LOST'].forEach(value=>{const cell=document.createElement('td');cell.textContent=value;row.appendChild(cell);});
+      body.appendChild(row);
+    });
+    table.appendChild(body);node.replaceChildren(table);
+  }catch(error){node.textContent=databaseState.available?'Leaderboard unavailable: '+error.message:'Leaderboard requires a working MongoDB connection and an account.';}
+}
+async function refreshAchievements(showMessage=true){
+  const node=byId('achievementArea');
+  try{
+    const result=await api('/api/achievements');
+    const unlocked=new Set(result.unlocked||[]);
+    node.replaceChildren();
+    Object.entries(achievements).forEach(([key,item])=>{
+      const row=document.createElement('div');row.className='account-achievement';
+      const icon=document.createElement('div');icon.className='achievement-icon';icon.textContent=item.icon;
+      const text=document.createElement('div');
+      const title=document.createElement('strong');title.textContent=item.title;
+      const description=document.createElement('small');description.textContent=item.description;
+      text.append(title,description);
+      const badge=document.createElement('small');badge.textContent=unlocked.has(key)?'UNLOCKED':'LOCKED';badge.style.color=unlocked.has(key)?'#cdbd80':'#748070';
+      row.append(icon,text,badge);node.appendChild(row);
+    });
+  }catch(error){node.textContent=databaseState.available?'Achievements unavailable: '+error.message:'Sign in with MongoDB connected to view cloud achievements. Local achievements can be synchronized after connection.';}
+}
+async function syncAchievements(snapshot=getSnapshot()){
+  if(!signedInUser||!window.FSGameBridge)return;
+  const unlocked=window.FSGameBridge.unlockCandidates();
+  if(!unlocked.length)return;
+  try{
+    await api('/api/achievements/unlock',{method:'POST',body:JSON.stringify({ids:unlocked})});
+    await refreshAchievements(false);
+  }catch(error){accountMessage('Checkpoint saved, but achievement sync failed: '+error.message,true);}
+}
+function filterArchive(){
+  const query=(byId('archiveSearch').value||'').trim().toLowerCase();
+  const category=byId('archiveFilter').value;
+  const entries=Array.from(document.querySelectorAll('[data-archive-entry]'));
+  let visible=0;
+  entries.forEach(entry=>{
+    const matchesText=!query||entry.dataset.search.includes(query);
+    const matchesCategory=category==='all'||entry.dataset.category===category;
+    const show=matchesText&&matchesCategory;
+    entry.hidden=!show;
+    if(show)visible++;
+  });
+  byId('archiveCount').textContent=visible+' of '+entries.length+' recovered records shown.';
+}
+function markArchiveRead(){
+  window.FSArchiveRead=true;
+  const candidates=window.FSGameBridge&&window.FSGameBridge.unlockCandidates?window.FSGameBridge.unlockCandidates():[];
+  if(signedInUser&&candidates.includes('archive_reader'))api('/api/achievements/unlock',{method:'POST',body:JSON.stringify({ids:['archive_reader']})}).catch(()=>{});
+}
+function installReadTracking(){
+  document.querySelectorAll('[data-archive-entry] details').forEach(details=>details.addEventListener('toggle',()=>{if(details.open)markArchiveRead();}));
+}
+byId('accountBtn').addEventListener('click',showAccount);
+byId('accountBack').addEventListener('click',closeAccount);
+byId('archiveBtn').addEventListener('click',showArchive);
+byId('archiveClose').addEventListener('click',closeArchive);
+byId('accountRegister').addEventListener('click',registerAccount);
+byId('accountLogin').addEventListener('click',loginAccount);
+byId('accountLogout').addEventListener('click',logoutAccount);
+byId('saveLocalButton').addEventListener('click',saveLocal);
+byId('loadLocalButton').addEventListener('click',loadLocal);
+byId('saveCloudButton').addEventListener('click',saveCloud);
+byId('loadCloudButton').addEventListener('click',loadCloud);
+byId('leaderboardRefresh').addEventListener('click',()=>refreshLeaderboard(true));
+byId('scoreSubmit').addEventListener('click',submitScore);
+byId('achievementRefresh').addEventListener('click',()=>refreshAchievements(true));
+byId('achievementSync').addEventListener('click',()=>syncAchievements().then(()=>accountMessage('Achievement sync completed.')).catch(error=>accountMessage(error.message,true)));
+byId('archiveSearch').addEventListener('input',filterArchive);
+byId('archiveFilter').addEventListener('change',filterArchive);
+byId('accountPassword').addEventListener('keydown',event=>{if(event.key==='Enter')loginAccount();});
+document.addEventListener('keydown',event=>{if(event.key==='Escape'){closeAccount();closeArchive();}});
+installReadTracking();
+api('/api/status').then(result=>{
+  databaseState=result.database||{configured:false,available:false};
+  if(databaseState.available)databaseMessage('MongoDB connected · '+result.databaseName+'.');
+  else if(databaseState.configured)databaseMessage('MongoDB configured but unavailable. Check credentials and network access.',true);
+  else databaseMessage('MongoDB not configured. Add MONGODB_URI and MONGODB_DB in Render. Local checkpoints still work.',false);
+}).catch(()=>databaseMessage('Database status could not be checked. Local checkpoints still work.',true));
 })();
 </script>
 </body>
@@ -7627,11 +12818,178 @@ boot();
 
 @app.get('/')
 def index():
-    return Response(HTML, mimetype='text/html')
+    response = Response(HTML, mimetype='text/html')
+    response.headers['Cache-Control'] = 'no-store, max-age=0'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    return response
+
+
+@app.get('/api/status')
+def api_status():
+    database, error = _get_database()
+    configured = bool((os.environ.get('MONGODB_URI') or '').strip())
+    return jsonify({
+        'ok': True,
+        'game': 'Florida Shadows',
+        'database': {'configured': configured, 'available': database is not None},
+        'databaseName': (os.environ.get('MONGODB_DB') or 'florida_shadows') if database is not None else None,
+        'features': ['accounts', 'cloud_saves', 'leaderboards', 'achievements'],
+        'message': error
+    })
+
+@app.get('/api/me')
+def api_me():
+    database, error = _get_database()
+    if database is None:
+        return jsonify({'ok': True, 'authenticated': False, 'databaseAvailable': False, 'message': error})
+    user = _current_user(database)
+    if user is None:
+        return jsonify({'ok': True, 'authenticated': False, 'databaseAvailable': True})
+    return jsonify({'ok': True, 'authenticated': True, 'databaseAvailable': True, 'user': {'username': user.get('username', ''), 'created_at': user.get('created_at', '')}})
+
+@app.post('/api/register')
+def api_register():
+    database, error = _get_database()
+    if database is None:
+        return jsonify(ok=False, error=error or 'MongoDB unavailable.'), 503
+    if generate_password_hash is None:
+        return jsonify(ok=False, error='Password hashing is unavailable. Install the listed requirements.'), 503
+    payload = request.get_json(silent=True) or {}
+    username = str(payload.get('username', '')).strip()
+    password = payload.get('password', '')
+    if not re.fullmatch(r'[A-Za-z0-9_]{3,18}', username):
+        return jsonify(ok=False, error='Username must be 3–18 characters using letters, numbers, or underscores.'), 400
+    if not isinstance(password, str) or len(password) < 8 or len(password) > 128:
+        return jsonify(ok=False, error='Password must be between 8 and 128 characters.'), 400
+    username_key = username.lower()
+    if database.users.find_one({'username_key': username_key}, {'_id': 1}):
+        return jsonify(ok=False, error='That username already exists.'), 409
+    document = {'username': username, 'username_key': username_key, 'password_hash': generate_password_hash(password, method='pbkdf2:sha256'), 'created_at': _utc_now(), 'schema': 1}
+    try:
+        result = database.users.insert_one(document)
+    except DuplicateKeyError:
+        return jsonify(ok=False, error='That username already exists.'), 409
+    session.clear()
+    session['user_id'] = str(result.inserted_id)
+    session['username'] = username
+    session.permanent = True
+    return jsonify(ok=True, user={'username': username, 'created_at': document['created_at']})
+
+@app.post('/api/login')
+def api_login():
+    database, error = _get_database()
+    if database is None:
+        return jsonify(ok=False, error=error or 'MongoDB unavailable.'), 503
+    if check_password_hash is None:
+        return jsonify(ok=False, error='Password verification is unavailable.'), 503
+    payload = request.get_json(silent=True) or {}
+    username = str(payload.get('username', '')).strip()
+    password = payload.get('password', '')
+    if not username or not isinstance(password, str):
+        return jsonify(ok=False, error='Enter your username and password.'), 400
+    user = database.users.find_one({'username_key': username.lower()})
+    if not user or not check_password_hash(user.get('password_hash', ''), password):
+        return jsonify(ok=False, error='Incorrect username or password.'), 401
+    session.clear()
+    session['user_id'] = str(user['_id'])
+    session['username'] = user.get('username', username)
+    session.permanent = True
+    return jsonify(ok=True, user={'username': user.get('username', username), 'created_at': user.get('created_at', '')})
+
+@app.post('/api/logout')
+def api_logout():
+    session.clear()
+    return jsonify(ok=True)
+
+@app.get('/api/save')
+@_auth_required
+def api_load_save(database, user):
+    slot = str(request.args.get('slot', 'main')).strip().lower()
+    if slot not in ('main', 'backup', 'challenge'):
+        return jsonify(ok=False, error='Unknown save slot.'), 400
+    record = database.saves.find_one({'user_id': str(user['_id']), 'slot': slot})
+    if not record:
+        return jsonify(ok=True, snapshot=None, slot=slot)
+    return jsonify(ok=True, snapshot=record.get('snapshot'), slot=slot, updatedAt=record.get('updated_at', ''))
+
+@app.post('/api/save')
+@_auth_required
+def api_store_save(database, user):
+    payload = request.get_json(silent=True) or {}
+    slot = str(payload.get('slot', 'main')).strip().lower()
+    snapshot = payload.get('snapshot')
+    if slot not in ('main', 'backup', 'challenge'):
+        return jsonify(ok=False, error='Unknown save slot.'), 400
+    if not isinstance(snapshot, dict) or snapshot.get('schema') != 1:
+        return jsonify(ok=False, error='The game checkpoint is invalid or unsupported.'), 400
+    try:
+        snapshot = _json_safe(snapshot)
+        serialized = json.dumps(snapshot, separators=(',', ':'), allow_nan=False)
+    except Exception:
+        return jsonify(ok=False, error='The checkpoint contains invalid data.'), 400
+    if len(serialized) > 68000:
+        return jsonify(ok=False, error='The checkpoint is too large.'), 413
+    updated_at = _utc_now()
+    database.saves.replace_one({'user_id': str(user['_id']), 'slot': slot}, {'user_id': str(user['_id']), 'username': user.get('username', ''), 'slot': slot, 'snapshot': snapshot, 'updated_at': updated_at, 'schema': 1}, upsert=True)
+    return jsonify(ok=True, slot=slot, updatedAt=updated_at)
+
+@app.get('/api/leaderboard')
+def api_leaderboard():
+    database, error = _get_database()
+    if database is None:
+        return jsonify(ok=False, error=error or 'MongoDB unavailable.'), 503
+    records = database.leaderboards.find({}, {'username': 1, 'score': 1, 'won': 1, 'created_at': 1, 'elapsed': 1}).sort([('score', DESCENDING), ('created_at', ASCENDING)]).limit(25)
+    entries = []
+    for record in records:
+        entries.append({'username': record.get('username', 'UNKNOWN'), 'score': int(record.get('score', 0)), 'won': bool(record.get('won')), 'created_at': record.get('created_at', ''), 'elapsed': int(record.get('elapsed', 0))})
+    return jsonify(ok=True, entries=entries)
+
+@app.post('/api/leaderboard')
+@_auth_required
+def api_submit_score(database, user):
+    payload = request.get_json(silent=True) or {}
+    try:
+        score = max(0, min(10000000, int(payload.get('score', 0))))
+        elapsed = max(0, min(86400, int(payload.get('elapsed', 0))))
+        evidence_count = max(0, min(100, int(payload.get('evidence', 0))))
+        studied = max(0, min(100, int(payload.get('studied', 0))))
+        kills = max(0, min(10000, int(payload.get('kills', 0))))
+        survivors_count = max(0, min(2, int(payload.get('survivors', 0))))
+        anchors = max(0, min(3, int(payload.get('anchors', 0))))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error='Invalid score data.'), 400
+    record = {'user_id': str(user['_id']), 'username': user.get('username', ''), 'score': score, 'won': bool(payload.get('won')), 'elapsed': elapsed, 'evidence': evidence_count, 'studied': studied, 'kills': kills, 'survivors': survivors_count, 'anchors': anchors, 'difficulty': str(payload.get('difficulty', 'definitive-nightmare'))[:32], 'created_at': _utc_now()}
+    database.leaderboards.insert_one(record)
+    return jsonify(ok=True, score=score, createdAt=record['created_at'])
+
+@app.get('/api/achievements')
+@_auth_required
+def api_get_achievements(database, user):
+    records = database.achievements.find({'user_id': str(user['_id'])}, {'achievement_id': 1, 'unlocked_at': 1})
+    unlocked = {record.get('achievement_id'): record.get('unlocked_at', '') for record in records}
+    catalog = [{'id': key, **value, 'unlocked': key in unlocked, 'unlocked_at': unlocked.get(key)} for key, value in ACHIEVEMENT_CATALOG.items()]
+    return jsonify(ok=True, unlocked=list(unlocked.keys()), achievements=catalog)
+
+@app.post('/api/achievements/unlock')
+@_auth_required
+def api_unlock_achievements(database, user):
+    payload = request.get_json(silent=True) or {}
+    requested = payload.get('ids', [])
+    if not isinstance(requested, list):
+        return jsonify(ok=False, error='Achievement identifiers must be a list.'), 400
+    valid = [str(value) for value in requested if str(value) in ACHIEVEMENT_CATALOG]
+    unlocked_at = _utc_now()
+    count = 0
+    for achievement_id in sorted(set(valid)):
+        result = database.achievements.update_one({'user_id': str(user['_id']), 'achievement_id': achievement_id}, {'$setOnInsert': {'user_id': str(user['_id']), 'username': user.get('username', ''), 'achievement_id': achievement_id, 'unlocked_at': unlocked_at}}, upsert=True)
+        if result.upserted_id is not None:
+            count += 1
+    return jsonify(ok=True, unlocked=sorted(set(valid)), newlyUnlocked=count)
 
 @app.get('/health')
 def health():
-    return jsonify(status='ok', game='Florida Shadows: The Living Nightmare', version='The Haunted Features Edition')
+    database, error = _get_database()
+    return jsonify(status='ok', game='Florida Shadows: The Living Nightmare', version='Cloud Save Edition', database='connected' if database is not None else ('not_configured' if not (os.environ.get('MONGODB_URI') or '').strip() else 'unavailable'))
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '5000'))
