@@ -1,35 +1,19 @@
-from flask import Flask, Response, jsonify, request, session
+from flask import Flask, Response, jsonify, request
+from datetime import datetime, timezone
+from threading import Lock
 import os
 import re
-import json
-import secrets
-import threading
-from datetime import datetime, timedelta, timezone
-from werkzeug.security import generate_password_hash, check_password_hash
 
 try:
-    from pymongo import MongoClient, ASCENDING, DESCENDING
-    from pymongo.errors import DuplicateKeyError, PyMongoError
-except Exception:
+    from pymongo import MongoClient
+except ImportError:
     MongoClient = None
-    ASCENDING = 1
-    DESCENDING = -1
-    DuplicateKeyError = Exception
-    PyMongoError = Exception
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
-app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["SESSION_COOKIE_SECURE"] = os.environ.get("COOKIE_SECURE", "1").strip().lower() not in {"0", "false", "no"}
-app.config["MAX_CONTENT_LENGTH"] = 100_000
-app.permanent_session_lifetime = timedelta(hours=10)
-
-_mongo_client = None
-_mongo_database = None
-_mongo_lock = threading.Lock()
-_mongo_schema_ready = False
-_mongo_last_error = ""
+_prayer_memory = []
+_prayer_lock = Lock()
+_prayer_mongo_client = None
+_prayer_mongo_uri = None
 
 HTML = r'''<!doctype html>
 <html lang="en">
@@ -520,7 +504,30 @@ body.prologue-mode.prologue-drive.mobile-mode #touchControls { display: block; }
 .memorial-photo { min-height:86px; display:flex; flex-direction:column; justify-content:center; align-items:center; gap:8px; padding:10px 5px; border:1px solid #59533e; background:#0b0f0a; color:#cabb95; text-align:center; font-size:10px; letter-spacing:1px; }
 .memorial-photo strong { font-size:25px; line-height:1; font-weight:normal; color:#e0d0a6; }
 .memorial-note { color:#a9ad9d; font-size:10px; line-height:1.7; }
-@media(max-width:760px) { .memorial-photo-row { gap:5px; } .memorial-photo { min-height:73px; font-size:8px; } .memorial-photo strong { font-size:20px; } .memorial-home p { font-size:10px; } }
+.prayer-open-button { width:100%; margin-top:10px; padding:9px 10px; color:#f1e5c4; border-color:#8d7c55; background:linear-gradient(180deg,#393421,#1b1b13); font-size:10px; letter-spacing:1px; }
+.prayer-book-panel { width:min(760px,96vw); border-color:#8b7d5b; background:linear-gradient(145deg,rgba(19,23,17,.99),rgba(3,5,4,.99)); }
+.prayer-book-panel .section-title { color:#efe3c5; }
+.prayer-intro { padding:12px 14px; color:#c8c4b4; border-left:2px solid #b9a16b; background:#11160f; font-size:12px; line-height:1.7; }
+.prayer-form { display:grid; gap:8px; margin:15px 0 16px; }
+.prayer-form label { color:#d9c99c; font-size:10px; letter-spacing:1px; text-transform:uppercase; }
+.prayer-form input, .prayer-form textarea { display:block; width:100%; padding:10px 11px; border:1px solid #55624f; border-radius:0; background:#090e0a; color:#eee9d9; font:12px/1.55 Consolas,Monaco,"Courier New",monospace; text-transform:none; letter-spacing:0; user-select:text; -webkit-user-select:text; pointer-events:auto; }
+.prayer-form textarea { min-height:108px; resize:vertical; }
+.prayer-form input:focus, .prayer-form textarea:focus { outline:1px solid #cbb47b; border-color:#cbb47b; }
+.prayer-form input::placeholder, .prayer-form textarea::placeholder { color:#8c9688; opacity:1; }
+.prayer-template-row { display:flex; flex-wrap:wrap; gap:6px; }
+.prayer-template-row button { padding:7px 8px; font-size:9px; letter-spacing:.3px; text-transform:none; }
+.prayer-form-bottom { display:flex; flex-wrap:wrap; align-items:center; gap:9px; }
+.prayer-form-bottom button { min-width:145px; }
+.prayer-status { min-height:32px; flex:1 1 220px; color:#c8d1bc; font-size:10px; line-height:1.5; }
+.prayer-storage-note { margin:6px 0 12px; color:#879584; font-size:9px; line-height:1.5; }
+.prayer-feed { display:grid; gap:8px; margin:10px 0 4px; }
+.prayer-empty { padding:15px 12px; border:1px dashed #4d5848; color:#8f9b8b; text-align:center; font-size:11px; line-height:1.7; }
+.prayer-entry { padding:11px 12px; border:1px solid #3e4a3d; border-left:2px solid #9f9065; background:linear-gradient(120deg,#11170f,#090d09); }
+.prayer-entry-head { display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:7px; margin-bottom:5px; color:#e0d1a7; font-size:10px; }
+.prayer-entry time { color:#7f8d7d; font-size:9px; }
+.prayer-entry-message { color:#c9d0c1; font-size:11px; line-height:1.7; white-space:pre-wrap; overflow-wrap:anywhere; user-select:text; }
+.prayer-honeypot { position:absolute!important; left:-10000px!important; width:1px!important; height:1px!important; opacity:0!important; }
+@media(max-width:760px) { .memorial-photo-row { gap:5px; } .memorial-photo { min-height:73px; font-size:8px; } .memorial-photo strong { font-size:20px; } .memorial-home p { font-size:10px; } .prayer-form textarea { min-height:95px; } .prayer-form-bottom button { width:100%; } }
 .section-title {
   margin: 7px 0 12px;
   color: #e8e2ce;
@@ -1265,41 +1272,6 @@ body.hunting #survivorLocator{opacity:0}
 @keyframes realityPulse{0%{opacity:.17;clip-path:inset(0 0 90% 0)}25%{opacity:.55;clip-path:inset(26% 0 62% 0)}50%{opacity:.12;clip-path:inset(58% 0 28% 0)}75%{opacity:.44;clip-path:inset(84% 0 8% 0)}100%{opacity:.2;clip-path:inset(10% 0 80% 0)}}
 @media(max-width:650px){#huntBanner{top:8px;font-size:9px;padding:8px 9px;max-width:94vw}#huntBanner small{font-size:8px}.radio-breach-choices{grid-template-columns:1fr}.radio-breach-choices button{min-height:56px}}
 
-
-#partnerChat{display:none!important;visibility:hidden!important;pointer-events:none!important}
-#driveLaneHUD{display:none!important}
-.account-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:16px 0}
-.account-card{border:1px solid #3c4a3b;background:#080d09;padding:14px;min-width:0}
-.account-card h3{margin:0 0 10px;color:#d7c698;font-size:12px;letter-spacing:1px}
-.account-field{display:grid;gap:5px;margin:10px 0;color:#b7c1b2;font-size:10px}
-.account-field input,.account-field select{width:100%;min-width:0;padding:11px;border:1px solid #475545;background:#030604;color:#ece9d9;text-transform:none;letter-spacing:0;outline:none}
-.account-actions{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
-.account-actions button{flex:1;min-width:135px;font-size:9px;padding:10px}
-.account-status{min-height:24px;color:#d7c89b;font-size:11px;line-height:1.6;white-space:pre-line}
-.account-status.error{color:#ef8c85}
-.account-list{display:grid;gap:6px;max-height:240px;overflow:auto}
-.account-row{padding:9px;border:1px solid #2d382d;background:#050805;color:#c5cfbe;font-size:10px;line-height:1.6;display:flex;justify-content:space-between;gap:12px}
-.account-row b{color:#e5d8b5}
-.account-badge{display:inline-block;padding:3px 6px;border:1px solid #53694c;color:#bbd8a8;font-size:9px;letter-spacing:1px}
-.account-badge.staff{color:#f2d59a;border-color:#8b7145}
-.archive-panel{width:min(980px,96vw)}
-.archive-search{width:100%;margin:9px 0 14px;padding:12px;border:1px solid #52634f;background:#020503;color:#f0eedf;text-transform:none;letter-spacing:0}
-.archive-entries{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;max-height:54vh;overflow:auto;padding:2px}
-.archive-entry{padding:12px;border:1px solid #3d4738;background:linear-gradient(150deg,#111910,#050705);text-align:left}
-.archive-entry.locked{border-color:#2c302a;filter:saturate(.4);opacity:.65}
-.archive-entry h3{margin:0 0 8px;color:#d9cba3;font-size:11px;line-height:1.45}
-.archive-entry p{margin:7px 0;color:#aab5a7;font-size:10px;line-height:1.65;white-space:pre-wrap}
-.archive-entry small{display:block;color:#7d8a79;letter-spacing:1px;font-size:8px;margin-bottom:5px}
-.account-tribute{border-left:3px solid #c7b783;background:#17170f;padding:12px 14px;margin:14px 0;color:#d6ceb8;line-height:1.8;font-size:11px}
-.tombstone-marker{pointer-events:none}
-@media(max-width:720px){.account-grid{grid-template-columns:1fr}.archive-entries{grid-template-columns:1fr}.account-actions button{min-width:100px}}
-
-
-.memorial-prayer-home{border-top:1px solid #494331;padding-top:9px;color:#c9c1a9!important;font-style:italic}
-.memorial-prayer{border:1px solid #655c43;background:#080b07;padding:17px;margin:15px 0;color:#d9d0b8;line-height:1.95;font-size:12px}
-.memorial-prayer h3{margin:0 0 8px;color:#ead9ad;font-size:12px;letter-spacing:1.5px}
-.tombstone-help{color:#d5c8a1;font-size:9px;letter-spacing:1px;text-align:center}
-
 </style>
 </head>
 <body>
@@ -1408,7 +1380,7 @@ body.hunting #survivorLocator{opacity:0}
           <button id="controlsBtn">Control mode</button>
           <button id="howBtn">How to play</button>
           <button id="creditsBtn">Credits</button>
-          <button id="accountBtn">Accounts · Cloud Saves</button>
+          <button id="prayersBtn">✦ Send a Prayer</button>
           <button id="disclaimerBtn">Horror & privacy disclaimer</button>
         </div>
         <section class="memorial-home" aria-label="In loving memory of Yumi's grandfather">
@@ -1416,7 +1388,7 @@ body.hunting #survivorLocator{opacity:0}
           <div class="memorial-icons" aria-label="His loves"><span>✈ PLANES</span><span>▰ CARS</span><span>▣ PHOTOGRAPHY</span></div>
           <p>He was a great man who lived a long, full life. His passing came suddenly in the early morning, but the things he loved and the memories he leaves behind will continue to matter. May the journeys he admired, the photographs he treasured, and the stories he shared bring comfort to everyone who loves him.</p>
           <span class="memorial-signoff">With heartfelt sympathy to Yumi and her family. May he rest in peace.</span>
-          <p class="memorial-prayer-home"><em>May God welcome him into peace, comfort Yumi and everyone who loves him, and let the memories gathered in photographs become a source of warmth when grief feels heavy.</em></p>
+          <button type="button" id="openPrayerBook" class="prayer-open-button">✦ LEAVE A PRAYER FOR YUMI AND HER FAMILY</button>
         </section>
         <div class="pc-hint">THE SEVENTH ARRIVAL · SCREAM JAM 2026 · HEADPHONES RECOMMENDED</div>
       </div>
@@ -1427,47 +1399,6 @@ body.hunting #survivorLocator{opacity:0}
     </div>
   </div>
 </div>
-
-<div id="accountPanel" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="accountPanelTitle">
-  <div class="panel">
-    <div class="kicker">Persistent identity · MongoDB cloud services</div>
-    <h2 id="accountPanelTitle" class="section-title">Accounts & Cloud Saves</h2>
-    <p class="intro">Create a player account to keep save slots, achievements, and leaderboard scores between devices. The browser game remains playable if the database is temporarily unavailable.</p>
-    <div class="account-tribute"><b>STAFF ACCOUNT SETUP</b><br>The initial staff username is <strong>26-0054</strong>. The staff password is read securely from the server environment variable <code>STAFF_PASSWORD</code>; it is not embedded in this source file. Configure MongoDB and the environment variables in Render before logging in.</div>
-    <div class="account-grid">
-      <section class="account-card">
-        <h3>PLAYER / STAFF SIGN-IN</h3>
-        <label class="account-field">Username<input id="accountUsername" name="username" maxlength="24" autocomplete="username" placeholder="Username"></label>
-        <label class="account-field">Password<input id="accountPassword" name="password" type="password" maxlength="128" autocomplete="current-password" placeholder="Password"></label>
-        <div class="account-actions"><button id="accountLogin">Sign in</button><button id="accountRegister">Create player account</button><button id="accountLogout" class="hidden">Sign out</button></div>
-        <div id="accountStatus" class="account-status" aria-live="polite">Connecting to account service…</div>
-        <div id="accountIdentity" class="account-tribute hidden"></div>
-      </section>
-      <section class="account-card">
-        <h3>CLOUD SAVE SLOTS</h3>
-        <label class="account-field">Save slot<select id="cloudSaveSlot"><option value="1">Slot 1 · Primary case</option><option value="2">Slot 2 · Alternate case</option><option value="3">Slot 3 · Challenge run</option></select></label>
-        <div class="account-actions"><button id="cloudSaveButton" disabled>Save current progress</button><button id="cloudLoadButton" disabled>Load selected slot</button><button id="cloudRefreshButton">Refresh data</button></div>
-        <div id="cloudSaveList" class="account-list"><div class="account-row">Sign in to view your saved cases.</div></div>
-      </section>
-      <section class="account-card">
-        <h3>LEADERBOARD</h3>
-        <div id="leaderboardList" class="account-list"><div class="account-row">Leaderboard loads from MongoDB.</div></div>
-      </section>
-      <section class="account-card">
-        <h3>ACHIEVEMENTS</h3>
-        <div id="achievementList" class="account-list"><div class="account-row">Achievements are awarded when you save a qualifying run.</div></div>
-      </section>
-    </div>
-    <section id="staffConsole" class="account-card hidden">
-      <h3>STAFF CONSOLE · SERVER-SIDE ROLE REQUIRED</h3>
-      <p class="intro">Account totals and operational counts are returned by a protected staff-only API route. Password hashes and player passwords are never displayed.</p>
-      <div class="account-actions"><button id="staffRefreshButton">Refresh staff overview</button></div>
-      <div id="staffOverview" class="account-list"><div class="account-row">Staff overview is locked until a staff account signs in.</div></div>
-    </section>
-    <div class="page-buttons"><button id="backAccount">Return</button></div>
-  </div>
-</div>
-
 <div id="characterPanel" class="overlay hidden">
   <div class="panel">
     <div class="kicker">Personnel records</div>
@@ -1510,7 +1441,6 @@ body.hunting #survivorLocator{opacity:0}
       <div class="rule"><b>08 / BREAK THE SIGNAL</b>Optional: destroy the black signal seals in the County Police Station, Pine Rest Motel, and St. Mercy Chapel. They weaken the mimic network and unlock a true-ending variation.</div>
       <div class="rule"><b>09 / SEARCH BUILDINGS</b>Press E at doors. Search five different buildings, and check rooms again: items may vanish when you look away. Important mission keys remain recoverable.</div>
       <div class="rule"><b>10 / ESCAPE</b>Rescue both survivors, recover and study six clues, generate four distinct cross-reference reports, defend the theory, recover the relay override key, search five buildings, save Silas Venn’s statement, then survive the 30-second extraction defense.</div>
-      <div class="rule"><b>12 / THE BLACK LEDGER</b>Press K during a case or open it from the case file. Hundreds of sealed fiction-only records unlock as you gather clues, audit visitors, visit buildings, and survive the night.</div>
       <div class="rule"><b>11 / A MOMENT OF REMEMBRANCE</b>Optional: inside the County Police Station, look for the framed tribute along the east side of the room. Press E to read it. This quiet memorial is separate from the investigation objectives.</div>
     </div>
     <p class="intro">Search buildings for ammunition, bandages, batteries, and clues. Press J to study collected evidence, compare contradictory details, and submit a supported case theory. Inside the County Police Station, chat with six visitors, inspect their ID cards, compare their explanations with the roster, and decide who should be admitted or detained. At least five decisions must be correct; flagged files can be re-audited after studying four clues. Extraction requires both survivors, six collected and studied clues, four distinct cross-reference reports, the accepted case theory, a corroborated witness statement, a completed intake audit, the relay override key, five different buildings searched, and a 30-second holdout under attack.</p>
@@ -1526,10 +1456,6 @@ body.hunting #survivorLocator{opacity:0}
       <div><b>FLORIDA SHADOWS</b><span>STATE TROOPER HORROR FILES</span><small>Pixel horror project · Scream Jam 2026</small></div>
     </div>
     <div class="credits-lines"><b>WITH APPRECIATION TO</b><br><strong class="credit-name">Mayumi Alingarog</strong><br><span class="credit-alias">Also known as Yumi, Mimi, and Yumimi</span><p>To Mayumi Alingarog, my classmate and fellow developer: thank you for being such a helpful, kind, and respectful person. Your support, encouragement, and willingness to share this creative journey mean a lot. Your kindness makes collaboration better, and I am grateful to have you as a classmate and fellow developer.</p><p>This project is a little more special because of the people who offer encouragement along the way. Thank you for being one of them.</p></div>
-    
-    <div class="credits-lines"><b>IN LOVING MEMORY</b><br>This project also holds a quiet tribute to Yumi’s grandfather, who passed away suddenly in the early morning of October 16, 2026. He loved planes, cars, and photographs, and he lived a long life that deserves to be remembered with warmth. May the journeys he admired and the moments he treasured continue to bring comfort to Yumi and her family. May he rest in peace.</div>
-    <div class="credits-lines"><b>A PRAYER FOR HIS PEACE AND THEIR COMFORT</b><br>May God receive him with mercy, grant him rest, and surround Yumi and her family with patience and love. May their sadness be met with gentle company, their memories remain precious, and their hearts be given room to heal at their own pace. Amen.</div>
-
     <div class="credits-lines"><b>TO EVERYONE WHO PLAYS</b><br>Thank you for stepping into the swamp, investigating the case, and helping bring this horror story to life. Keep exploring, keep creating, and never ignore strange sounds on the radio.</div>
     <div class="info-card credits-quote">“Every mystery leaves a trace. Every crime leaves a shadow. And some shadows are always watching.”</div>
     <div class="page-buttons"><button id="backCredits">Return to menu</button></div>
@@ -1549,16 +1475,36 @@ body.hunting #survivorLocator{opacity:0}
       <p>He loved planes, cars, and photographs—the journeys they represented, the details worth noticing, and the moments worth keeping. He lived a long life and was a great man. A sudden goodbye cannot take away the years he lived, the memories he made, or the love that remains.</p>
       <p>May every photograph bring back a story, every passing plane remind those who loved him of the wonder he saw in the world, and every memory make the loss a little gentler with time. May he rest in peace.</p>
     </div>
-    
-    <div class="memorial-prayer">
-      <h3>A PRAYER FOR YUMI’S LOLO</h3>
-      <p>God of compassion, please welcome him into Your peace. Thank You for the long life he lived, the journeys he loved, the cars he admired, and the photographs that helped keep precious moments close.</p>
-      <p>Hold Yumi and her family gently through the shock of a sudden goodbye. Give them rest when they are tired, comfort when memories arrive unexpectedly, and people who will sit beside them when words are not enough. Remind them that grief does not have a timetable and that they do not have to be strong every moment.</p>
-      <p>May his years be remembered with gratitude, may the stories he left behind continue to be shared, and may the love he gave remain a blessing. Grant him eternal rest and let perpetual light shine upon him. Amen.</p>
-    </div>
-
     <p class="memorial-note">This is a quiet tribute offered with respect and sympathy to Yumi and her family. It is not evidence in the case, and nothing here is meant to turn their loss into a scare.</p>
     <div class="page-buttons"><button id="closeMemorial">Leave the memory in peace</button></div>
+  </div>
+</div>
+<div id="prayersPanel" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="prayerBookTitle">
+  <div class="panel prayer-book-panel">
+    <div class="kicker">A space for kindness and remembrance</div>
+    <h2 id="prayerBookTitle" class="section-title">Prayer & Remembrance Book</h2>
+    <p class="prayer-intro">Leave a prayer, a kind thought, or a few words of remembrance for Yumi and her family as they grieve the sudden loss of her grandfather. You do not need perfect words. A short, sincere message is enough.</p>
+    <div class="prayer-template-row" aria-label="Optional prayer starters">
+      <button type="button" data-prayer-template="May he rest in peace. May Yumi and her family find comfort, strength, and gentle moments of peace in the memories they shared.">A prayer for peace</button>
+      <button type="button" data-prayer-template="May Yumi feel surrounded by kindness and patience. May she have space to grieve and people who will listen when she needs them.">A prayer for strength</button>
+      <button type="button" data-prayer-template="Thank you for the life he lived, the journeys he loved, and the memories he left behind. May those memories continue to bring warmth to the people who miss him.">A prayer of remembrance</button>
+    </div>
+    <form id="prayerForm" class="prayer-form" autocomplete="off">
+      <label for="prayerName">Your name or nickname (optional)</label>
+      <input id="prayerName" name="name" type="text" maxlength="32" placeholder="Anonymous is okay" autocomplete="nickname">
+      <label for="prayerMessage">Your prayer or message</label>
+      <textarea id="prayerMessage" name="message" minlength="3" maxlength="600" required placeholder="Write a kind thought, prayer, or message for Yumi and her family…"></textarea>
+      <label class="prayer-honeypot" aria-hidden="true" for="prayerWebsite">Leave this field empty</label>
+      <input class="prayer-honeypot" id="prayerWebsite" name="website" tabindex="-1" autocomplete="off" aria-hidden="true">
+      <div class="prayer-form-bottom">
+        <button id="sendPrayerButton" type="submit">Send Prayer</button>
+        <div id="prayerStatus" class="prayer-status" role="status" aria-live="polite">Your message can be anonymous. Please share only kind words and do not include private contact details.</div>
+      </div>
+    </form>
+    <div class="kicker">Messages of support</div>
+    <p id="prayerStorageNote" class="prayer-storage-note">Loading the remembrance book…</p>
+    <div id="prayerFeed" class="prayer-feed" aria-live="polite"><div class="prayer-empty">Loading prayers…</div></div>
+    <div class="page-buttons"><button id="backPrayers" type="button">Return to homepage</button></div>
   </div>
 </div>
 <div id="objectivePanel" class="overlay hidden">
@@ -1584,23 +1530,9 @@ body.hunting #survivorLocator{opacity:0}
     <div class="page-buttons"><button id="submitTheory">Submit case theory</button></div>
     <h3 class="section-title" style="font-size:17px;margin-top:24px">Disappearance log</h3>
     <div id="missingLog" class="info-card">Nothing has gone missing yet. Keep track of the scene.</div>
-    <div class="account-actions"><button id="openBlackLedger">OPEN BLACK LEDGER · SECRET ARCHIVES [K]</button></div>
     <div class="page-buttons"><button id="closeObjectives">Close case file</button></div>
   </div>
 </div>
-
-<div id="archivePanel" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="archivePanelTitle">
-  <div class="panel archive-panel">
-    <div class="kicker">Recovered material · FS-07 restricted archive</div>
-    <h2 id="archivePanelTitle" class="section-title">THE BLACK LEDGER</h2>
-    <p class="intro">Every record is fictional case lore. More files unlock through field evidence, forensic study, suspect screening, building exploration, signal anchors, and surviving hunts. Locked files remain redacted until the investigation earns access.</p>
-    <div id="archiveProgressText" class="account-tribute">ARCHIVE ACCESS: 0 / 260 FILES</div>
-    <input id="archiveSearch" class="archive-search" type="search" placeholder="Search unlocked files by title, source, or anomaly…" autocomplete="off">
-    <div id="archiveEntries" class="archive-entries"></div>
-    <div class="page-buttons"><button id="closeArchives">Return to case file</button></div>
-  </div>
-</div>
-
 <div id="interviewPanel" class="overlay hidden">
   <div class="witness-frame">
     <section class="witness-camera">
@@ -1715,8 +1647,7 @@ Awaiting database query.</div>
     <div class="kicker">Patrol interrupted</div>
     <h2 class="section-title">Paused</h2>
     <p class="intro">The swamp is still there when you return.</p>
-    <div class="page-buttons"><button id="resume">Resume patrol</button><button id="pauseObjectives">Case file</button><button id="accountFromPause">Accounts · Cloud Saves</button>
-      <button id="pauseMenu">Abandon patrol</button></div>
+    <div class="page-buttons"><button id="resume">Resume patrol</button><button id="pauseObjectives">Case file</button><button id="pauseMenu">Abandon patrol</button></div>
   </div>
 </div>
 
@@ -1928,9 +1859,7 @@ const state={
   realityPulseCooldown:0,
   realityPulseCount:0,
   lastRealityRoom:'',
-  memorialTributeViewed:false,
-  memorialSource:'',
-  smilerCondolenceDone:false
+  memorialTributeViewed:false
 };
 let W=innerWidth;
 let H=innerHeight;
@@ -1964,10 +1893,6 @@ let fireflies=[];
 let decals=[];
 let interiorProps=[];
 let camera={x:0,y:0};
-let accountReturnScreen='menu';
-let currentAccount=null;
-let currentArchiveQuery='';
-let archiveReturnScreen='game';
 let keys={};
 let pointer={x:W/2,y:H/2,down:false};
 let touchRun=false;
@@ -2030,6 +1955,7 @@ function setScreen(name){
     controls:'controlsPanel',
     how:'howPanel',
     credits:'creditsPanel',
+    prayers:'prayersPanel',
     objectives:'objectivePanel',
     memorial:'memorialPanel',
     inventory:'inventoryPanel',
@@ -2037,14 +1963,12 @@ function setScreen(name){
     ending:'endingPanel',
     radio:'radioPanel',
     interview:'interviewPanel',
-    stationIntake:'stationIntakePanel',
-    account:'accountPanel',
-    archives:'archivePanel'
+    stationIntake:'stationIntakePanel'
   };
   for(const id of Object.values(mapping))$(id).classList.add('hidden');
   const suspectZoom=$('suspectZoomPanel');if(suspectZoom)suspectZoom.classList.add('hidden');
   if(mapping[name])$(mapping[name]).classList.remove('hidden');
-  if(name==='menu'||name==='character'||name==='controls'||name==='how'||name==='credits'||name==='account'){
+  if(name==='menu'||name==='character'||name==='controls'||name==='how'||name==='credits'||name==='prayers'){
     state.running=false;
     document.body.classList.remove('game-active');
   }
@@ -2500,8 +2424,7 @@ function makeObjects(){
     {id:'ammo1',x:1010,y:805,type:'loot',name:'Ammunition box',loot:'ammo',found:false,icon:'▪'},
     {id:'battery1',x:1525,y:520,type:'loot',name:'Flashlight batteries',loot:'battery',found:false,icon:'ϟ'},
     {id:'ammo2',x:2225,y:1590,type:'loot',name:'Emergency ammo pouch',loot:'ammo',found:false,icon:'▪'},
-    {id:'exit',x:2920,y:2300,type:'exit',name:'Emergency extraction beacon',detail:'A portable emergency beacon awaits a completed case file and the relay override key.',icon:'✦'},
-    {id:'tribute-tombstone',x:520,y:860,type:'memorial',name:'Quiet memorial stone — In Loving Memory',detail:'A respectful memorial for Yumi’s grandfather. The stone is a place to pause, pray, and remember the planes he loved, the cars he admired, and the photographs that preserved his life’s small wonders.'}
+    {id:'exit',x:2920,y:2300,type:'exit',name:'Emergency extraction beacon',detail:'A portable emergency beacon awaits a completed case file and the relay override key.',icon:'✦'}
   ];
   survivors=[
     {id:'ana',x:1110,y:660,name:'Mara',found:false,following:false,delivered:false,hp:1,dialogue:'Please, please get me out of here. It keeps calling from the trees.'},
@@ -2648,7 +2571,7 @@ function resetGame(){
   bullets=[];
   particles=[];
   crawlers=[];
-  for(let i=0;i<2;i++){
+  for(let i=0;i<5;i++){
     crawlers.push({x:760+i*410,y:420+(i%3)*450,r:9,hp:2,speed:70+Math.random()*15,phase:Math.random()*8,alert:false,attack:0,dead:false,hiddenUntil:14});
   }
   monster={x:2800,y:2080,r:15,stun:0,phase:0,active:false,spotted:false,attack:0,lastMove:0,warpCooldown:0,hidden:false,vanishTimer:0,vanishCooldown:4.5+Math.random()*3.4,activeTime:0,pendingX:0,pendingY:0,reappearGlow:0,blinkCount:0};
@@ -2757,7 +2680,7 @@ function applyControlMode(){
   $('mobileMode').classList.toggle('selected',state.pendingMode==='mobile');
 }
 function activeOverlay(){
-  return ['menu','character','controls','how','credits','objectives','inventory','pause','ending','radio','account','archives'].includes(state.screen);
+  return ['menu','character','controls','how','credits','objectives','inventory','pause','ending','radio'].includes(state.screen);
 }
 function setPrologueStage(stage){
   state.prologueStage=stage;
@@ -2829,17 +2752,6 @@ function addPartnerMessage(message,side='incoming'){
   while(box.children.length>5)box.removeChild(box.firstElementChild);
   box.scrollTop=box.scrollHeight;
   state.partnerChatCount++;
-  if(side!=='outgoing'){
-    const subtitle=$('voiceSubtitle');
-    const words=$('voiceWords');
-    const senderLabel=$('voiceWho');
-    if(subtitle&&words&&senderLabel){
-      words.textContent='“'+message+'”';
-      senderLabel.textContent=(side==='unknown'?'UNVERIFIED RADIO VOICE':partnerOfficerName().toUpperCase())+' · RADIO';
-      subtitle.className='active '+(side==='unknown'?'right':'center');
-      state.voiceCaptionTimer=Math.max(2.6,Math.min(5.5,message.length*.038));
-    }
-  }
 }
 function partnerExchange(key,incoming,outgoing){
   if(state.partnerSent[key])return;
@@ -3581,7 +3493,6 @@ function interact(){
   }
   if(target.type==='memorial'){
     state.memorialTributeViewed=true;
-    state.memorialSource=target.id==='tribute-tombstone'?'tombstone':'station-frame';
     enterScreen('memorial');
     return;
   }
@@ -3756,7 +3667,7 @@ function spawnCrawlerWave(count=2,minRadius=180,speedBase=92,hp=2){
   if(state.anchorsDisabled&&state.extractionStarted)count=Math.max(1,count-1);
   let alive=crawlers.filter(c=>!c.dead).length;
   let made=0;
-  for(let i=0;i<count&&alive<5;i++){
+  for(let i=0;i<count&&alive<10;i++){
     const angle=(Math.PI*2*i/Math.max(1,count))+Math.random()*.55;
     const radius=minRadius+Math.random()*70;
     let x=clamp(player.x+Math.cos(angle)*radius,70,WORLD.w-70);
@@ -4349,7 +4260,7 @@ function closeOverlay(){
   state.paused=false;
   state.running=true;
   state.screen='game';
-  for(const id of ['objectivePanel','inventoryPanel','pausePanel','radioPanel','interviewPanel','stationIntakePanel','suspectZoomPanel','memorialPanel','archivePanel'])$(id).classList.add('hidden');
+  for(const id of ['objectivePanel','inventoryPanel','pausePanel','radioPanel','interviewPanel','stationIntakePanel','suspectZoomPanel','memorialPanel'])$(id).classList.add('hidden');
   $('hud').style.display='block';
   document.body.classList.add('game-active');
   state.lastFrame=performance.now();
@@ -6093,38 +6004,6 @@ function drawLoot(o){
   px(x-5,y-4,10,7,'#b09b67');
   px(x-3,y-2,6,3,pulse?'#e8d49b':'#7e764f');
 }
-
-function drawMemorialTombstone(o){
-  const x=o.x-camera.x+shakeX;
-  const y=o.y-camera.y+shakeY;
-  if(x<-85||y<-90||x>W+85||y>H+90)return;
-  const halo=.16+.07*Math.sin(state.elapsed*.55);
-  ctx.save();
-  ctx.globalCompositeOperation='screen';
-  const glow=ctx.createRadialGradient(x,y-11,2,x,y-11,55);
-  glow.addColorStop(0,'rgba(218,198,145,'+halo+')');
-  glow.addColorStop(1,'rgba(0,0,0,0)');
-  ctx.fillStyle=glow;
-  ctx.fillRect(x-58,y-67,116,112);
-  ctx.restore();
-  px(x-20,y+15,40,5,'#10120d');
-  px(x-14,y-27,28,43,'#292c25');
-  px(x-12,y-32,24,9,'#34362c');
-  px(x-10,y-24,20,35,'#817b65');
-  px(x-8,y-21,16,28,'#3f4438');
-  px(x-2,y-17,4,11,'#cabb91');
-  px(x-6,y-13,12,3,'#cabb91');
-  px(x-7,y+1,14,2,'#b7ad8e');
-  px(x-7,y+6,14,2,'#b7ad8e');
-  ctx.fillStyle='#d9cda9';
-  ctx.font='bold 7px monospace';
-  ctx.textAlign='center';
-  ctx.fillText('IN MEMORY',x,y+28);
-  ctx.fillStyle='#a4b496';
-  ctx.font='8px monospace';
-  ctx.fillText('PRESS E',x,y+39);
-}
-
 function drawExit(o){
   const x=o.x-camera.x;
   const y=o.y-camera.y;
@@ -6593,7 +6472,6 @@ function drawWorld(){
     if(o.type==='evidence')drawEvidence(o);
     if(o.type==='loot')drawLoot(o);
     if(o.type==='exit')drawExit(o);
-    if(o.type==='memorial')drawMemorialTombstone(o);
   }
   drawSurvivors();
   for(const c of crawlers)drawCrawler(c);
@@ -7444,6 +7322,82 @@ function drawPortraits(){
     }
   });
 }
+function renderPrayerFeed(prayers){
+  const feed=$('prayerFeed');
+  feed.replaceChildren();
+  if(!Array.isArray(prayers)||!prayers.length){
+    const empty=document.createElement('div');
+    empty.className='prayer-empty';
+    empty.textContent='No prayers have been shared yet. You can leave the first kind words here.';
+    feed.appendChild(empty);
+    return;
+  }
+  for(const item of prayers.slice(0,20)){
+    const card=document.createElement('article');
+    card.className='prayer-entry';
+    const head=document.createElement('div');
+    head.className='prayer-entry-head';
+    const name=document.createElement('strong');
+    name.textContent=String(item.name||'Anonymous').slice(0,32);
+    const time=document.createElement('time');
+    const raw=String(item.created_at||'');
+    const date=new Date(raw);
+    time.textContent=Number.isNaN(date.getTime())?'A message of remembrance':date.toLocaleString();
+    head.append(name,time);
+    const message=document.createElement('div');
+    message.className='prayer-entry-message';
+    message.textContent=String(item.message||'').slice(0,600);
+    card.append(head,message);
+    feed.appendChild(card);
+  }
+}
+async function loadPrayers(){
+  const note=$('prayerStorageNote');
+  const feed=$('prayerFeed');
+  if(!note||!feed)return;
+  try{
+    const response=await fetch('/api/prayers',{headers:{'Accept':'application/json'},cache:'no-store'});
+    const data=await response.json();
+    if(!response.ok)throw new Error(data.error||'Could not load prayers.');
+    renderPrayerFeed(data.prayers||[]);
+    note.textContent=data.persistent?'Prayers are being saved to the community remembrance book.':'Temporary mode: prayers work now, but add MONGODB_URI in Render to preserve them between restarts and across all visitors.';
+  }catch(error){
+    renderPrayerFeed([]);
+    note.textContent='The prayer book could not connect just now. You can still write a message and try again.';
+  }
+}
+function openPrayerBook(){
+  setScreen('prayers');
+  loadPrayers();
+  setTimeout(()=>{const input=$('prayerMessage');if(input)input.focus({preventScroll:true});},80);
+}
+async function submitPrayer(event){
+  event.preventDefault();
+  const button=$('sendPrayerButton');
+  const status=$('prayerStatus');
+  const message=$('prayerMessage').value.trim();
+  const name=$('prayerName').value.trim();
+  const honeypot=$('prayerWebsite').value;
+  if(honeypot)return;
+  if(message.length<3){status.textContent='Please write a few kind words before sending.';$('prayerMessage').focus();return;}
+  if(message.length>600){status.textContent='Please keep your message under 600 characters.';return;}
+  button.disabled=true;
+  button.textContent='SENDING…';
+  status.textContent='Sending your prayer…';
+  try{
+    const response=await fetch('/api/prayers',{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify({name,message,website:honeypot})});
+    const data=await response.json();
+    if(!response.ok||!data.ok)throw new Error(data.error||'Your prayer could not be sent. Please try again.');
+    $('prayerMessage').value='';
+    status.textContent=data.persistent?'Your prayer has been saved. Thank you for sharing kindness with Yumi and her family.':'Your prayer was received for this running session. To keep it permanently across visits, connect MongoDB with MONGODB_URI in Render.';
+    await loadPrayers();
+  }catch(error){
+    status.textContent=error&&error.message?error.message:'The prayer could not be sent. Please check your connection and try again.';
+  }finally{
+    button.disabled=false;
+    button.textContent='Send Prayer';
+  }
+}
 function bindEvents(){
   const partnerComposer=$('partnerComposer');
   if(partnerComposer)partnerComposer.addEventListener('submit',e=>{e.preventDefault();sendPartnerChat();});
@@ -7461,19 +7415,11 @@ function bindEvents(){
   });
   $('howBtn').addEventListener('click',()=>setScreen('how'));
   $('creditsBtn').addEventListener('click',()=>setScreen('credits'));
-  $('accountBtn').addEventListener('click',()=>openAccountPanel('menu'));
-  const accountFromPause=$('accountFromPause');if(accountFromPause)accountFromPause.addEventListener('click',()=>openAccountPanel('pause'));
-  $('backAccount').addEventListener('click',closeAccountPanel);
-  $('accountLogin').addEventListener('click',loginAccount);
-  $('accountRegister').addEventListener('click',registerAccount);
-  $('accountLogout').addEventListener('click',logoutAccount);
-  $('cloudSaveButton').addEventListener('click',saveCloudSlot);
-  $('cloudLoadButton').addEventListener('click',loadCloudSlot);
-  $('cloudRefreshButton').addEventListener('click',refreshAccountData);
-  $('staffRefreshButton').addEventListener('click',loadStaffOverview);
-  $('openBlackLedger').addEventListener('click',()=>openBlackLedger('objectives'));
-  $('closeArchives').addEventListener('click',closeBlackLedger);
-  $('archiveSearch').addEventListener('input',renderBlackLedger);
+  $('prayersBtn').addEventListener('click',openPrayerBook);
+  $('openPrayerBook').addEventListener('click',openPrayerBook);
+  $('backPrayers').addEventListener('click',()=>setScreen('menu'));
+  $('prayerForm').addEventListener('submit',submitPrayer);
+  document.querySelectorAll('[data-prayer-template]').forEach(button=>button.addEventListener('click',()=>{const area=$('prayerMessage');area.value=button.dataset.prayerTemplate||'';area.focus({preventScroll:true});$('prayerStatus').textContent='You can edit this prayer before sending it.';}));
   $('backCharacter').addEventListener('click',()=>setScreen('menu'));
   $('confirmCharacter').addEventListener('click',()=>{
     state.selectedCharacter=state.pendingCharacter;
@@ -7513,21 +7459,7 @@ function bindEvents(){
   $('enableVoiceWhispers').addEventListener('change',e=>state.options.voiceWhispers=e.target.checked);
   $('objectiveToggle').addEventListener('click',openObjectives);
   $('closeObjectives').addEventListener('click',closeOverlay);
-  $('closeMemorial').addEventListener('click',()=>{
-    const fromTombstone=state.memorialSource==='tombstone';
-    closeOverlay();
-    if(fromTombstone&&!state.smilerCondolenceDone){
-      state.smilerCondolenceDone=true;
-      window.setTimeout(()=>{
-        if(!state.running||state.gameOver)return;
-        state.voiceCooldown=0;
-        const line=state.selectedCharacter==='yumi'
-          ?'Yumi… I heard about your lolo. I am sorry. You do not have to be brave every moment. Let the people who care about you stand beside you.'
-          :'Hugo… I heard about Yumi’s lolo. My condolences. You cannot erase her sadness, but you can be kind, listen, and give her time.';
-        triggerWhisper(line,'center','THE SMILER · A QUIET CONDOLENCE');
-      },1300);
-    }
-  });
+  $('closeMemorial').addEventListener('click',closeOverlay);
   $('evidenceBoard').addEventListener('click',e=>{
     const button=e.target.closest('[data-study-id]');
     if(button)studyEvidence(button.dataset.studyId);
@@ -7688,7 +7620,6 @@ function onKeyDown(e){
     openObjectives();
   }
   if(key==='i')openInventory();
-  if(key==='k'){openBlackLedger(state.screen==='objectives'?'objectives':'game');return;}
   if(key===' '&&state.floor==='outside')shoot();
   if(key==='q'){
     if(batteryCells>0){
@@ -7717,2925 +7648,6 @@ function loop(now){
   drawWorld();
   if(state.running)requestAnimationFrame(loop);
 }
-
-const CLASSIFIED_ARCHIVE_ENTRIES = [
-  {
-    id: "night-file-001",
-    title: "Night File 001 — Evidence Seal / Leaning Cabin",
-    category: "ROSTER",
-    unlock: 0,
-    summary: "Recovered at Leaning Cabin. The evidence seal records that the shadow crosses the room in the opposite direction from its owner. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Leaning Cabin): “The witness did not lie. The statement did.”",
-    analysis: "The absence of a witness does not mean the event did not occur. The original report describes a separate detail: the shadow crosses the room in the opposite direction from its owner.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: Leaning Cabin. Artifact type: Evidence Seal.",
-  },
-  {
-    id: "night-file-002",
-    title: "Night File 002 — Duty Roster Copy / Holding Room Two",
-    category: "STATION",
-    unlock: 0,
-    summary: "Recovered at Holding Room Two. The duty roster copy records that the camera frame contains the photographer standing behind themself. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Holding Room Two): “I locked the room from the outside. The next frame shows me locking it from within.”",
-    analysis: "Do not destroy the original. A later file may refer to this exact mark. The original report describes a separate detail: the camera frame contains the photographer standing behind themself.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: Holding Room Two. Artifact type: Duty Roster Copy.",
-  },
-  {
-    id: "night-file-003",
-    title: "Night File 003 — Badge Inspection Sheet / The upstairs landing",
-    category: "ROSTER",
-    unlock: 1,
-    summary: "Recovered at The upstairs landing. The badge inspection sheet records that the photograph contains a person who was born years after it was taken. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The upstairs landing): “Every clock was stopped at a different minute. The file listed them as synchronized.”",
-    analysis: "The safest working theory is an imitator altering the timeline and the records. The original report describes a separate detail: the photograph contains a person who was born years after it was taken.",
-    followup: "Mark the anomaly, then continue the investigation without answering the voice. Source location: The upstairs landing. Artifact type: Badge Inspection Sheet.",
-  },
-  {
-    id: "night-file-004",
-    title: "Night File 004 — Handwritten Prayer / The evidence cage",
-    category: "STATION",
-    unlock: 1,
-    summary: "Recovered at The evidence cage. The handwritten prayer records that the badge number belongs to a record marked deleted before it was created. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The evidence cage): “I heard the plane overhead, but the sky in the photograph was indoors.”",
-    analysis: "The report’s conclusion was copied from a case file that was still sealed. The original report describes a separate detail: the badge number belongs to a record marked deleted before it was created.",
-    followup: "Keep the original evidence sealed and study another independent source. Source location: The evidence cage. Artifact type: Handwritten Prayer.",
-  },
-  {
-    id: "night-file-005",
-    title: "Night File 005 — Rain Gauge Sheet / Swamp Gas Stop",
-    category: "ROSTER",
-    unlock: 2,
-    summary: "Recovered at Swamp Gas Stop. The rain gauge sheet records that the ink remains warm despite the paper being soaked. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Swamp Gas Stop): “The photograph captured a face. The person had their back to the camera.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the ink remains warm despite the paper being soaked.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: Swamp Gas Stop. Artifact type: Rain Gauge Sheet.",
-  },
-  {
-    id: "night-file-006",
-    title: "Night File 006 — Interview Notes / Mile Marker Nine",
-    category: "STATION",
-    unlock: 2,
-    summary: "Recovered at Mile Marker Nine. The interview notes records that the station map marks the same room on two separate floors. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Mile Marker Nine): “We opened the file and found tomorrow’s evidence inside.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the station map marks the same room on two separate floors.",
-    followup: "Read the related note before attempting to submit your theory. Source location: Mile Marker Nine. Artifact type: Interview Notes.",
-  },
-  {
-    id: "night-file-007",
-    title: "Night File 007 — Witness Statement / The old dispatch booth",
-    category: "ROSTER",
-    unlock: 3,
-    summary: "Recovered at The old dispatch booth. The witness statement records that a second signature appears beneath a single original signature. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The old dispatch booth): “I counted six knocks. The seventh came from inside the desk.”",
-    analysis: "The consistent detail is the number of arrivals: one more than the official count. The original report describes a separate detail: a second signature appears beneath a single original signature.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: The old dispatch booth. Artifact type: Witness Statement.",
-  },
-  {
-    id: "night-file-008",
-    title: "Night File 008 — Visitor Register / The locked generator room",
-    category: "STATION",
-    unlock: 3,
-    summary: "Recovered at The locked generator room. The visitor register records that the door sensor reports a person leaving while the room is still occupied. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The locked generator room): “The room was empty, but the chair was still slowly turning.”",
-    analysis: "The camera is not merely failing to record. It is recording a different room. The original report describes a separate detail: the door sensor reports a person leaving while the room is still occupied.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: The locked generator room. Artifact type: Visitor Register.",
-  },
-  {
-    id: "night-file-009",
-    title: "Night File 009 — Door Sensor Log / Radio Relay Hut",
-    category: "ROSTER",
-    unlock: 4,
-    summary: "Recovered at Radio Relay Hut. The door sensor log records that the witness remembers an event listed in a report not yet written. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Radio Relay Hut): “The visitor was polite. The reflection was not.”",
-    analysis: "This record is linked to at least one earlier missing-item report. The original report describes a separate detail: the witness remembers an event listed in a report not yet written.",
-    followup: "Read the related note before attempting to submit your theory. Source location: Radio Relay Hut. Artifact type: Door Sensor Log.",
-  },
-  {
-    id: "night-file-010",
-    title: "Night File 010 — Tape Index / North Culvert",
-    category: "BODYCAM",
-    unlock: 4,
-    summary: "Recovered at North Culvert. The tape index records that the recorded voice has the same cadence as the listener. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (North Culvert): “I heard someone praying in the chapel. The chapel’s microphone was unplugged.”",
-    analysis: "The discrepancy repeats after power is restored, which weakens the electrical-fault theory. The original report describes a separate detail: the recorded voice has the same cadence as the listener.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: North Culvert. Artifact type: Tape Index.",
-  },
-  {
-    id: "night-file-011",
-    title: "Night File 011 — Badge Inspection Sheet / The chapel basement",
-    category: "FORENSIC",
-    unlock: 5,
-    summary: "Recovered at The chapel basement. The badge inspection sheet records that the dust outline shows an object still present in the current photograph. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The chapel basement): “I heard the plane overhead, but the sky in the photograph was indoors.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the dust outline shows an object still present in the current photograph.",
-    followup: "Verify the identity through the roster rather than through the voice. Source location: The chapel basement. Artifact type: Badge Inspection Sheet.",
-  },
-  {
-    id: "night-file-012",
-    title: "Night File 012 — Camera Still / The storage loft",
-    category: "BODYCAM",
-    unlock: 5,
-    summary: "Recovered at The storage loft. The camera still records that the room count is larger than the building count. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The storage loft): “A whisper came through the speaker. The speaker was missing its cone.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the room count is larger than the building count.",
-    followup: "Do not confuse the apparition with the real witness in your case file. Source location: The storage loft. Artifact type: Camera Still.",
-  },
-  {
-    id: "night-file-013",
-    title: "Night File 013 — Unknown Caller Slip / St. Mercy Chapel",
-    category: "FORENSIC",
-    unlock: 6,
-    summary: "Recovered at St. Mercy Chapel. The unknown caller slip records that the paper has a dry footprint beneath a fresh water stain. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (St. Mercy Chapel): “The person asked to be admitted. The roster showed they had already been admitted.”",
-    analysis: "A duplicate identity is more likely than a second authorized unit. The original report describes a separate detail: the paper has a dry footprint beneath a fresh water stain.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: St. Mercy Chapel. Artifact type: Unknown Caller Slip.",
-  },
-  {
-    id: "night-file-014",
-    title: "Night File 014 — Interview Notes / Road Maintenance Depot",
-    category: "BODYCAM",
-    unlock: 6,
-    summary: "Recovered at Road Maintenance Depot. The interview notes records that the audio contains a response before the question is spoken. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Road Maintenance Depot): “The officer entered alone. The microphone captured two sets of boots.”",
-    analysis: "The object is real. Its provenance is impossible. The original report describes a separate detail: the audio contains a response before the question is spoken.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: Road Maintenance Depot. Artifact type: Interview Notes.",
-  },
-  {
-    id: "night-file-015",
-    title: "Night File 015 — Fingerprint Sleeve / The flooded footpath",
-    category: "FORENSIC",
-    unlock: 7,
-    summary: "Recovered at The flooded footpath. The fingerprint sleeve records that the inventory count increases after every audit. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The flooded footpath): “The room was empty, but the chair was still slowly turning.”",
-    analysis: "The sound is not an echo. It contains a new word that was never spoken aloud. The original report describes a separate detail: the inventory count increases after every audit.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: The flooded footpath. Artifact type: Fingerprint Sleeve.",
-  },
-  {
-    id: "night-file-016",
-    title: "Night File 016 — Bodycam Cassette / The infirmary",
-    category: "BODYCAM",
-    unlock: 7,
-    summary: "Recovered at The infirmary. The bodycam cassette records that the timestamp moves backward whenever the page is turned. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The infirmary): “I wrote the report after the event. The report is dated before it.”",
-    analysis: "The room layout is stable; the recorded route is what changes. The original report describes a separate detail: the timestamp moves backward whenever the page is turned.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: The infirmary. Artifact type: Bodycam Cassette.",
-  },
-  {
-    id: "night-file-017",
-    title: "Night File 017 — Door Sensor Log / Pine Rest Motel",
-    category: "FORENSIC",
-    unlock: 8,
-    summary: "Recovered at Pine Rest Motel. The door sensor log records that the shadow crosses the room in the opposite direction from its owner. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Pine Rest Motel): “The badge was genuine. The officer wearing it was not on the roster.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the shadow crosses the room in the opposite direction from its owner.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: Pine Rest Motel. Artifact type: Door Sensor Log.",
-  },
-  {
-    id: "night-file-018",
-    title: "Night File 018 — Medical Intake Form / Last Stop Diner",
-    category: "BODYCAM",
-    unlock: 8,
-    summary: "Recovered at Last Stop Diner. The medical intake form records that the camera frame contains the photographer standing behind themself. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Last Stop Diner): “The car in the picture has no driver. Its shadow has someone at the wheel.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the camera frame contains the photographer standing behind themself.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: Last Stop Diner. Artifact type: Medical Intake Form.",
-  },
-  {
-    id: "night-file-019",
-    title: "Night File 019 — Night Roster / The east hallway",
-    category: "FORENSIC",
-    unlock: 9,
-    summary: "Recovered at The east hallway. The night roster records that the photograph contains a person who was born years after it was taken. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The east hallway): “A whisper came through the speaker. The speaker was missing its cone.”",
-    analysis: "Do not use the timestamp alone. Two independent records repeat the same contradiction. The original report describes a separate detail: the photograph contains a person who was born years after it was taken.",
-    followup: "Mark the anomaly, then continue the investigation without answering the voice. Source location: The east hallway. Artifact type: Night Roster.",
-  },
-  {
-    id: "night-file-020",
-    title: "Night File 020 — Camera Still / The ranger trail",
-    category: "FIELD NOTE",
-    unlock: 9,
-    summary: "Recovered at The ranger trail. The camera still records that the badge number belongs to a record marked deleted before it was created. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The ranger trail): “I could hear rain on the roof. The weather station says there was no rain.”",
-    analysis: "This anomaly becomes more consistent when the flashlight is turned away. The original report describes a separate detail: the badge number belongs to a record marked deleted before it was created.",
-    followup: "Keep the original evidence sealed and study another independent source. Source location: The ranger trail. Artifact type: Camera Still.",
-  },
-  {
-    id: "night-file-021",
-    title: "Night File 021 — Photographic Negative / Cypress Farmhouse",
-    category: "ARCHITECTURE",
-    unlock: 10,
-    summary: "Recovered at Cypress Farmhouse. The photographic negative records that the reflected figure looks toward the camera after the camera has been removed. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Cypress Farmhouse): “Please file the negative separately. The print does not show everyone.”",
-    analysis: "The physical record appears authentic; the impossible part is the event it describes. The original report describes a separate detail: the reflected figure looks toward the camera after the camera has been removed.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: Cypress Farmhouse. Artifact type: Photographic Negative.",
-  },
-  {
-    id: "night-file-022",
-    title: "Night File 022 — Maintenance Ticket / County Clinic",
-    category: "FIELD NOTE",
-    unlock: 10,
-    summary: "Recovered at County Clinic. The maintenance ticket records that the radio records a transmission during a documented power outage. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (County Clinic): “A second flashlight moved beside mine. I was holding mine with both hands.”",
-    analysis: "Cross-reference this with the bodycam and the roster before making a decision. The original report describes a separate detail: the radio records a transmission during a documented power outage.",
-    followup: "Read the related note before attempting to submit your theory. Source location: County Clinic. Artifact type: Maintenance Ticket.",
-  },
-  {
-    id: "night-file-023",
-    title: "Night File 023 — Fingerprint Sleeve / Camera Four",
-    category: "ARCHITECTURE",
-    unlock: 11,
-    summary: "Recovered at Camera Four. The fingerprint sleeve records that a second signature appears beneath a single original signature. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Camera Four): “I wrote the report after the event. The report is dated before it.”",
-    analysis: "Treat the record as evidence of sequence corruption, not a harmless clerical error. The original report describes a separate detail: a second signature appears beneath a single original signature.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: Camera Four. Artifact type: Fingerprint Sleeve.",
-  },
-  {
-    id: "night-file-024",
-    title: "Night File 024 — Dispatch Transcript / The perimeter fence",
-    category: "FIELD NOTE",
-    unlock: 11,
-    summary: "Recovered at The perimeter fence. The dispatch transcript records that the door sensor reports a person leaving while the room is still occupied. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The perimeter fence): “The desk clerk asked me to sign the visitor log. My signature was already there.”",
-    analysis: "Treat the record as evidence of sequence corruption, not a harmless clerical error. The original report describes a separate detail: the door sensor reports a person leaving while the room is still occupied.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: The perimeter fence. Artifact type: Dispatch Transcript.",
-  },
-  {
-    id: "night-file-025",
-    title: "Night File 025 — Incident Ledger / County Police Station",
-    category: "ARCHITECTURE",
-    unlock: 12,
-    summary: "Recovered at County Police Station. The incident ledger records that the witness remembers an event listed in a report not yet written. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (County Police Station): “The tape ends when the voice says my name, not when the recorder stops.”",
-    analysis: "The absence of a witness does not mean the event did not occur. The original report describes a separate detail: the witness remembers an event listed in a report not yet written.",
-    followup: "Read the related note before attempting to submit your theory. Source location: County Police Station. Artifact type: Incident Ledger.",
-  },
-  {
-    id: "night-file-026",
-    title: "Night File 026 — Medical Intake Form / Leaning Cabin",
-    category: "FIELD NOTE",
-    unlock: 12,
-    summary: "Recovered at Leaning Cabin. The medical intake form records that the recorded voice has the same cadence as the listener. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Leaning Cabin): “The seventh person waited patiently. The sixth person was the room itself.”",
-    analysis: "Do not destroy the original. A later file may refer to this exact mark. The original report describes a separate detail: the recorded voice has the same cadence as the listener.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: Leaning Cabin. Artifact type: Medical Intake Form.",
-  },
-  {
-    id: "night-file-027",
-    title: "Night File 027 — Audio Reel / Holding Room Two",
-    category: "ARCHITECTURE",
-    unlock: 13,
-    summary: "Recovered at Holding Room Two. The audio reel records that the dust outline shows an object still present in the current photograph. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Holding Room Two): “I could hear rain on the roof. The weather station says there was no rain.”",
-    analysis: "The safest working theory is an imitator altering the timeline and the records. The original report describes a separate detail: the dust outline shows an object still present in the current photograph.",
-    followup: "Verify the identity through the roster rather than through the voice. Source location: Holding Room Two. Artifact type: Audio Reel.",
-  },
-  {
-    id: "night-file-028",
-    title: "Night File 028 — Radio Frequency Chart / The upstairs landing",
-    category: "FIELD NOTE",
-    unlock: 13,
-    summary: "Recovered at The upstairs landing. The radio frequency chart records that the call sign is valid but its owner has never been assigned to this county. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The upstairs landing): “If the radio uses your own voice, do not answer in the same channel.”",
-    analysis: "The report’s conclusion was copied from a case file that was still sealed. The original report describes a separate detail: the call sign is valid but its owner has never been assigned to this county.",
-    followup: "Do not confuse the apparition with the real witness in your case file. Source location: The upstairs landing. Artifact type: Radio Frequency Chart.",
-  },
-  {
-    id: "night-file-029",
-    title: "Night File 029 — Photographic Negative / The evidence cage",
-    category: "ARCHITECTURE",
-    unlock: 14,
-    summary: "Recovered at The evidence cage. The photographic negative records that the employee photograph changes when viewed through the glass. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The evidence cage): “The footprints stopped at the wall. The wall was wet on the other side.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the employee photograph changes when viewed through the glass.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: The evidence cage. Artifact type: Photographic Negative.",
-  },
-  {
-    id: "night-file-030",
-    title: "Night File 030 — Lost Property Card / Swamp Gas Stop",
-    category: "AUDIO",
-    unlock: 14,
-    summary: "Recovered at Swamp Gas Stop. The lost property card records that the audio contains a response before the question is spoken. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Swamp Gas Stop): “The lights went out. The person at the end of the hall kept casting a shadow.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the audio contains a response before the question is spoken.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: Swamp Gas Stop. Artifact type: Lost Property Card.",
-  },
-  {
-    id: "night-file-031",
-    title: "Night File 031 — Emergency Bulletin / Mile Marker Nine",
-    category: "RADIO",
-    unlock: 15,
-    summary: "Recovered at Mile Marker Nine. The emergency bulletin records that the inventory count increases after every audit. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Mile Marker Nine): “The desk clerk asked me to sign the visitor log. My signature was already there.”",
-    analysis: "The consistent detail is the number of arrivals: one more than the official count. The original report describes a separate detail: the inventory count increases after every audit.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: Mile Marker Nine. Artifact type: Emergency Bulletin.",
-  },
-  {
-    id: "night-file-032",
-    title: "Night File 032 — Dispatch Transcript / The old dispatch booth",
-    category: "AUDIO",
-    unlock: 15,
-    summary: "Recovered at The old dispatch booth. The dispatch transcript records that the timestamp moves backward whenever the page is turned. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The old dispatch booth): “The key fit the lock. The lock insisted it had never been installed.”",
-    analysis: "The camera is not merely failing to record. It is recording a different room. The original report describes a separate detail: the timestamp moves backward whenever the page is turned.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: The old dispatch booth. Artifact type: Dispatch Transcript.",
-  },
-  {
-    id: "night-file-033",
-    title: "Night File 033 — Flashlight Test Record / The locked generator room",
-    category: "RADIO",
-    unlock: 16,
-    summary: "Recovered at The locked generator room. The flashlight test record records that the shadow crosses the room in the opposite direction from its owner. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The locked generator room): “The file was sealed. Something had already read the last page.”",
-    analysis: "This record is linked to at least one earlier missing-item report. The original report describes a separate detail: the shadow crosses the room in the opposite direction from its owner.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: The locked generator room. Artifact type: Flashlight Test Record.",
-  },
-  {
-    id: "night-file-034",
-    title: "Night File 034 — Power Interruption Log / Radio Relay Hut",
-    category: "AUDIO",
-    unlock: 16,
-    summary: "Recovered at Radio Relay Hut. The power interruption log records that the camera frame contains the photographer standing behind themself. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Radio Relay Hut): “I took one photograph. The envelope came back with three negatives.”",
-    analysis: "The discrepancy repeats after power is restored, which weakens the electrical-fault theory. The original report describes a separate detail: the camera frame contains the photographer standing behind themself.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: Radio Relay Hut. Artifact type: Power Interruption Log.",
-  },
-  {
-    id: "night-file-035",
-    title: "Night File 035 — Audio Reel / North Culvert",
-    category: "RADIO",
-    unlock: 17,
-    summary: "Recovered at North Culvert. The audio reel records that the page lists an exit before the corresponding entrance. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (North Culvert): “If the radio uses your own voice, do not answer in the same channel.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the page lists an exit before the corresponding entrance.",
-    followup: "Mark the anomaly, then continue the investigation without answering the voice. Source location: North Culvert. Artifact type: Audio Reel.",
-  },
-  {
-    id: "night-file-036",
-    title: "Night File 036 — Room Key Ledger / The chapel basement",
-    category: "AUDIO",
-    unlock: 17,
-    summary: "Recovered at The chapel basement. The room key ledger records that the voice says the next word before the speaker moves their mouth. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The chapel basement): “Every clock was stopped at a different minute. The file listed them as synchronized.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the voice says the next word before the speaker moves their mouth.",
-    followup: "Keep the original evidence sealed and study another independent source. Source location: The chapel basement. Artifact type: Room Key Ledger.",
-  },
-  {
-    id: "night-file-037",
-    title: "Night File 037 — Graveyard Inventory / The storage loft",
-    category: "RADIO",
-    unlock: 18,
-    summary: "Recovered at The storage loft. The graveyard inventory records that the reflected figure looks toward the camera after the camera has been removed. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The storage loft): “There was a second name under mine. It was written in my handwriting.”",
-    analysis: "A duplicate identity is more likely than a second authorized unit. The original report describes a separate detail: the reflected figure looks toward the camera after the camera has been removed.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: The storage loft. Artifact type: Graveyard Inventory.",
-  },
-  {
-    id: "night-file-038",
-    title: "Night File 038 — Lost Property Card / St. Mercy Chapel",
-    category: "AUDIO",
-    unlock: 18,
-    summary: "Recovered at St. Mercy Chapel. The lost property card records that the radio records a transmission during a documented power outage. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (St. Mercy Chapel): “I left the room before the alarm. The recording shows me still inside it.”",
-    analysis: "The object is real. Its provenance is impossible. The original report describes a separate detail: the radio records a transmission during a documented power outage.",
-    followup: "Read the related note before attempting to submit your theory. Source location: St. Mercy Chapel. Artifact type: Lost Property Card.",
-  },
-  {
-    id: "night-file-039",
-    title: "Night File 039 — Duty Roster Copy / Road Maintenance Depot",
-    category: "RADIO",
-    unlock: 19,
-    summary: "Recovered at Road Maintenance Depot. The duty roster copy records that a second signature appears beneath a single original signature. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Road Maintenance Depot): “The key fit the lock. The lock insisted it had never been installed.”",
-    analysis: "The sound is not an echo. It contains a new word that was never spoken aloud. The original report describes a separate detail: a second signature appears beneath a single original signature.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: Road Maintenance Depot. Artifact type: Duty Roster Copy.",
-  },
-  {
-    id: "night-file-040",
-    title: "Night File 040 — Photograph Envelope / The flooded footpath",
-    category: "PHOTOGRAPH",
-    unlock: 19,
-    summary: "Recovered at The flooded footpath. The photograph envelope records that the door sensor reports a person leaving while the room is still occupied. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The flooded footpath): “I counted six knocks. The seventh came from inside the desk.”",
-    analysis: "The room layout is stable; the recorded route is what changes. The original report describes a separate detail: the door sensor reports a person leaving while the room is still occupied.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: The flooded footpath. Artifact type: Photograph Envelope.",
-  },
-  {
-    id: "night-file-041",
-    title: "Night File 041 — Flashlight Test Record / The infirmary",
-    category: "MISSING OBJECT",
-    unlock: 20,
-    summary: "Recovered at The infirmary. The flashlight test record records that the witness remembers an event listed in a report not yet written. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The infirmary): “The witness did not lie. The statement did.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the witness remembers an event listed in a report not yet written.",
-    followup: "Read the related note before attempting to submit your theory. Source location: The infirmary. Artifact type: Flashlight Test Record.",
-  },
-  {
-    id: "night-file-042",
-    title: "Night File 042 — Rain Gauge Sheet / Pine Rest Motel",
-    category: "PHOTOGRAPH",
-    unlock: 20,
-    summary: "Recovered at Pine Rest Motel. The rain gauge sheet records that the filing date is tomorrow while the postmark is eleven years old. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Pine Rest Motel): “I locked the room from the outside. The next frame shows me locking it from within.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the filing date is tomorrow while the postmark is eleven years old.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: Pine Rest Motel. Artifact type: Rain Gauge Sheet.",
-  },
-  {
-    id: "night-file-043",
-    title: "Night File 043 — Flood Map / Last Stop Diner",
-    category: "MISSING OBJECT",
-    unlock: 21,
-    summary: "Recovered at Last Stop Diner. The flood map records that the call originated from the receiver that was physically disconnected. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Last Stop Diner): “Every clock was stopped at a different minute. The file listed them as synchronized.”",
-    analysis: "Do not use the timestamp alone. Two independent records repeat the same contradiction. The original report describes a separate detail: the call originated from the receiver that was physically disconnected.",
-    followup: "Verify the identity through the roster rather than through the voice. Source location: Last Stop Diner. Artifact type: Flood Map.",
-  },
-  {
-    id: "night-file-044",
-    title: "Night File 044 — Room Key Ledger / The east hallway",
-    category: "PHOTOGRAPH",
-    unlock: 21,
-    summary: "Recovered at The east hallway. The room key ledger records that the call sign is valid but its owner has never been assigned to this county. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The east hallway): “I heard the plane overhead, but the sky in the photograph was indoors.”",
-    analysis: "This anomaly becomes more consistent when the flashlight is turned away. The original report describes a separate detail: the call sign is valid but its owner has never been assigned to this county.",
-    followup: "Do not confuse the apparition with the real witness in your case file. Source location: The east hallway. Artifact type: Room Key Ledger.",
-  },
-  {
-    id: "night-file-045",
-    title: "Night File 045 — Visitor Register / The ranger trail",
-    category: "MISSING OBJECT",
-    unlock: 22,
-    summary: "Recovered at The ranger trail. The visitor register records that the employee photograph changes when viewed through the glass. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The ranger trail): “The photograph captured a face. The person had their back to the camera.”",
-    analysis: "The physical record appears authentic; the impossible part is the event it describes. The original report describes a separate detail: the employee photograph changes when viewed through the glass.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: The ranger trail. Artifact type: Visitor Register.",
-  },
-  {
-    id: "night-file-046",
-    title: "Night File 046 — Evidence Seal / Cypress Farmhouse",
-    category: "PHOTOGRAPH",
-    unlock: 22,
-    summary: "Recovered at Cypress Farmhouse. The evidence seal records that the audio contains a response before the question is spoken. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Cypress Farmhouse): “We opened the file and found tomorrow’s evidence inside.”",
-    analysis: "Cross-reference this with the bodycam and the roster before making a decision. The original report describes a separate detail: the audio contains a response before the question is spoken.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: Cypress Farmhouse. Artifact type: Evidence Seal.",
-  },
-  {
-    id: "night-file-047",
-    title: "Night File 047 — Duty Roster Copy / County Clinic",
-    category: "MISSING OBJECT",
-    unlock: 23,
-    summary: "Recovered at County Clinic. The duty roster copy records that the inventory count increases after every audit. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (County Clinic): “I counted six knocks. The seventh came from inside the desk.”",
-    analysis: "Treat the record as evidence of sequence corruption, not a harmless clerical error. The original report describes a separate detail: the inventory count increases after every audit.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: County Clinic. Artifact type: Duty Roster Copy.",
-  },
-  {
-    id: "night-file-048",
-    title: "Night File 048 — Badge Inspection Sheet / Camera Four",
-    category: "PHOTOGRAPH",
-    unlock: 23,
-    summary: "Recovered at Camera Four. The badge inspection sheet records that the timestamp moves backward whenever the page is turned. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Camera Four): “The room was empty, but the chair was still slowly turning.”",
-    analysis: "Treat the record as evidence of sequence corruption, not a harmless clerical error. The original report describes a separate detail: the timestamp moves backward whenever the page is turned.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: Camera Four. Artifact type: Badge Inspection Sheet.",
-  },
-  {
-    id: "night-file-049",
-    title: "Night File 049 — Handwritten Prayer / The perimeter fence",
-    category: "MISSING OBJECT",
-    unlock: 24,
-    summary: "Recovered at The perimeter fence. The handwritten prayer records that the handwriting matches an officer who has not yet joined the force. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The perimeter fence): “The visitor was polite. The reflection was not.”",
-    analysis: "The absence of a witness does not mean the event did not occur. The original report describes a separate detail: the handwriting matches an officer who has not yet joined the force.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: The perimeter fence. Artifact type: Handwritten Prayer.",
-  },
-  {
-    id: "night-file-050",
-    title: "Night File 050 — Rain Gauge Sheet / County Police Station",
-    category: "ROSTER",
-    unlock: 24,
-    summary: "Recovered at County Police Station. The rain gauge sheet records that the map scale changes only around one house. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (County Police Station): “I heard someone praying in the chapel. The chapel’s microphone was unplugged.”",
-    analysis: "Do not destroy the original. A later file may refer to this exact mark. The original report describes a separate detail: the map scale changes only around one house.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: County Police Station. Artifact type: Rain Gauge Sheet.",
-  },
-  {
-    id: "night-file-051",
-    title: "Night File 051 — Interview Notes / Leaning Cabin",
-    category: "STATION",
-    unlock: 25,
-    summary: "Recovered at Leaning Cabin. The interview notes records that the page lists an exit before the corresponding entrance. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Leaning Cabin): “I heard the plane overhead, but the sky in the photograph was indoors.”",
-    analysis: "The safest working theory is an imitator altering the timeline and the records. The original report describes a separate detail: the page lists an exit before the corresponding entrance.",
-    followup: "Mark the anomaly, then continue the investigation without answering the voice. Source location: Leaning Cabin. Artifact type: Interview Notes.",
-  },
-  {
-    id: "night-file-052",
-    title: "Night File 052 — Witness Statement / Holding Room Two",
-    category: "ROSTER",
-    unlock: 25,
-    summary: "Recovered at Holding Room Two. The witness statement records that the voice says the next word before the speaker moves their mouth. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Holding Room Two): “A whisper came through the speaker. The speaker was missing its cone.”",
-    analysis: "The report’s conclusion was copied from a case file that was still sealed. The original report describes a separate detail: the voice says the next word before the speaker moves their mouth.",
-    followup: "Keep the original evidence sealed and study another independent source. Source location: Holding Room Two. Artifact type: Witness Statement.",
-  },
-  {
-    id: "night-file-053",
-    title: "Night File 053 — Visitor Register / The upstairs landing",
-    category: "STATION",
-    unlock: 26,
-    summary: "Recovered at The upstairs landing. The visitor register records that the reflected figure looks toward the camera after the camera has been removed. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The upstairs landing): “The person asked to be admitted. The roster showed they had already been admitted.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the reflected figure looks toward the camera after the camera has been removed.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: The upstairs landing. Artifact type: Visitor Register.",
-  },
-  {
-    id: "night-file-054",
-    title: "Night File 054 — Door Sensor Log / The evidence cage",
-    category: "ROSTER",
-    unlock: 26,
-    summary: "Recovered at The evidence cage. The door sensor log records that the radio records a transmission during a documented power outage. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The evidence cage): “The officer entered alone. The microphone captured two sets of boots.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the radio records a transmission during a documented power outage.",
-    followup: "Read the related note before attempting to submit your theory. Source location: The evidence cage. Artifact type: Door Sensor Log.",
-  },
-  {
-    id: "night-file-055",
-    title: "Night File 055 — Tape Index / Swamp Gas Stop",
-    category: "STATION",
-    unlock: 27,
-    summary: "Recovered at Swamp Gas Stop. The tape index records that a second signature appears beneath a single original signature. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Swamp Gas Stop): “The room was empty, but the chair was still slowly turning.”",
-    analysis: "The consistent detail is the number of arrivals: one more than the official count. The original report describes a separate detail: a second signature appears beneath a single original signature.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: Swamp Gas Stop. Artifact type: Tape Index.",
-  },
-  {
-    id: "night-file-056",
-    title: "Night File 056 — Badge Inspection Sheet / Mile Marker Nine",
-    category: "ROSTER",
-    unlock: 27,
-    summary: "Recovered at Mile Marker Nine. The badge inspection sheet records that the negative shows seven people but the print shows six. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Mile Marker Nine): “I wrote the report after the event. The report is dated before it.”",
-    analysis: "The camera is not merely failing to record. It is recording a different room. The original report describes a separate detail: the negative shows seven people but the print shows six.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: Mile Marker Nine. Artifact type: Badge Inspection Sheet.",
-  },
-  {
-    id: "night-file-057",
-    title: "Night File 057 — Camera Still / The old dispatch booth",
-    category: "STATION",
-    unlock: 28,
-    summary: "Recovered at The old dispatch booth. The camera still records that the door opens on camera but the handle never moves. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The old dispatch booth): “The badge was genuine. The officer wearing it was not on the roster.”",
-    analysis: "This record is linked to at least one earlier missing-item report. The original report describes a separate detail: the door opens on camera but the handle never moves.",
-    followup: "Read the related note before attempting to submit your theory. Source location: The old dispatch booth. Artifact type: Camera Still.",
-  },
-  {
-    id: "night-file-058",
-    title: "Night File 058 — Unknown Caller Slip / The locked generator room",
-    category: "ROSTER",
-    unlock: 28,
-    summary: "Recovered at The locked generator room. The unknown caller slip records that the filing date is tomorrow while the postmark is eleven years old. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The locked generator room): “The car in the picture has no driver. Its shadow has someone at the wheel.”",
-    analysis: "The discrepancy repeats after power is restored, which weakens the electrical-fault theory. The original report describes a separate detail: the filing date is tomorrow while the postmark is eleven years old.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: The locked generator room. Artifact type: Unknown Caller Slip.",
-  },
-  {
-    id: "night-file-059",
-    title: "Night File 059 — Interview Notes / Radio Relay Hut",
-    category: "STATION",
-    unlock: 29,
-    summary: "Recovered at Radio Relay Hut. The interview notes records that the call originated from the receiver that was physically disconnected. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Radio Relay Hut): “A whisper came through the speaker. The speaker was missing its cone.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the call originated from the receiver that was physically disconnected.",
-    followup: "Verify the identity through the roster rather than through the voice. Source location: Radio Relay Hut. Artifact type: Interview Notes.",
-  },
-  {
-    id: "night-file-060",
-    title: "Night File 060 — Fingerprint Sleeve / North Culvert",
-    category: "FORENSIC",
-    unlock: 29,
-    summary: "Recovered at North Culvert. The fingerprint sleeve records that the call sign is valid but its owner has never been assigned to this county. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (North Culvert): “I could hear rain on the roof. The weather station says there was no rain.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the call sign is valid but its owner has never been assigned to this county.",
-    followup: "Do not confuse the apparition with the real witness in your case file. Source location: North Culvert. Artifact type: Fingerprint Sleeve.",
-  },
-  {
-    id: "night-file-061",
-    title: "Night File 061 — Bodycam Cassette / The chapel basement",
-    category: "BODYCAM",
-    unlock: 30,
-    summary: "Recovered at The chapel basement. The bodycam cassette records that the employee photograph changes when viewed through the glass. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The chapel basement): “Please file the negative separately. The print does not show everyone.”",
-    analysis: "A duplicate identity is more likely than a second authorized unit. The original report describes a separate detail: the employee photograph changes when viewed through the glass.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: The chapel basement. Artifact type: Bodycam Cassette.",
-  },
-  {
-    id: "night-file-062",
-    title: "Night File 062 — Door Sensor Log / The storage loft",
-    category: "FORENSIC",
-    unlock: 30,
-    summary: "Recovered at The storage loft. The door sensor log records that the audio contains a response before the question is spoken. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The storage loft): “A second flashlight moved beside mine. I was holding mine with both hands.”",
-    analysis: "The object is real. Its provenance is impossible. The original report describes a separate detail: the audio contains a response before the question is spoken.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: The storage loft. Artifact type: Door Sensor Log.",
-  },
-  {
-    id: "night-file-063",
-    title: "Night File 063 — Medical Intake Form / St. Mercy Chapel",
-    category: "BODYCAM",
-    unlock: 31,
-    summary: "Recovered at St. Mercy Chapel. The medical intake form records that the station map marks the same room on two separate floors. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (St. Mercy Chapel): “I wrote the report after the event. The report is dated before it.”",
-    analysis: "The sound is not an echo. It contains a new word that was never spoken aloud. The original report describes a separate detail: the station map marks the same room on two separate floors.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: St. Mercy Chapel. Artifact type: Medical Intake Form.",
-  },
-  {
-    id: "night-file-064",
-    title: "Night File 064 — Night Roster / Road Maintenance Depot",
-    category: "FORENSIC",
-    unlock: 31,
-    summary: "Recovered at Road Maintenance Depot. The night roster records that the recorded footsteps are one step ahead of the person walking. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Road Maintenance Depot): “The desk clerk asked me to sign the visitor log. My signature was already there.”",
-    analysis: "The room layout is stable; the recorded route is what changes. The original report describes a separate detail: the recorded footsteps are one step ahead of the person walking.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: Road Maintenance Depot. Artifact type: Night Roster.",
-  },
-  {
-    id: "night-file-065",
-    title: "Night File 065 — Camera Still / The flooded footpath",
-    category: "BODYCAM",
-    unlock: 32,
-    summary: "Recovered at The flooded footpath. The camera still records that the handwriting matches an officer who has not yet joined the force. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The flooded footpath): “The tape ends when the voice says my name, not when the recorder stops.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the handwriting matches an officer who has not yet joined the force.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: The flooded footpath. Artifact type: Camera Still.",
-  },
-  {
-    id: "night-file-066",
-    title: "Night File 066 — Photographic Negative / The infirmary",
-    category: "FORENSIC",
-    unlock: 32,
-    summary: "Recovered at The infirmary. The photographic negative records that the map scale changes only around one house. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The infirmary): “The seventh person waited patiently. The sixth person was the room itself.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the map scale changes only around one house.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: The infirmary. Artifact type: Photographic Negative.",
-  },
-  {
-    id: "night-file-067",
-    title: "Night File 067 — Maintenance Ticket / Pine Rest Motel",
-    category: "BODYCAM",
-    unlock: 33,
-    summary: "Recovered at Pine Rest Motel. The maintenance ticket records that the page lists an exit before the corresponding entrance. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Pine Rest Motel): “I could hear rain on the roof. The weather station says there was no rain.”",
-    analysis: "Do not use the timestamp alone. Two independent records repeat the same contradiction. The original report describes a separate detail: the page lists an exit before the corresponding entrance.",
-    followup: "Mark the anomaly, then continue the investigation without answering the voice. Source location: Pine Rest Motel. Artifact type: Maintenance Ticket.",
-  },
-  {
-    id: "night-file-068",
-    title: "Night File 068 — Fingerprint Sleeve / Last Stop Diner",
-    category: "FORENSIC",
-    unlock: 33,
-    summary: "Recovered at Last Stop Diner. The fingerprint sleeve records that the voice says the next word before the speaker moves their mouth. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Last Stop Diner): “If the radio uses your own voice, do not answer in the same channel.”",
-    analysis: "This anomaly becomes more consistent when the flashlight is turned away. The original report describes a separate detail: the voice says the next word before the speaker moves their mouth.",
-    followup: "Keep the original evidence sealed and study another independent source. Source location: Last Stop Diner. Artifact type: Fingerprint Sleeve.",
-  },
-  {
-    id: "night-file-069",
-    title: "Night File 069 — Dispatch Transcript / The east hallway",
-    category: "BODYCAM",
-    unlock: 34,
-    summary: "Recovered at The east hallway. The dispatch transcript records that the reflected figure looks toward the camera after the camera has been removed. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The east hallway): “The footprints stopped at the wall. The wall was wet on the other side.”",
-    analysis: "The physical record appears authentic; the impossible part is the event it describes. The original report describes a separate detail: the reflected figure looks toward the camera after the camera has been removed.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: The east hallway. Artifact type: Dispatch Transcript.",
-  },
-  {
-    id: "night-file-070",
-    title: "Night File 070 — Incident Ledger / The ranger trail",
-    category: "ARCHITECTURE",
-    unlock: 34,
-    summary: "Recovered at The ranger trail. The incident ledger records that the paper has a dry footprint beneath a fresh water stain. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The ranger trail): “The lights went out. The person at the end of the hall kept casting a shadow.”",
-    analysis: "Cross-reference this with the bodycam and the roster before making a decision. The original report describes a separate detail: the paper has a dry footprint beneath a fresh water stain.",
-    followup: "Read the related note before attempting to submit your theory. Source location: The ranger trail. Artifact type: Incident Ledger.",
-  },
-  {
-    id: "night-file-071",
-    title: "Night File 071 — Medical Intake Form / Cypress Farmhouse",
-    category: "FIELD NOTE",
-    unlock: 35,
-    summary: "Recovered at Cypress Farmhouse. The medical intake form records that the image shows a door that does not exist in the mapped floor plan. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Cypress Farmhouse): “The desk clerk asked me to sign the visitor log. My signature was already there.”",
-    analysis: "Treat the record as evidence of sequence corruption, not a harmless clerical error. The original report describes a separate detail: the image shows a door that does not exist in the mapped floor plan.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: Cypress Farmhouse. Artifact type: Medical Intake Form.",
-  },
-  {
-    id: "night-file-072",
-    title: "Night File 072 — Audio Reel / County Clinic",
-    category: "ARCHITECTURE",
-    unlock: 35,
-    summary: "Recovered at County Clinic. The audio reel records that the negative shows seven people but the print shows six. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (County Clinic): “The key fit the lock. The lock insisted it had never been installed.”",
-    analysis: "Treat the record as evidence of sequence corruption, not a harmless clerical error. The original report describes a separate detail: the negative shows seven people but the print shows six.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: County Clinic. Artifact type: Audio Reel.",
-  },
-  {
-    id: "night-file-073",
-    title: "Night File 073 — Radio Frequency Chart / Camera Four",
-    category: "FIELD NOTE",
-    unlock: 36,
-    summary: "Recovered at Camera Four. The radio frequency chart records that the door opens on camera but the handle never moves. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Camera Four): “The file was sealed. Something had already read the last page.”",
-    analysis: "The absence of a witness does not mean the event did not occur. The original report describes a separate detail: the door opens on camera but the handle never moves.",
-    followup: "Read the related note before attempting to submit your theory. Source location: Camera Four. Artifact type: Radio Frequency Chart.",
-  },
-  {
-    id: "night-file-074",
-    title: "Night File 074 — Photographic Negative / The perimeter fence",
-    category: "ARCHITECTURE",
-    unlock: 36,
-    summary: "Recovered at The perimeter fence. The photographic negative records that the filing date is tomorrow while the postmark is eleven years old. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The perimeter fence): “I took one photograph. The envelope came back with three negatives.”",
-    analysis: "Do not destroy the original. A later file may refer to this exact mark. The original report describes a separate detail: the filing date is tomorrow while the postmark is eleven years old.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: The perimeter fence. Artifact type: Photographic Negative.",
-  },
-  {
-    id: "night-file-075",
-    title: "Night File 075 — Lost Property Card / County Police Station",
-    category: "FIELD NOTE",
-    unlock: 37,
-    summary: "Recovered at County Police Station. The lost property card records that the call originated from the receiver that was physically disconnected. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (County Police Station): “If the radio uses your own voice, do not answer in the same channel.”",
-    analysis: "The safest working theory is an imitator altering the timeline and the records. The original report describes a separate detail: the call originated from the receiver that was physically disconnected.",
-    followup: "Verify the identity through the roster rather than through the voice. Source location: County Police Station. Artifact type: Lost Property Card.",
-  },
-  {
-    id: "night-file-076",
-    title: "Night File 076 — Emergency Bulletin / Leaning Cabin",
-    category: "ARCHITECTURE",
-    unlock: 37,
-    summary: "Recovered at Leaning Cabin. The emergency bulletin records that the call sign is valid but its owner has never been assigned to this county. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Leaning Cabin): “Every clock was stopped at a different minute. The file listed them as synchronized.”",
-    analysis: "The report’s conclusion was copied from a case file that was still sealed. The original report describes a separate detail: the call sign is valid but its owner has never been assigned to this county.",
-    followup: "Do not confuse the apparition with the real witness in your case file. Source location: Leaning Cabin. Artifact type: Emergency Bulletin.",
-  },
-  {
-    id: "night-file-077",
-    title: "Night File 077 — Dispatch Transcript / Holding Room Two",
-    category: "FIELD NOTE",
-    unlock: 38,
-    summary: "Recovered at Holding Room Two. The dispatch transcript records that the badge number belongs to a record marked deleted before it was created. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Holding Room Two): “There was a second name under mine. It was written in my handwriting.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the badge number belongs to a record marked deleted before it was created.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: Holding Room Two. Artifact type: Dispatch Transcript.",
-  },
-  {
-    id: "night-file-078",
-    title: "Night File 078 — Flashlight Test Record / The upstairs landing",
-    category: "ARCHITECTURE",
-    unlock: 38,
-    summary: "Recovered at The upstairs landing. The flashlight test record records that the ink remains warm despite the paper being soaked. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The upstairs landing): “I left the room before the alarm. The recording shows me still inside it.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the ink remains warm despite the paper being soaked.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: The upstairs landing. Artifact type: Flashlight Test Record.",
-  },
-  {
-    id: "night-file-079",
-    title: "Night File 079 — Power Interruption Log / The evidence cage",
-    category: "FIELD NOTE",
-    unlock: 39,
-    summary: "Recovered at The evidence cage. The power interruption log records that the station map marks the same room on two separate floors. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The evidence cage): “The key fit the lock. The lock insisted it had never been installed.”",
-    analysis: "The consistent detail is the number of arrivals: one more than the official count. The original report describes a separate detail: the station map marks the same room on two separate floors.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: The evidence cage. Artifact type: Power Interruption Log.",
-  },
-  {
-    id: "night-file-080",
-    title: "Night File 080 — Audio Reel / Swamp Gas Stop",
-    category: "RADIO",
-    unlock: 39,
-    summary: "Recovered at Swamp Gas Stop. The audio reel records that the recorded footsteps are one step ahead of the person walking. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Swamp Gas Stop): “I counted six knocks. The seventh came from inside the desk.”",
-    analysis: "The camera is not merely failing to record. It is recording a different room. The original report describes a separate detail: the recorded footsteps are one step ahead of the person walking.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: Swamp Gas Stop. Artifact type: Audio Reel.",
-  },
-  {
-    id: "night-file-081",
-    title: "Night File 081 — Room Key Ledger / Mile Marker Nine",
-    category: "AUDIO",
-    unlock: 40,
-    summary: "Recovered at Mile Marker Nine. The room key ledger records that the handwriting matches an officer who has not yet joined the force. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Mile Marker Nine): “The witness did not lie. The statement did.”",
-    analysis: "This record is linked to at least one earlier missing-item report. The original report describes a separate detail: the handwriting matches an officer who has not yet joined the force.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: Mile Marker Nine. Artifact type: Room Key Ledger.",
-  },
-  {
-    id: "night-file-082",
-    title: "Night File 082 — Graveyard Inventory / The old dispatch booth",
-    category: "RADIO",
-    unlock: 40,
-    summary: "Recovered at The old dispatch booth. The graveyard inventory records that the map scale changes only around one house. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The old dispatch booth): “I locked the room from the outside. The next frame shows me locking it from within.”",
-    analysis: "The discrepancy repeats after power is restored, which weakens the electrical-fault theory. The original report describes a separate detail: the map scale changes only around one house.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: The old dispatch booth. Artifact type: Graveyard Inventory.",
-  },
-  {
-    id: "night-file-083",
-    title: "Night File 083 — Lost Property Card / The locked generator room",
-    category: "AUDIO",
-    unlock: 41,
-    summary: "Recovered at The locked generator room. The lost property card records that the page lists an exit before the corresponding entrance. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The locked generator room): “Every clock was stopped at a different minute. The file listed them as synchronized.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the page lists an exit before the corresponding entrance.",
-    followup: "Mark the anomaly, then continue the investigation without answering the voice. Source location: The locked generator room. Artifact type: Lost Property Card.",
-  },
-  {
-    id: "night-file-084",
-    title: "Night File 084 — Duty Roster Copy / Radio Relay Hut",
-    category: "RADIO",
-    unlock: 41,
-    summary: "Recovered at Radio Relay Hut. The duty roster copy records that the dust outline shows an object still present in the current photograph. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Radio Relay Hut): “I heard the plane overhead, but the sky in the photograph was indoors.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the dust outline shows an object still present in the current photograph.",
-    followup: "Keep the original evidence sealed and study another independent source. Source location: Radio Relay Hut. Artifact type: Duty Roster Copy.",
-  },
-  {
-    id: "night-file-085",
-    title: "Night File 085 — Photograph Envelope / North Culvert",
-    category: "AUDIO",
-    unlock: 42,
-    summary: "Recovered at North Culvert. The photograph envelope records that the room count is larger than the building count. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (North Culvert): “The photograph captured a face. The person had their back to the camera.”",
-    analysis: "A duplicate identity is more likely than a second authorized unit. The original report describes a separate detail: the room count is larger than the building count.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: North Culvert. Artifact type: Photograph Envelope.",
-  },
-  {
-    id: "night-file-086",
-    title: "Night File 086 — Flashlight Test Record / The chapel basement",
-    category: "RADIO",
-    unlock: 42,
-    summary: "Recovered at The chapel basement. The flashlight test record records that the paper has a dry footprint beneath a fresh water stain. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The chapel basement): “We opened the file and found tomorrow’s evidence inside.”",
-    analysis: "The object is real. Its provenance is impossible. The original report describes a separate detail: the paper has a dry footprint beneath a fresh water stain.",
-    followup: "Read the related note before attempting to submit your theory. Source location: The chapel basement. Artifact type: Flashlight Test Record.",
-  },
-  {
-    id: "night-file-087",
-    title: "Night File 087 — Rain Gauge Sheet / The storage loft",
-    category: "AUDIO",
-    unlock: 43,
-    summary: "Recovered at The storage loft. The rain gauge sheet records that the image shows a door that does not exist in the mapped floor plan. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The storage loft): “I counted six knocks. The seventh came from inside the desk.”",
-    analysis: "The sound is not an echo. It contains a new word that was never spoken aloud. The original report describes a separate detail: the image shows a door that does not exist in the mapped floor plan.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: The storage loft. Artifact type: Rain Gauge Sheet.",
-  },
-  {
-    id: "night-file-088",
-    title: "Night File 088 — Flood Map / St. Mercy Chapel",
-    category: "RADIO",
-    unlock: 43,
-    summary: "Recovered at St. Mercy Chapel. The flood map records that the negative shows seven people but the print shows six. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (St. Mercy Chapel): “The room was empty, but the chair was still slowly turning.”",
-    analysis: "The room layout is stable; the recorded route is what changes. The original report describes a separate detail: the negative shows seven people but the print shows six.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: St. Mercy Chapel. Artifact type: Flood Map.",
-  },
-  {
-    id: "night-file-089",
-    title: "Night File 089 — Room Key Ledger / Road Maintenance Depot",
-    category: "AUDIO",
-    unlock: 44,
-    summary: "Recovered at Road Maintenance Depot. The room key ledger records that the door opens on camera but the handle never moves. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Road Maintenance Depot): “The visitor was polite. The reflection was not.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the door opens on camera but the handle never moves.",
-    followup: "Read the related note before attempting to submit your theory. Source location: Road Maintenance Depot. Artifact type: Room Key Ledger.",
-  },
-  {
-    id: "night-file-090",
-    title: "Night File 090 — Visitor Register / The flooded footpath",
-    category: "MISSING OBJECT",
-    unlock: 44,
-    summary: "Recovered at The flooded footpath. The visitor register records that the filing date is tomorrow while the postmark is eleven years old. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The flooded footpath): “I heard someone praying in the chapel. The chapel’s microphone was unplugged.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the filing date is tomorrow while the postmark is eleven years old.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: The flooded footpath. Artifact type: Visitor Register.",
-  },
-  {
-    id: "night-file-091",
-    title: "Night File 091 — Evidence Seal / The infirmary",
-    category: "PHOTOGRAPH",
-    unlock: 45,
-    summary: "Recovered at The infirmary. The evidence seal records that the camera frame contains the photographer standing behind themself. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The infirmary): “I heard the plane overhead, but the sky in the photograph was indoors.”",
-    analysis: "Do not use the timestamp alone. Two independent records repeat the same contradiction. The original report describes a separate detail: the camera frame contains the photographer standing behind themself.",
-    followup: "Verify the identity through the roster rather than through the voice. Source location: The infirmary. Artifact type: Evidence Seal.",
-  },
-  {
-    id: "night-file-092",
-    title: "Night File 092 — Duty Roster Copy / Pine Rest Motel",
-    category: "MISSING OBJECT",
-    unlock: 45,
-    summary: "Recovered at Pine Rest Motel. The duty roster copy records that the photograph contains a person who was born years after it was taken. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Pine Rest Motel): “A whisper came through the speaker. The speaker was missing its cone.”",
-    analysis: "This anomaly becomes more consistent when the flashlight is turned away. The original report describes a separate detail: the photograph contains a person who was born years after it was taken.",
-    followup: "Do not confuse the apparition with the real witness in your case file. Source location: Pine Rest Motel. Artifact type: Duty Roster Copy.",
-  },
-  {
-    id: "night-file-093",
-    title: "Night File 093 — Badge Inspection Sheet / Last Stop Diner",
-    category: "PHOTOGRAPH",
-    unlock: 46,
-    summary: "Recovered at Last Stop Diner. The badge inspection sheet records that the badge number belongs to a record marked deleted before it was created. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Last Stop Diner): “The person asked to be admitted. The roster showed they had already been admitted.”",
-    analysis: "The physical record appears authentic; the impossible part is the event it describes. The original report describes a separate detail: the badge number belongs to a record marked deleted before it was created.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: Last Stop Diner. Artifact type: Badge Inspection Sheet.",
-  },
-  {
-    id: "night-file-094",
-    title: "Night File 094 — Handwritten Prayer / The east hallway",
-    category: "MISSING OBJECT",
-    unlock: 46,
-    summary: "Recovered at The east hallway. The handwritten prayer records that the ink remains warm despite the paper being soaked. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The east hallway): “The officer entered alone. The microphone captured two sets of boots.”",
-    analysis: "Cross-reference this with the bodycam and the roster before making a decision. The original report describes a separate detail: the ink remains warm despite the paper being soaked.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: The east hallway. Artifact type: Handwritten Prayer.",
-  },
-  {
-    id: "night-file-095",
-    title: "Night File 095 — Rain Gauge Sheet / The ranger trail",
-    category: "PHOTOGRAPH",
-    unlock: 47,
-    summary: "Recovered at The ranger trail. The rain gauge sheet records that the station map marks the same room on two separate floors. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The ranger trail): “The room was empty, but the chair was still slowly turning.”",
-    analysis: "Treat the record as evidence of sequence corruption, not a harmless clerical error. The original report describes a separate detail: the station map marks the same room on two separate floors.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: The ranger trail. Artifact type: Rain Gauge Sheet.",
-  },
-  {
-    id: "night-file-096",
-    title: "Night File 096 — Interview Notes / Cypress Farmhouse",
-    category: "MISSING OBJECT",
-    unlock: 47,
-    summary: "Recovered at Cypress Farmhouse. The interview notes records that the recorded footsteps are one step ahead of the person walking. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Cypress Farmhouse): “I wrote the report after the event. The report is dated before it.”",
-    analysis: "Treat the record as evidence of sequence corruption, not a harmless clerical error. The original report describes a separate detail: the recorded footsteps are one step ahead of the person walking.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: Cypress Farmhouse. Artifact type: Interview Notes.",
-  },
-  {
-    id: "night-file-097",
-    title: "Night File 097 — Witness Statement / County Clinic",
-    category: "PHOTOGRAPH",
-    unlock: 48,
-    summary: "Recovered at County Clinic. The witness statement records that the handwriting matches an officer who has not yet joined the force. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (County Clinic): “The badge was genuine. The officer wearing it was not on the roster.”",
-    analysis: "The absence of a witness does not mean the event did not occur. The original report describes a separate detail: the handwriting matches an officer who has not yet joined the force.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: County Clinic. Artifact type: Witness Statement.",
-  },
-  {
-    id: "night-file-098",
-    title: "Night File 098 — Visitor Register / Camera Four",
-    category: "MISSING OBJECT",
-    unlock: 48,
-    summary: "Recovered at Camera Four. The visitor register records that the witness remembers an event listed in a report not yet written. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Camera Four): “The car in the picture has no driver. Its shadow has someone at the wheel.”",
-    analysis: "Do not destroy the original. A later file may refer to this exact mark. The original report describes a separate detail: the witness remembers an event listed in a report not yet written.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: Camera Four. Artifact type: Visitor Register.",
-  },
-  {
-    id: "night-file-099",
-    title: "Night File 099 — Door Sensor Log / The perimeter fence",
-    category: "PHOTOGRAPH",
-    unlock: 49,
-    summary: "Recovered at The perimeter fence. The door sensor log records that the recorded voice has the same cadence as the listener. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The perimeter fence): “A whisper came through the speaker. The speaker was missing its cone.”",
-    analysis: "The safest working theory is an imitator altering the timeline and the records. The original report describes a separate detail: the recorded voice has the same cadence as the listener.",
-    followup: "Mark the anomaly, then continue the investigation without answering the voice. Source location: The perimeter fence. Artifact type: Door Sensor Log.",
-  },
-  {
-    id: "night-file-100",
-    title: "Night File 100 — Tape Index / County Police Station",
-    category: "STATION",
-    unlock: 49,
-    summary: "Recovered at County Police Station. The tape index records that the dust outline shows an object still present in the current photograph. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (County Police Station): “I could hear rain on the roof. The weather station says there was no rain.”",
-    analysis: "The report’s conclusion was copied from a case file that was still sealed. The original report describes a separate detail: the dust outline shows an object still present in the current photograph.",
-    followup: "Keep the original evidence sealed and study another independent source. Source location: County Police Station. Artifact type: Tape Index.",
-  },
-  {
-    id: "night-file-101",
-    title: "Night File 101 — Badge Inspection Sheet / Leaning Cabin",
-    category: "ROSTER",
-    unlock: 50,
-    summary: "Recovered at Leaning Cabin. The badge inspection sheet records that the room count is larger than the building count. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Leaning Cabin): “Please file the negative separately. The print does not show everyone.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the room count is larger than the building count.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: Leaning Cabin. Artifact type: Badge Inspection Sheet.",
-  },
-  {
-    id: "night-file-102",
-    title: "Night File 102 — Camera Still / Holding Room Two",
-    category: "STATION",
-    unlock: 50,
-    summary: "Recovered at Holding Room Two. The camera still records that the paper has a dry footprint beneath a fresh water stain. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Holding Room Two): “A second flashlight moved beside mine. I was holding mine with both hands.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the paper has a dry footprint beneath a fresh water stain.",
-    followup: "Read the related note before attempting to submit your theory. Source location: Holding Room Two. Artifact type: Camera Still.",
-  },
-  {
-    id: "night-file-103",
-    title: "Night File 103 — Unknown Caller Slip / The upstairs landing",
-    category: "ROSTER",
-    unlock: 51,
-    summary: "Recovered at The upstairs landing. The unknown caller slip records that the image shows a door that does not exist in the mapped floor plan. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The upstairs landing): “I wrote the report after the event. The report is dated before it.”",
-    analysis: "The consistent detail is the number of arrivals: one more than the official count. The original report describes a separate detail: the image shows a door that does not exist in the mapped floor plan.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: The upstairs landing. Artifact type: Unknown Caller Slip.",
-  },
-  {
-    id: "night-file-104",
-    title: "Night File 104 — Interview Notes / The evidence cage",
-    category: "STATION",
-    unlock: 51,
-    summary: "Recovered at The evidence cage. The interview notes records that the negative shows seven people but the print shows six. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The evidence cage): “The desk clerk asked me to sign the visitor log. My signature was already there.”",
-    analysis: "The camera is not merely failing to record. It is recording a different room. The original report describes a separate detail: the negative shows seven people but the print shows six.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: The evidence cage. Artifact type: Interview Notes.",
-  },
-  {
-    id: "night-file-105",
-    title: "Night File 105 — Fingerprint Sleeve / Swamp Gas Stop",
-    category: "ROSTER",
-    unlock: 52,
-    summary: "Recovered at Swamp Gas Stop. The fingerprint sleeve records that the timestamp moves backward whenever the page is turned. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Swamp Gas Stop): “The tape ends when the voice says my name, not when the recorder stops.”",
-    analysis: "This record is linked to at least one earlier missing-item report. The original report describes a separate detail: the timestamp moves backward whenever the page is turned.",
-    followup: "Read the related note before attempting to submit your theory. Source location: Swamp Gas Stop. Artifact type: Fingerprint Sleeve.",
-  },
-  {
-    id: "night-file-106",
-    title: "Night File 106 — Bodycam Cassette / Mile Marker Nine",
-    category: "STATION",
-    unlock: 52,
-    summary: "Recovered at Mile Marker Nine. The bodycam cassette records that the shadow crosses the room in the opposite direction from its owner. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Mile Marker Nine): “The seventh person waited patiently. The sixth person was the room itself.”",
-    analysis: "The discrepancy repeats after power is restored, which weakens the electrical-fault theory. The original report describes a separate detail: the shadow crosses the room in the opposite direction from its owner.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: Mile Marker Nine. Artifact type: Bodycam Cassette.",
-  },
-  {
-    id: "night-file-107",
-    title: "Night File 107 — Door Sensor Log / The old dispatch booth",
-    category: "ROSTER",
-    unlock: 53,
-    summary: "Recovered at The old dispatch booth. The door sensor log records that the camera frame contains the photographer standing behind themself. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The old dispatch booth): “I could hear rain on the roof. The weather station says there was no rain.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the camera frame contains the photographer standing behind themself.",
-    followup: "Verify the identity through the roster rather than through the voice. Source location: The old dispatch booth. Artifact type: Door Sensor Log.",
-  },
-  {
-    id: "night-file-108",
-    title: "Night File 108 — Medical Intake Form / The locked generator room",
-    category: "STATION",
-    unlock: 53,
-    summary: "Recovered at The locked generator room. The medical intake form records that the photograph contains a person who was born years after it was taken. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The locked generator room): “If the radio uses your own voice, do not answer in the same channel.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the photograph contains a person who was born years after it was taken.",
-    followup: "Do not confuse the apparition with the real witness in your case file. Source location: The locked generator room. Artifact type: Medical Intake Form.",
-  },
-  {
-    id: "night-file-109",
-    title: "Night File 109 — Night Roster / Radio Relay Hut",
-    category: "ROSTER",
-    unlock: 54,
-    summary: "Recovered at Radio Relay Hut. The night roster records that the badge number belongs to a record marked deleted before it was created. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Radio Relay Hut): “The footprints stopped at the wall. The wall was wet on the other side.”",
-    analysis: "A duplicate identity is more likely than a second authorized unit. The original report describes a separate detail: the badge number belongs to a record marked deleted before it was created.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: Radio Relay Hut. Artifact type: Night Roster.",
-  },
-  {
-    id: "night-file-110",
-    title: "Night File 110 — Camera Still / North Culvert",
-    category: "BODYCAM",
-    unlock: 54,
-    summary: "Recovered at North Culvert. The camera still records that the ink remains warm despite the paper being soaked. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (North Culvert): “The lights went out. The person at the end of the hall kept casting a shadow.”",
-    analysis: "The object is real. Its provenance is impossible. The original report describes a separate detail: the ink remains warm despite the paper being soaked.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: North Culvert. Artifact type: Camera Still.",
-  },
-  {
-    id: "night-file-111",
-    title: "Night File 111 — Photographic Negative / The chapel basement",
-    category: "FORENSIC",
-    unlock: 55,
-    summary: "Recovered at The chapel basement. The photographic negative records that the station map marks the same room on two separate floors. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The chapel basement): “The desk clerk asked me to sign the visitor log. My signature was already there.”",
-    analysis: "The sound is not an echo. It contains a new word that was never spoken aloud. The original report describes a separate detail: the station map marks the same room on two separate floors.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: The chapel basement. Artifact type: Photographic Negative.",
-  },
-  {
-    id: "night-file-112",
-    title: "Night File 112 — Maintenance Ticket / The storage loft",
-    category: "BODYCAM",
-    unlock: 55,
-    summary: "Recovered at The storage loft. The maintenance ticket records that a second signature appears beneath a single original signature. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The storage loft): “The key fit the lock. The lock insisted it had never been installed.”",
-    analysis: "The room layout is stable; the recorded route is what changes. The original report describes a separate detail: a second signature appears beneath a single original signature.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: The storage loft. Artifact type: Maintenance Ticket.",
-  },
-  {
-    id: "night-file-113",
-    title: "Night File 113 — Fingerprint Sleeve / St. Mercy Chapel",
-    category: "FORENSIC",
-    unlock: 56,
-    summary: "Recovered at St. Mercy Chapel. The fingerprint sleeve records that the door sensor reports a person leaving while the room is still occupied. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (St. Mercy Chapel): “The file was sealed. Something had already read the last page.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the door sensor reports a person leaving while the room is still occupied.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: St. Mercy Chapel. Artifact type: Fingerprint Sleeve.",
-  },
-  {
-    id: "night-file-114",
-    title: "Night File 114 — Dispatch Transcript / Road Maintenance Depot",
-    category: "BODYCAM",
-    unlock: 56,
-    summary: "Recovered at Road Maintenance Depot. The dispatch transcript records that the witness remembers an event listed in a report not yet written. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Road Maintenance Depot): “I took one photograph. The envelope came back with three negatives.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the witness remembers an event listed in a report not yet written.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: Road Maintenance Depot. Artifact type: Dispatch Transcript.",
-  },
-  {
-    id: "night-file-115",
-    title: "Night File 115 — Incident Ledger / The flooded footpath",
-    category: "FORENSIC",
-    unlock: 57,
-    summary: "Recovered at The flooded footpath. The incident ledger records that the recorded voice has the same cadence as the listener. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The flooded footpath): “If the radio uses your own voice, do not answer in the same channel.”",
-    analysis: "Do not use the timestamp alone. Two independent records repeat the same contradiction. The original report describes a separate detail: the recorded voice has the same cadence as the listener.",
-    followup: "Mark the anomaly, then continue the investigation without answering the voice. Source location: The flooded footpath. Artifact type: Incident Ledger.",
-  },
-  {
-    id: "night-file-116",
-    title: "Night File 116 — Medical Intake Form / The infirmary",
-    category: "BODYCAM",
-    unlock: 57,
-    summary: "Recovered at The infirmary. The medical intake form records that the dust outline shows an object still present in the current photograph. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The infirmary): “Every clock was stopped at a different minute. The file listed them as synchronized.”",
-    analysis: "This anomaly becomes more consistent when the flashlight is turned away. The original report describes a separate detail: the dust outline shows an object still present in the current photograph.",
-    followup: "Keep the original evidence sealed and study another independent source. Source location: The infirmary. Artifact type: Medical Intake Form.",
-  },
-  {
-    id: "night-file-117",
-    title: "Night File 117 — Audio Reel / Pine Rest Motel",
-    category: "FORENSIC",
-    unlock: 58,
-    summary: "Recovered at Pine Rest Motel. The audio reel records that the room count is larger than the building count. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Pine Rest Motel): “There was a second name under mine. It was written in my handwriting.”",
-    analysis: "The physical record appears authentic; the impossible part is the event it describes. The original report describes a separate detail: the room count is larger than the building count.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: Pine Rest Motel. Artifact type: Audio Reel.",
-  },
-  {
-    id: "night-file-118",
-    title: "Night File 118 — Radio Frequency Chart / Last Stop Diner",
-    category: "BODYCAM",
-    unlock: 58,
-    summary: "Recovered at Last Stop Diner. The radio frequency chart records that the paper has a dry footprint beneath a fresh water stain. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Last Stop Diner): “I left the room before the alarm. The recording shows me still inside it.”",
-    analysis: "Cross-reference this with the bodycam and the roster before making a decision. The original report describes a separate detail: the paper has a dry footprint beneath a fresh water stain.",
-    followup: "Read the related note before attempting to submit your theory. Source location: Last Stop Diner. Artifact type: Radio Frequency Chart.",
-  },
-  {
-    id: "night-file-119",
-    title: "Night File 119 — Photographic Negative / The east hallway",
-    category: "FORENSIC",
-    unlock: 59,
-    summary: "Recovered at The east hallway. The photographic negative records that the audio contains a response before the question is spoken. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The east hallway): “The key fit the lock. The lock insisted it had never been installed.”",
-    analysis: "Treat the record as evidence of sequence corruption, not a harmless clerical error. The original report describes a separate detail: the audio contains a response before the question is spoken.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: The east hallway. Artifact type: Photographic Negative.",
-  },
-  {
-    id: "night-file-120",
-    title: "Night File 120 — Lost Property Card / The ranger trail",
-    category: "FIELD NOTE",
-    unlock: 59,
-    summary: "Recovered at The ranger trail. The lost property card records that the inventory count increases after every audit. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The ranger trail): “I counted six knocks. The seventh came from inside the desk.”",
-    analysis: "Treat the record as evidence of sequence corruption, not a harmless clerical error. The original report describes a separate detail: the inventory count increases after every audit.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: The ranger trail. Artifact type: Lost Property Card.",
-  },
-  {
-    id: "night-file-121",
-    title: "Night File 121 — Emergency Bulletin / Cypress Farmhouse",
-    category: "ARCHITECTURE",
-    unlock: 60,
-    summary: "Recovered at Cypress Farmhouse. The emergency bulletin records that the timestamp moves backward whenever the page is turned. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Cypress Farmhouse): “The witness did not lie. The statement did.”",
-    analysis: "The absence of a witness does not mean the event did not occur. The original report describes a separate detail: the timestamp moves backward whenever the page is turned.",
-    followup: "Read the related note before attempting to submit your theory. Source location: Cypress Farmhouse. Artifact type: Emergency Bulletin.",
-  },
-  {
-    id: "night-file-122",
-    title: "Night File 122 — Dispatch Transcript / County Clinic",
-    category: "FIELD NOTE",
-    unlock: 60,
-    summary: "Recovered at County Clinic. The dispatch transcript records that the shadow crosses the room in the opposite direction from its owner. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (County Clinic): “I locked the room from the outside. The next frame shows me locking it from within.”",
-    analysis: "Do not destroy the original. A later file may refer to this exact mark. The original report describes a separate detail: the shadow crosses the room in the opposite direction from its owner.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: County Clinic. Artifact type: Dispatch Transcript.",
-  },
-  {
-    id: "night-file-123",
-    title: "Night File 123 — Flashlight Test Record / Camera Four",
-    category: "ARCHITECTURE",
-    unlock: 61,
-    summary: "Recovered at Camera Four. The flashlight test record records that the camera frame contains the photographer standing behind themself. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Camera Four): “Every clock was stopped at a different minute. The file listed them as synchronized.”",
-    analysis: "The safest working theory is an imitator altering the timeline and the records. The original report describes a separate detail: the camera frame contains the photographer standing behind themself.",
-    followup: "Verify the identity through the roster rather than through the voice. Source location: Camera Four. Artifact type: Flashlight Test Record.",
-  },
-  {
-    id: "night-file-124",
-    title: "Night File 124 — Power Interruption Log / The perimeter fence",
-    category: "FIELD NOTE",
-    unlock: 61,
-    summary: "Recovered at The perimeter fence. The power interruption log records that the photograph contains a person who was born years after it was taken. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The perimeter fence): “I heard the plane overhead, but the sky in the photograph was indoors.”",
-    analysis: "The report’s conclusion was copied from a case file that was still sealed. The original report describes a separate detail: the photograph contains a person who was born years after it was taken.",
-    followup: "Do not confuse the apparition with the real witness in your case file. Source location: The perimeter fence. Artifact type: Power Interruption Log.",
-  },
-  {
-    id: "night-file-125",
-    title: "Night File 125 — Audio Reel / County Police Station",
-    category: "ARCHITECTURE",
-    unlock: 62,
-    summary: "Recovered at County Police Station. The audio reel records that the badge number belongs to a record marked deleted before it was created. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (County Police Station): “The photograph captured a face. The person had their back to the camera.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the badge number belongs to a record marked deleted before it was created.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: County Police Station. Artifact type: Audio Reel.",
-  },
-  {
-    id: "night-file-126",
-    title: "Night File 126 — Room Key Ledger / Leaning Cabin",
-    category: "FIELD NOTE",
-    unlock: 62,
-    summary: "Recovered at Leaning Cabin. The room key ledger records that the reflected figure looks toward the camera after the camera has been removed. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Leaning Cabin): “We opened the file and found tomorrow’s evidence inside.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the reflected figure looks toward the camera after the camera has been removed.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: Leaning Cabin. Artifact type: Room Key Ledger.",
-  },
-  {
-    id: "night-file-127",
-    title: "Night File 127 — Graveyard Inventory / Holding Room Two",
-    category: "ARCHITECTURE",
-    unlock: 63,
-    summary: "Recovered at Holding Room Two. The graveyard inventory records that the radio records a transmission during a documented power outage. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Holding Room Two): “I counted six knocks. The seventh came from inside the desk.”",
-    analysis: "The consistent detail is the number of arrivals: one more than the official count. The original report describes a separate detail: the radio records a transmission during a documented power outage.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: Holding Room Two. Artifact type: Graveyard Inventory.",
-  },
-  {
-    id: "night-file-128",
-    title: "Night File 128 — Lost Property Card / The upstairs landing",
-    category: "FIELD NOTE",
-    unlock: 63,
-    summary: "Recovered at The upstairs landing. The lost property card records that a second signature appears beneath a single original signature. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The upstairs landing): “The room was empty, but the chair was still slowly turning.”",
-    analysis: "The camera is not merely failing to record. It is recording a different room. The original report describes a separate detail: a second signature appears beneath a single original signature.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: The upstairs landing. Artifact type: Lost Property Card.",
-  },
-  {
-    id: "night-file-129",
-    title: "Night File 129 — Duty Roster Copy / The evidence cage",
-    category: "ARCHITECTURE",
-    unlock: 64,
-    summary: "Recovered at The evidence cage. The duty roster copy records that the door sensor reports a person leaving while the room is still occupied. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The evidence cage): “The visitor was polite. The reflection was not.”",
-    analysis: "This record is linked to at least one earlier missing-item report. The original report describes a separate detail: the door sensor reports a person leaving while the room is still occupied.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: The evidence cage. Artifact type: Duty Roster Copy.",
-  },
-  {
-    id: "night-file-130",
-    title: "Night File 130 — Photograph Envelope / Swamp Gas Stop",
-    category: "AUDIO",
-    unlock: 64,
-    summary: "Recovered at Swamp Gas Stop. The photograph envelope records that the witness remembers an event listed in a report not yet written. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Swamp Gas Stop): “I heard someone praying in the chapel. The chapel’s microphone was unplugged.”",
-    analysis: "The discrepancy repeats after power is restored, which weakens the electrical-fault theory. The original report describes a separate detail: the witness remembers an event listed in a report not yet written.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: Swamp Gas Stop. Artifact type: Photograph Envelope.",
-  },
-  {
-    id: "night-file-131",
-    title: "Night File 131 — Flashlight Test Record / Mile Marker Nine",
-    category: "RADIO",
-    unlock: 65,
-    summary: "Recovered at Mile Marker Nine. The flashlight test record records that the recorded voice has the same cadence as the listener. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Mile Marker Nine): “I heard the plane overhead, but the sky in the photograph was indoors.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the recorded voice has the same cadence as the listener.",
-    followup: "Mark the anomaly, then continue the investigation without answering the voice. Source location: Mile Marker Nine. Artifact type: Flashlight Test Record.",
-  },
-  {
-    id: "night-file-132",
-    title: "Night File 132 — Rain Gauge Sheet / The old dispatch booth",
-    category: "AUDIO",
-    unlock: 65,
-    summary: "Recovered at The old dispatch booth. The rain gauge sheet records that the dust outline shows an object still present in the current photograph. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The old dispatch booth): “A whisper came through the speaker. The speaker was missing its cone.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the dust outline shows an object still present in the current photograph.",
-    followup: "Keep the original evidence sealed and study another independent source. Source location: The old dispatch booth. Artifact type: Rain Gauge Sheet.",
-  },
-  {
-    id: "night-file-133",
-    title: "Night File 133 — Flood Map / The locked generator room",
-    category: "RADIO",
-    unlock: 66,
-    summary: "Recovered at The locked generator room. The flood map records that the call sign is valid but its owner has never been assigned to this county. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The locked generator room): “The person asked to be admitted. The roster showed they had already been admitted.”",
-    analysis: "A duplicate identity is more likely than a second authorized unit. The original report describes a separate detail: the call sign is valid but its owner has never been assigned to this county.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: The locked generator room. Artifact type: Flood Map.",
-  },
-  {
-    id: "night-file-134",
-    title: "Night File 134 — Room Key Ledger / Radio Relay Hut",
-    category: "AUDIO",
-    unlock: 66,
-    summary: "Recovered at Radio Relay Hut. The room key ledger records that the employee photograph changes when viewed through the glass. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Radio Relay Hut): “The officer entered alone. The microphone captured two sets of boots.”",
-    analysis: "The object is real. Its provenance is impossible. The original report describes a separate detail: the employee photograph changes when viewed through the glass.",
-    followup: "Read the related note before attempting to submit your theory. Source location: Radio Relay Hut. Artifact type: Room Key Ledger.",
-  },
-  {
-    id: "night-file-135",
-    title: "Night File 135 — Visitor Register / North Culvert",
-    category: "RADIO",
-    unlock: 67,
-    summary: "Recovered at North Culvert. The visitor register records that the audio contains a response before the question is spoken. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (North Culvert): “The room was empty, but the chair was still slowly turning.”",
-    analysis: "The sound is not an echo. It contains a new word that was never spoken aloud. The original report describes a separate detail: the audio contains a response before the question is spoken.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: North Culvert. Artifact type: Visitor Register.",
-  },
-  {
-    id: "night-file-136",
-    title: "Night File 136 — Evidence Seal / The chapel basement",
-    category: "AUDIO",
-    unlock: 67,
-    summary: "Recovered at The chapel basement. The evidence seal records that the inventory count increases after every audit. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The chapel basement): “I wrote the report after the event. The report is dated before it.”",
-    analysis: "The room layout is stable; the recorded route is what changes. The original report describes a separate detail: the inventory count increases after every audit.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: The chapel basement. Artifact type: Evidence Seal.",
-  },
-  {
-    id: "night-file-137",
-    title: "Night File 137 — Duty Roster Copy / The storage loft",
-    category: "RADIO",
-    unlock: 68,
-    summary: "Recovered at The storage loft. The duty roster copy records that the timestamp moves backward whenever the page is turned. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The storage loft): “The badge was genuine. The officer wearing it was not on the roster.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the timestamp moves backward whenever the page is turned.",
-    followup: "Read the related note before attempting to submit your theory. Source location: The storage loft. Artifact type: Duty Roster Copy.",
-  },
-  {
-    id: "night-file-138",
-    title: "Night File 138 — Badge Inspection Sheet / St. Mercy Chapel",
-    category: "AUDIO",
-    unlock: 68,
-    summary: "Recovered at St. Mercy Chapel. The badge inspection sheet records that the shadow crosses the room in the opposite direction from its owner. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (St. Mercy Chapel): “The car in the picture has no driver. Its shadow has someone at the wheel.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the shadow crosses the room in the opposite direction from its owner.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: St. Mercy Chapel. Artifact type: Badge Inspection Sheet.",
-  },
-  {
-    id: "night-file-139",
-    title: "Night File 139 — Handwritten Prayer / Road Maintenance Depot",
-    category: "RADIO",
-    unlock: 69,
-    summary: "Recovered at Road Maintenance Depot. The handwritten prayer records that the camera frame contains the photographer standing behind themself. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Road Maintenance Depot): “A whisper came through the speaker. The speaker was missing its cone.”",
-    analysis: "Do not use the timestamp alone. Two independent records repeat the same contradiction. The original report describes a separate detail: the camera frame contains the photographer standing behind themself.",
-    followup: "Verify the identity through the roster rather than through the voice. Source location: Road Maintenance Depot. Artifact type: Handwritten Prayer.",
-  },
-  {
-    id: "night-file-140",
-    title: "Night File 140 — Rain Gauge Sheet / The flooded footpath",
-    category: "PHOTOGRAPH",
-    unlock: 69,
-    summary: "Recovered at The flooded footpath. The rain gauge sheet records that the page lists an exit before the corresponding entrance. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The flooded footpath): “I could hear rain on the roof. The weather station says there was no rain.”",
-    analysis: "This anomaly becomes more consistent when the flashlight is turned away. The original report describes a separate detail: the page lists an exit before the corresponding entrance.",
-    followup: "Do not confuse the apparition with the real witness in your case file. Source location: The flooded footpath. Artifact type: Rain Gauge Sheet.",
-  },
-  {
-    id: "night-file-141",
-    title: "Night File 141 — Interview Notes / The infirmary",
-    category: "MISSING OBJECT",
-    unlock: 70,
-    summary: "Recovered at The infirmary. The interview notes records that the voice says the next word before the speaker moves their mouth. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The infirmary): “Please file the negative separately. The print does not show everyone.”",
-    analysis: "The physical record appears authentic; the impossible part is the event it describes. The original report describes a separate detail: the voice says the next word before the speaker moves their mouth.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: The infirmary. Artifact type: Interview Notes.",
-  },
-  {
-    id: "night-file-142",
-    title: "Night File 142 — Witness Statement / Pine Rest Motel",
-    category: "PHOTOGRAPH",
-    unlock: 70,
-    summary: "Recovered at Pine Rest Motel. The witness statement records that the reflected figure looks toward the camera after the camera has been removed. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Pine Rest Motel): “A second flashlight moved beside mine. I was holding mine with both hands.”",
-    analysis: "Cross-reference this with the bodycam and the roster before making a decision. The original report describes a separate detail: the reflected figure looks toward the camera after the camera has been removed.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: Pine Rest Motel. Artifact type: Witness Statement.",
-  },
-  {
-    id: "night-file-143",
-    title: "Night File 143 — Visitor Register / Last Stop Diner",
-    category: "MISSING OBJECT",
-    unlock: 71,
-    summary: "Recovered at Last Stop Diner. The visitor register records that the radio records a transmission during a documented power outage. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Last Stop Diner): “I wrote the report after the event. The report is dated before it.”",
-    analysis: "Treat the record as evidence of sequence corruption, not a harmless clerical error. The original report describes a separate detail: the radio records a transmission during a documented power outage.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: Last Stop Diner. Artifact type: Visitor Register.",
-  },
-  {
-    id: "night-file-144",
-    title: "Night File 144 — Door Sensor Log / The east hallway",
-    category: "PHOTOGRAPH",
-    unlock: 71,
-    summary: "Recovered at The east hallway. The door sensor log records that a second signature appears beneath a single original signature. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The east hallway): “The desk clerk asked me to sign the visitor log. My signature was already there.”",
-    analysis: "Treat the record as evidence of sequence corruption, not a harmless clerical error. The original report describes a separate detail: a second signature appears beneath a single original signature.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: The east hallway. Artifact type: Door Sensor Log.",
-  },
-  {
-    id: "night-file-145",
-    title: "Night File 145 — Tape Index / The ranger trail",
-    category: "MISSING OBJECT",
-    unlock: 72,
-    summary: "Recovered at The ranger trail. The tape index records that the door sensor reports a person leaving while the room is still occupied. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The ranger trail): “The tape ends when the voice says my name, not when the recorder stops.”",
-    analysis: "The absence of a witness does not mean the event did not occur. The original report describes a separate detail: the door sensor reports a person leaving while the room is still occupied.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: The ranger trail. Artifact type: Tape Index.",
-  },
-  {
-    id: "night-file-146",
-    title: "Night File 146 — Badge Inspection Sheet / Cypress Farmhouse",
-    category: "PHOTOGRAPH",
-    unlock: 72,
-    summary: "Recovered at Cypress Farmhouse. The badge inspection sheet records that the witness remembers an event listed in a report not yet written. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Cypress Farmhouse): “The seventh person waited patiently. The sixth person was the room itself.”",
-    analysis: "Do not destroy the original. A later file may refer to this exact mark. The original report describes a separate detail: the witness remembers an event listed in a report not yet written.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: Cypress Farmhouse. Artifact type: Badge Inspection Sheet.",
-  },
-  {
-    id: "night-file-147",
-    title: "Night File 147 — Camera Still / County Clinic",
-    category: "MISSING OBJECT",
-    unlock: 73,
-    summary: "Recovered at County Clinic. The camera still records that the filing date is tomorrow while the postmark is eleven years old. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (County Clinic): “I could hear rain on the roof. The weather station says there was no rain.”",
-    analysis: "The safest working theory is an imitator altering the timeline and the records. The original report describes a separate detail: the filing date is tomorrow while the postmark is eleven years old.",
-    followup: "Mark the anomaly, then continue the investigation without answering the voice. Source location: County Clinic. Artifact type: Camera Still.",
-  },
-  {
-    id: "night-file-148",
-    title: "Night File 148 — Unknown Caller Slip / Camera Four",
-    category: "PHOTOGRAPH",
-    unlock: 73,
-    summary: "Recovered at Camera Four. The unknown caller slip records that the call originated from the receiver that was physically disconnected. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Camera Four): “If the radio uses your own voice, do not answer in the same channel.”",
-    analysis: "The report’s conclusion was copied from a case file that was still sealed. The original report describes a separate detail: the call originated from the receiver that was physically disconnected.",
-    followup: "Keep the original evidence sealed and study another independent source. Source location: Camera Four. Artifact type: Unknown Caller Slip.",
-  },
-  {
-    id: "night-file-149",
-    title: "Night File 149 — Interview Notes / The perimeter fence",
-    category: "MISSING OBJECT",
-    unlock: 74,
-    summary: "Recovered at The perimeter fence. The interview notes records that the call sign is valid but its owner has never been assigned to this county. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The perimeter fence): “The footprints stopped at the wall. The wall was wet on the other side.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the call sign is valid but its owner has never been assigned to this county.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: The perimeter fence. Artifact type: Interview Notes.",
-  },
-  {
-    id: "night-file-150",
-    title: "Night File 150 — Fingerprint Sleeve / County Police Station",
-    category: "ROSTER",
-    unlock: 74,
-    summary: "Recovered at County Police Station. The fingerprint sleeve records that the employee photograph changes when viewed through the glass. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (County Police Station): “The lights went out. The person at the end of the hall kept casting a shadow.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the employee photograph changes when viewed through the glass.",
-    followup: "Read the related note before attempting to submit your theory. Source location: County Police Station. Artifact type: Fingerprint Sleeve.",
-  },
-  {
-    id: "night-file-151",
-    title: "Night File 151 — Bodycam Cassette / Leaning Cabin",
-    category: "STATION",
-    unlock: 75,
-    summary: "Recovered at Leaning Cabin. The bodycam cassette records that the audio contains a response before the question is spoken. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Leaning Cabin): “The desk clerk asked me to sign the visitor log. My signature was already there.”",
-    analysis: "The consistent detail is the number of arrivals: one more than the official count. The original report describes a separate detail: the audio contains a response before the question is spoken.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: Leaning Cabin. Artifact type: Bodycam Cassette.",
-  },
-  {
-    id: "night-file-152",
-    title: "Night File 152 — Door Sensor Log / Holding Room Two",
-    category: "ROSTER",
-    unlock: 75,
-    summary: "Recovered at Holding Room Two. The door sensor log records that the inventory count increases after every audit. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Holding Room Two): “The key fit the lock. The lock insisted it had never been installed.”",
-    analysis: "The camera is not merely failing to record. It is recording a different room. The original report describes a separate detail: the inventory count increases after every audit.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: Holding Room Two. Artifact type: Door Sensor Log.",
-  },
-  {
-    id: "night-file-153",
-    title: "Night File 153 — Medical Intake Form / The upstairs landing",
-    category: "STATION",
-    unlock: 76,
-    summary: "Recovered at The upstairs landing. The medical intake form records that the timestamp moves backward whenever the page is turned. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The upstairs landing): “The file was sealed. Something had already read the last page.”",
-    analysis: "This record is linked to at least one earlier missing-item report. The original report describes a separate detail: the timestamp moves backward whenever the page is turned.",
-    followup: "Read the related note before attempting to submit your theory. Source location: The upstairs landing. Artifact type: Medical Intake Form.",
-  },
-  {
-    id: "night-file-154",
-    title: "Night File 154 — Night Roster / The evidence cage",
-    category: "ROSTER",
-    unlock: 76,
-    summary: "Recovered at The evidence cage. The night roster records that the handwriting matches an officer who has not yet joined the force. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The evidence cage): “I took one photograph. The envelope came back with three negatives.”",
-    analysis: "The discrepancy repeats after power is restored, which weakens the electrical-fault theory. The original report describes a separate detail: the handwriting matches an officer who has not yet joined the force.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: The evidence cage. Artifact type: Night Roster.",
-  },
-  {
-    id: "night-file-155",
-    title: "Night File 155 — Camera Still / Swamp Gas Stop",
-    category: "STATION",
-    unlock: 77,
-    summary: "Recovered at Swamp Gas Stop. The camera still records that the map scale changes only around one house. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Swamp Gas Stop): “If the radio uses your own voice, do not answer in the same channel.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the map scale changes only around one house.",
-    followup: "Verify the identity through the roster rather than through the voice. Source location: Swamp Gas Stop. Artifact type: Camera Still.",
-  },
-  {
-    id: "night-file-156",
-    title: "Night File 156 — Photographic Negative / Mile Marker Nine",
-    category: "ROSTER",
-    unlock: 77,
-    summary: "Recovered at Mile Marker Nine. The photographic negative records that the page lists an exit before the corresponding entrance. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Mile Marker Nine): “Every clock was stopped at a different minute. The file listed them as synchronized.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the page lists an exit before the corresponding entrance.",
-    followup: "Do not confuse the apparition with the real witness in your case file. Source location: Mile Marker Nine. Artifact type: Photographic Negative.",
-  },
-  {
-    id: "night-file-157",
-    title: "Night File 157 — Maintenance Ticket / The old dispatch booth",
-    category: "STATION",
-    unlock: 78,
-    summary: "Recovered at The old dispatch booth. The maintenance ticket records that the voice says the next word before the speaker moves their mouth. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The old dispatch booth): “There was a second name under mine. It was written in my handwriting.”",
-    analysis: "A duplicate identity is more likely than a second authorized unit. The original report describes a separate detail: the voice says the next word before the speaker moves their mouth.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: The old dispatch booth. Artifact type: Maintenance Ticket.",
-  },
-  {
-    id: "night-file-158",
-    title: "Night File 158 — Fingerprint Sleeve / The locked generator room",
-    category: "ROSTER",
-    unlock: 78,
-    summary: "Recovered at The locked generator room. The fingerprint sleeve records that the reflected figure looks toward the camera after the camera has been removed. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The locked generator room): “I left the room before the alarm. The recording shows me still inside it.”",
-    analysis: "The object is real. Its provenance is impossible. The original report describes a separate detail: the reflected figure looks toward the camera after the camera has been removed.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: The locked generator room. Artifact type: Fingerprint Sleeve.",
-  },
-  {
-    id: "night-file-159",
-    title: "Night File 159 — Dispatch Transcript / Radio Relay Hut",
-    category: "STATION",
-    unlock: 79,
-    summary: "Recovered at Radio Relay Hut. The dispatch transcript records that the radio records a transmission during a documented power outage. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Radio Relay Hut): “The key fit the lock. The lock insisted it had never been installed.”",
-    analysis: "The sound is not an echo. It contains a new word that was never spoken aloud. The original report describes a separate detail: the radio records a transmission during a documented power outage.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: Radio Relay Hut. Artifact type: Dispatch Transcript.",
-  },
-  {
-    id: "night-file-160",
-    title: "Night File 160 — Incident Ledger / North Culvert",
-    category: "FORENSIC",
-    unlock: 79,
-    summary: "Recovered at North Culvert. The incident ledger records that a second signature appears beneath a single original signature. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (North Culvert): “I counted six knocks. The seventh came from inside the desk.”",
-    analysis: "The room layout is stable; the recorded route is what changes. The original report describes a separate detail: a second signature appears beneath a single original signature.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: North Culvert. Artifact type: Incident Ledger.",
-  },
-  {
-    id: "night-file-161",
-    title: "Night File 161 — Medical Intake Form / The chapel basement",
-    category: "BODYCAM",
-    unlock: 80,
-    summary: "Recovered at The chapel basement. The medical intake form records that the negative shows seven people but the print shows six. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The chapel basement): “The witness did not lie. The statement did.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the negative shows seven people but the print shows six.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: The chapel basement. Artifact type: Medical Intake Form.",
-  },
-  {
-    id: "night-file-162",
-    title: "Night File 162 — Audio Reel / The storage loft",
-    category: "FORENSIC",
-    unlock: 80,
-    summary: "Recovered at The storage loft. The audio reel records that the door opens on camera but the handle never moves. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The storage loft): “I locked the room from the outside. The next frame shows me locking it from within.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the door opens on camera but the handle never moves.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: The storage loft. Artifact type: Audio Reel.",
-  },
-  {
-    id: "night-file-163",
-    title: "Night File 163 — Radio Frequency Chart / St. Mercy Chapel",
-    category: "BODYCAM",
-    unlock: 81,
-    summary: "Recovered at St. Mercy Chapel. The radio frequency chart records that the filing date is tomorrow while the postmark is eleven years old. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (St. Mercy Chapel): “Every clock was stopped at a different minute. The file listed them as synchronized.”",
-    analysis: "Do not use the timestamp alone. Two independent records repeat the same contradiction. The original report describes a separate detail: the filing date is tomorrow while the postmark is eleven years old.",
-    followup: "Mark the anomaly, then continue the investigation without answering the voice. Source location: St. Mercy Chapel. Artifact type: Radio Frequency Chart.",
-  },
-  {
-    id: "night-file-164",
-    title: "Night File 164 — Photographic Negative / Road Maintenance Depot",
-    category: "FORENSIC",
-    unlock: 81,
-    summary: "Recovered at Road Maintenance Depot. The photographic negative records that the call originated from the receiver that was physically disconnected. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Road Maintenance Depot): “I heard the plane overhead, but the sky in the photograph was indoors.”",
-    analysis: "This anomaly becomes more consistent when the flashlight is turned away. The original report describes a separate detail: the call originated from the receiver that was physically disconnected.",
-    followup: "Keep the original evidence sealed and study another independent source. Source location: Road Maintenance Depot. Artifact type: Photographic Negative.",
-  },
-  {
-    id: "night-file-165",
-    title: "Night File 165 — Lost Property Card / The flooded footpath",
-    category: "BODYCAM",
-    unlock: 82,
-    summary: "Recovered at The flooded footpath. The lost property card records that the call sign is valid but its owner has never been assigned to this county. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The flooded footpath): “The photograph captured a face. The person had their back to the camera.”",
-    analysis: "The physical record appears authentic; the impossible part is the event it describes. The original report describes a separate detail: the call sign is valid but its owner has never been assigned to this county.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: The flooded footpath. Artifact type: Lost Property Card.",
-  },
-  {
-    id: "night-file-166",
-    title: "Night File 166 — Emergency Bulletin / The infirmary",
-    category: "FORENSIC",
-    unlock: 82,
-    summary: "Recovered at The infirmary. The emergency bulletin records that the employee photograph changes when viewed through the glass. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The infirmary): “We opened the file and found tomorrow’s evidence inside.”",
-    analysis: "Cross-reference this with the bodycam and the roster before making a decision. The original report describes a separate detail: the employee photograph changes when viewed through the glass.",
-    followup: "Read the related note before attempting to submit your theory. Source location: The infirmary. Artifact type: Emergency Bulletin.",
-  },
-  {
-    id: "night-file-167",
-    title: "Night File 167 — Dispatch Transcript / Pine Rest Motel",
-    category: "BODYCAM",
-    unlock: 83,
-    summary: "Recovered at Pine Rest Motel. The dispatch transcript records that the audio contains a response before the question is spoken. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Pine Rest Motel): “I counted six knocks. The seventh came from inside the desk.”",
-    analysis: "Treat the record as evidence of sequence corruption, not a harmless clerical error. The original report describes a separate detail: the audio contains a response before the question is spoken.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: Pine Rest Motel. Artifact type: Dispatch Transcript.",
-  },
-  {
-    id: "night-file-168",
-    title: "Night File 168 — Flashlight Test Record / Last Stop Diner",
-    category: "FORENSIC",
-    unlock: 83,
-    summary: "Recovered at Last Stop Diner. The flashlight test record records that the station map marks the same room on two separate floors. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Last Stop Diner): “The room was empty, but the chair was still slowly turning.”",
-    analysis: "Treat the record as evidence of sequence corruption, not a harmless clerical error. The original report describes a separate detail: the station map marks the same room on two separate floors.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: Last Stop Diner. Artifact type: Flashlight Test Record.",
-  },
-  {
-    id: "night-file-169",
-    title: "Night File 169 — Power Interruption Log / The east hallway",
-    category: "BODYCAM",
-    unlock: 84,
-    summary: "Recovered at The east hallway. The power interruption log records that the recorded footsteps are one step ahead of the person walking. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The east hallway): “The visitor was polite. The reflection was not.”",
-    analysis: "The absence of a witness does not mean the event did not occur. The original report describes a separate detail: the recorded footsteps are one step ahead of the person walking.",
-    followup: "Read the related note before attempting to submit your theory. Source location: The east hallway. Artifact type: Power Interruption Log.",
-  },
-  {
-    id: "night-file-170",
-    title: "Night File 170 — Audio Reel / The ranger trail",
-    category: "ARCHITECTURE",
-    unlock: 84,
-    summary: "Recovered at The ranger trail. The audio reel records that the handwriting matches an officer who has not yet joined the force. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The ranger trail): “I heard someone praying in the chapel. The chapel’s microphone was unplugged.”",
-    analysis: "Do not destroy the original. A later file may refer to this exact mark. The original report describes a separate detail: the handwriting matches an officer who has not yet joined the force.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: The ranger trail. Artifact type: Audio Reel.",
-  },
-  {
-    id: "night-file-171",
-    title: "Night File 171 — Room Key Ledger / Cypress Farmhouse",
-    category: "FIELD NOTE",
-    unlock: 85,
-    summary: "Recovered at Cypress Farmhouse. The room key ledger records that the map scale changes only around one house. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Cypress Farmhouse): “I heard the plane overhead, but the sky in the photograph was indoors.”",
-    analysis: "The safest working theory is an imitator altering the timeline and the records. The original report describes a separate detail: the map scale changes only around one house.",
-    followup: "Verify the identity through the roster rather than through the voice. Source location: Cypress Farmhouse. Artifact type: Room Key Ledger.",
-  },
-  {
-    id: "night-file-172",
-    title: "Night File 172 — Graveyard Inventory / County Clinic",
-    category: "ARCHITECTURE",
-    unlock: 85,
-    summary: "Recovered at County Clinic. The graveyard inventory records that the page lists an exit before the corresponding entrance. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (County Clinic): “A whisper came through the speaker. The speaker was missing its cone.”",
-    analysis: "The report’s conclusion was copied from a case file that was still sealed. The original report describes a separate detail: the page lists an exit before the corresponding entrance.",
-    followup: "Do not confuse the apparition with the real witness in your case file. Source location: County Clinic. Artifact type: Graveyard Inventory.",
-  },
-  {
-    id: "night-file-173",
-    title: "Night File 173 — Lost Property Card / Camera Four",
-    category: "FIELD NOTE",
-    unlock: 86,
-    summary: "Recovered at Camera Four. The lost property card records that the voice says the next word before the speaker moves their mouth. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Camera Four): “The person asked to be admitted. The roster showed they had already been admitted.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the voice says the next word before the speaker moves their mouth.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: Camera Four. Artifact type: Lost Property Card.",
-  },
-  {
-    id: "night-file-174",
-    title: "Night File 174 — Duty Roster Copy / The perimeter fence",
-    category: "ARCHITECTURE",
-    unlock: 86,
-    summary: "Recovered at The perimeter fence. The duty roster copy records that the reflected figure looks toward the camera after the camera has been removed. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The perimeter fence): “The officer entered alone. The microphone captured two sets of boots.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the reflected figure looks toward the camera after the camera has been removed.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: The perimeter fence. Artifact type: Duty Roster Copy.",
-  },
-  {
-    id: "night-file-175",
-    title: "Night File 175 — Photograph Envelope / County Police Station",
-    category: "FIELD NOTE",
-    unlock: 87,
-    summary: "Recovered at County Police Station. The photograph envelope records that the paper has a dry footprint beneath a fresh water stain. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (County Police Station): “The room was empty, but the chair was still slowly turning.”",
-    analysis: "The consistent detail is the number of arrivals: one more than the official count. The original report describes a separate detail: the paper has a dry footprint beneath a fresh water stain.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: County Police Station. Artifact type: Photograph Envelope.",
-  },
-  {
-    id: "night-file-176",
-    title: "Night File 176 — Flashlight Test Record / Leaning Cabin",
-    category: "ARCHITECTURE",
-    unlock: 87,
-    summary: "Recovered at Leaning Cabin. The flashlight test record records that the image shows a door that does not exist in the mapped floor plan. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Leaning Cabin): “I wrote the report after the event. The report is dated before it.”",
-    analysis: "The camera is not merely failing to record. It is recording a different room. The original report describes a separate detail: the image shows a door that does not exist in the mapped floor plan.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: Leaning Cabin. Artifact type: Flashlight Test Record.",
-  },
-  {
-    id: "night-file-177",
-    title: "Night File 177 — Rain Gauge Sheet / Holding Room Two",
-    category: "FIELD NOTE",
-    unlock: 88,
-    summary: "Recovered at Holding Room Two. The rain gauge sheet records that the negative shows seven people but the print shows six. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Holding Room Two): “The badge was genuine. The officer wearing it was not on the roster.”",
-    analysis: "This record is linked to at least one earlier missing-item report. The original report describes a separate detail: the negative shows seven people but the print shows six.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: Holding Room Two. Artifact type: Rain Gauge Sheet.",
-  },
-  {
-    id: "night-file-178",
-    title: "Night File 178 — Flood Map / The upstairs landing",
-    category: "ARCHITECTURE",
-    unlock: 88,
-    summary: "Recovered at The upstairs landing. The flood map records that the door opens on camera but the handle never moves. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The upstairs landing): “The car in the picture has no driver. Its shadow has someone at the wheel.”",
-    analysis: "The discrepancy repeats after power is restored, which weakens the electrical-fault theory. The original report describes a separate detail: the door opens on camera but the handle never moves.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: The upstairs landing. Artifact type: Flood Map.",
-  },
-  {
-    id: "night-file-179",
-    title: "Night File 179 — Room Key Ledger / The evidence cage",
-    category: "FIELD NOTE",
-    unlock: 89,
-    summary: "Recovered at The evidence cage. The room key ledger records that the filing date is tomorrow while the postmark is eleven years old. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The evidence cage): “A whisper came through the speaker. The speaker was missing its cone.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the filing date is tomorrow while the postmark is eleven years old.",
-    followup: "Mark the anomaly, then continue the investigation without answering the voice. Source location: The evidence cage. Artifact type: Room Key Ledger.",
-  },
-  {
-    id: "night-file-180",
-    title: "Night File 180 — Visitor Register / Swamp Gas Stop",
-    category: "RADIO",
-    unlock: 89,
-    summary: "Recovered at Swamp Gas Stop. The visitor register records that the call originated from the receiver that was physically disconnected. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Swamp Gas Stop): “I could hear rain on the roof. The weather station says there was no rain.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the call originated from the receiver that was physically disconnected.",
-    followup: "Keep the original evidence sealed and study another independent source. Source location: Swamp Gas Stop. Artifact type: Visitor Register.",
-  },
-  {
-    id: "night-file-181",
-    title: "Night File 181 — Evidence Seal / Mile Marker Nine",
-    category: "AUDIO",
-    unlock: 90,
-    summary: "Recovered at Mile Marker Nine. The evidence seal records that the call sign is valid but its owner has never been assigned to this county. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Mile Marker Nine): “Please file the negative separately. The print does not show everyone.”",
-    analysis: "A duplicate identity is more likely than a second authorized unit. The original report describes a separate detail: the call sign is valid but its owner has never been assigned to this county.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: Mile Marker Nine. Artifact type: Evidence Seal.",
-  },
-  {
-    id: "night-file-182",
-    title: "Night File 182 — Duty Roster Copy / The old dispatch booth",
-    category: "RADIO",
-    unlock: 90,
-    summary: "Recovered at The old dispatch booth. The duty roster copy records that the badge number belongs to a record marked deleted before it was created. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The old dispatch booth): “A second flashlight moved beside mine. I was holding mine with both hands.”",
-    analysis: "The object is real. Its provenance is impossible. The original report describes a separate detail: the badge number belongs to a record marked deleted before it was created.",
-    followup: "Read the related note before attempting to submit your theory. Source location: The old dispatch booth. Artifact type: Duty Roster Copy.",
-  },
-  {
-    id: "night-file-183",
-    title: "Night File 183 — Badge Inspection Sheet / The locked generator room",
-    category: "AUDIO",
-    unlock: 91,
-    summary: "Recovered at The locked generator room. The badge inspection sheet records that the ink remains warm despite the paper being soaked. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The locked generator room): “I wrote the report after the event. The report is dated before it.”",
-    analysis: "The sound is not an echo. It contains a new word that was never spoken aloud. The original report describes a separate detail: the ink remains warm despite the paper being soaked.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: The locked generator room. Artifact type: Badge Inspection Sheet.",
-  },
-  {
-    id: "night-file-184",
-    title: "Night File 184 — Handwritten Prayer / Radio Relay Hut",
-    category: "RADIO",
-    unlock: 91,
-    summary: "Recovered at Radio Relay Hut. The handwritten prayer records that the station map marks the same room on two separate floors. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Radio Relay Hut): “The desk clerk asked me to sign the visitor log. My signature was already there.”",
-    analysis: "The room layout is stable; the recorded route is what changes. The original report describes a separate detail: the station map marks the same room on two separate floors.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: Radio Relay Hut. Artifact type: Handwritten Prayer.",
-  },
-  {
-    id: "night-file-185",
-    title: "Night File 185 — Rain Gauge Sheet / North Culvert",
-    category: "AUDIO",
-    unlock: 92,
-    summary: "Recovered at North Culvert. The rain gauge sheet records that the recorded footsteps are one step ahead of the person walking. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (North Culvert): “The tape ends when the voice says my name, not when the recorder stops.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the recorded footsteps are one step ahead of the person walking.",
-    followup: "Read the related note before attempting to submit your theory. Source location: North Culvert. Artifact type: Rain Gauge Sheet.",
-  },
-  {
-    id: "night-file-186",
-    title: "Night File 186 — Interview Notes / The chapel basement",
-    category: "RADIO",
-    unlock: 92,
-    summary: "Recovered at The chapel basement. The interview notes records that the handwriting matches an officer who has not yet joined the force. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The chapel basement): “The seventh person waited patiently. The sixth person was the room itself.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the handwriting matches an officer who has not yet joined the force.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: The chapel basement. Artifact type: Interview Notes.",
-  },
-  {
-    id: "night-file-187",
-    title: "Night File 187 — Witness Statement / The storage loft",
-    category: "AUDIO",
-    unlock: 93,
-    summary: "Recovered at The storage loft. The witness statement records that the map scale changes only around one house. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The storage loft): “I could hear rain on the roof. The weather station says there was no rain.”",
-    analysis: "Do not use the timestamp alone. Two independent records repeat the same contradiction. The original report describes a separate detail: the map scale changes only around one house.",
-    followup: "Verify the identity through the roster rather than through the voice. Source location: The storage loft. Artifact type: Witness Statement.",
-  },
-  {
-    id: "night-file-188",
-    title: "Night File 188 — Visitor Register / St. Mercy Chapel",
-    category: "RADIO",
-    unlock: 93,
-    summary: "Recovered at St. Mercy Chapel. The visitor register records that the page lists an exit before the corresponding entrance. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (St. Mercy Chapel): “If the radio uses your own voice, do not answer in the same channel.”",
-    analysis: "This anomaly becomes more consistent when the flashlight is turned away. The original report describes a separate detail: the page lists an exit before the corresponding entrance.",
-    followup: "Do not confuse the apparition with the real witness in your case file. Source location: St. Mercy Chapel. Artifact type: Visitor Register.",
-  },
-  {
-    id: "night-file-189",
-    title: "Night File 189 — Door Sensor Log / Road Maintenance Depot",
-    category: "AUDIO",
-    unlock: 94,
-    summary: "Recovered at Road Maintenance Depot. The door sensor log records that the dust outline shows an object still present in the current photograph. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Road Maintenance Depot): “The footprints stopped at the wall. The wall was wet on the other side.”",
-    analysis: "The physical record appears authentic; the impossible part is the event it describes. The original report describes a separate detail: the dust outline shows an object still present in the current photograph.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: Road Maintenance Depot. Artifact type: Door Sensor Log.",
-  },
-  {
-    id: "night-file-190",
-    title: "Night File 190 — Tape Index / The flooded footpath",
-    category: "MISSING OBJECT",
-    unlock: 94,
-    summary: "Recovered at The flooded footpath. The tape index records that the room count is larger than the building count. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The flooded footpath): “The lights went out. The person at the end of the hall kept casting a shadow.”",
-    analysis: "Cross-reference this with the bodycam and the roster before making a decision. The original report describes a separate detail: the room count is larger than the building count.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: The flooded footpath. Artifact type: Tape Index.",
-  },
-  {
-    id: "night-file-191",
-    title: "Night File 191 — Badge Inspection Sheet / The infirmary",
-    category: "PHOTOGRAPH",
-    unlock: 95,
-    summary: "Recovered at The infirmary. The badge inspection sheet records that the paper has a dry footprint beneath a fresh water stain. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The infirmary): “The desk clerk asked me to sign the visitor log. My signature was already there.”",
-    analysis: "Treat the record as evidence of sequence corruption, not a harmless clerical error. The original report describes a separate detail: the paper has a dry footprint beneath a fresh water stain.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: The infirmary. Artifact type: Badge Inspection Sheet.",
-  },
-  {
-    id: "night-file-192",
-    title: "Night File 192 — Camera Still / Pine Rest Motel",
-    category: "MISSING OBJECT",
-    unlock: 95,
-    summary: "Recovered at Pine Rest Motel. The camera still records that the image shows a door that does not exist in the mapped floor plan. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Pine Rest Motel): “The key fit the lock. The lock insisted it had never been installed.”",
-    analysis: "Treat the record as evidence of sequence corruption, not a harmless clerical error. The original report describes a separate detail: the image shows a door that does not exist in the mapped floor plan.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: Pine Rest Motel. Artifact type: Camera Still.",
-  },
-  {
-    id: "night-file-193",
-    title: "Night File 193 — Unknown Caller Slip / Last Stop Diner",
-    category: "PHOTOGRAPH",
-    unlock: 96,
-    summary: "Recovered at Last Stop Diner. The unknown caller slip records that the negative shows seven people but the print shows six. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Last Stop Diner): “The file was sealed. Something had already read the last page.”",
-    analysis: "The absence of a witness does not mean the event did not occur. The original report describes a separate detail: the negative shows seven people but the print shows six.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: Last Stop Diner. Artifact type: Unknown Caller Slip.",
-  },
-  {
-    id: "night-file-194",
-    title: "Night File 194 — Interview Notes / The east hallway",
-    category: "MISSING OBJECT",
-    unlock: 96,
-    summary: "Recovered at The east hallway. The interview notes records that the door opens on camera but the handle never moves. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The east hallway): “I took one photograph. The envelope came back with three negatives.”",
-    analysis: "Do not destroy the original. A later file may refer to this exact mark. The original report describes a separate detail: the door opens on camera but the handle never moves.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: The east hallway. Artifact type: Interview Notes.",
-  },
-  {
-    id: "night-file-195",
-    title: "Night File 195 — Fingerprint Sleeve / The ranger trail",
-    category: "PHOTOGRAPH",
-    unlock: 97,
-    summary: "Recovered at The ranger trail. The fingerprint sleeve records that the filing date is tomorrow while the postmark is eleven years old. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The ranger trail): “If the radio uses your own voice, do not answer in the same channel.”",
-    analysis: "The safest working theory is an imitator altering the timeline and the records. The original report describes a separate detail: the filing date is tomorrow while the postmark is eleven years old.",
-    followup: "Mark the anomaly, then continue the investigation without answering the voice. Source location: The ranger trail. Artifact type: Fingerprint Sleeve.",
-  },
-  {
-    id: "night-file-196",
-    title: "Night File 196 — Bodycam Cassette / Cypress Farmhouse",
-    category: "MISSING OBJECT",
-    unlock: 97,
-    summary: "Recovered at Cypress Farmhouse. The bodycam cassette records that the camera frame contains the photographer standing behind themself. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Cypress Farmhouse): “Every clock was stopped at a different minute. The file listed them as synchronized.”",
-    analysis: "The report’s conclusion was copied from a case file that was still sealed. The original report describes a separate detail: the camera frame contains the photographer standing behind themself.",
-    followup: "Keep the original evidence sealed and study another independent source. Source location: Cypress Farmhouse. Artifact type: Bodycam Cassette.",
-  },
-  {
-    id: "night-file-197",
-    title: "Night File 197 — Door Sensor Log / County Clinic",
-    category: "PHOTOGRAPH",
-    unlock: 98,
-    summary: "Recovered at County Clinic. The door sensor log records that the photograph contains a person who was born years after it was taken. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (County Clinic): “There was a second name under mine. It was written in my handwriting.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the photograph contains a person who was born years after it was taken.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: County Clinic. Artifact type: Door Sensor Log.",
-  },
-  {
-    id: "night-file-198",
-    title: "Night File 198 — Medical Intake Form / Camera Four",
-    category: "MISSING OBJECT",
-    unlock: 98,
-    summary: "Recovered at Camera Four. The medical intake form records that the badge number belongs to a record marked deleted before it was created. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Camera Four): “I left the room before the alarm. The recording shows me still inside it.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the badge number belongs to a record marked deleted before it was created.",
-    followup: "Read the related note before attempting to submit your theory. Source location: Camera Four. Artifact type: Medical Intake Form.",
-  },
-  {
-    id: "night-file-199",
-    title: "Night File 199 — Night Roster / The perimeter fence",
-    category: "PHOTOGRAPH",
-    unlock: 99,
-    summary: "Recovered at The perimeter fence. The night roster records that the ink remains warm despite the paper being soaked. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The perimeter fence): “The key fit the lock. The lock insisted it had never been installed.”",
-    analysis: "The consistent detail is the number of arrivals: one more than the official count. The original report describes a separate detail: the ink remains warm despite the paper being soaked.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: The perimeter fence. Artifact type: Night Roster.",
-  },
-  {
-    id: "night-file-200",
-    title: "Night File 200 — Camera Still / County Police Station",
-    category: "STATION",
-    unlock: 99,
-    summary: "Recovered at County Police Station. The camera still records that the station map marks the same room on two separate floors. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (County Police Station): “I counted six knocks. The seventh came from inside the desk.”",
-    analysis: "The camera is not merely failing to record. It is recording a different room. The original report describes a separate detail: the station map marks the same room on two separate floors.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: County Police Station. Artifact type: Camera Still.",
-  },
-  {
-    id: "night-file-201",
-    title: "Night File 201 — Photographic Negative / Leaning Cabin",
-    category: "ROSTER",
-    unlock: 100,
-    summary: "Recovered at Leaning Cabin. The photographic negative records that the recorded footsteps are one step ahead of the person walking. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Leaning Cabin): “The witness did not lie. The statement did.”",
-    analysis: "This record is linked to at least one earlier missing-item report. The original report describes a separate detail: the recorded footsteps are one step ahead of the person walking.",
-    followup: "Read the related note before attempting to submit your theory. Source location: Leaning Cabin. Artifact type: Photographic Negative.",
-  },
-  {
-    id: "night-file-202",
-    title: "Night File 202 — Maintenance Ticket / Holding Room Two",
-    category: "STATION",
-    unlock: 100,
-    summary: "Recovered at Holding Room Two. The maintenance ticket records that the handwriting matches an officer who has not yet joined the force. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Holding Room Two): “I locked the room from the outside. The next frame shows me locking it from within.”",
-    analysis: "The discrepancy repeats after power is restored, which weakens the electrical-fault theory. The original report describes a separate detail: the handwriting matches an officer who has not yet joined the force.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: Holding Room Two. Artifact type: Maintenance Ticket.",
-  },
-  {
-    id: "night-file-203",
-    title: "Night File 203 — Fingerprint Sleeve / The upstairs landing",
-    category: "ROSTER",
-    unlock: 101,
-    summary: "Recovered at The upstairs landing. The fingerprint sleeve records that the witness remembers an event listed in a report not yet written. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The upstairs landing): “Every clock was stopped at a different minute. The file listed them as synchronized.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the witness remembers an event listed in a report not yet written.",
-    followup: "Verify the identity through the roster rather than through the voice. Source location: The upstairs landing. Artifact type: Fingerprint Sleeve.",
-  },
-  {
-    id: "night-file-204",
-    title: "Night File 204 — Dispatch Transcript / The evidence cage",
-    category: "STATION",
-    unlock: 101,
-    summary: "Recovered at The evidence cage. The dispatch transcript records that the recorded voice has the same cadence as the listener. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The evidence cage): “I heard the plane overhead, but the sky in the photograph was indoors.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the recorded voice has the same cadence as the listener.",
-    followup: "Do not confuse the apparition with the real witness in your case file. Source location: The evidence cage. Artifact type: Dispatch Transcript.",
-  },
-  {
-    id: "night-file-205",
-    title: "Night File 205 — Incident Ledger / Swamp Gas Stop",
-    category: "ROSTER",
-    unlock: 102,
-    summary: "Recovered at Swamp Gas Stop. The incident ledger records that the dust outline shows an object still present in the current photograph. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Swamp Gas Stop): “The photograph captured a face. The person had their back to the camera.”",
-    analysis: "A duplicate identity is more likely than a second authorized unit. The original report describes a separate detail: the dust outline shows an object still present in the current photograph.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: Swamp Gas Stop. Artifact type: Incident Ledger.",
-  },
-  {
-    id: "night-file-206",
-    title: "Night File 206 — Medical Intake Form / Mile Marker Nine",
-    category: "STATION",
-    unlock: 102,
-    summary: "Recovered at Mile Marker Nine. The medical intake form records that the room count is larger than the building count. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Mile Marker Nine): “We opened the file and found tomorrow’s evidence inside.”",
-    analysis: "The object is real. Its provenance is impossible. The original report describes a separate detail: the room count is larger than the building count.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: Mile Marker Nine. Artifact type: Medical Intake Form.",
-  },
-  {
-    id: "night-file-207",
-    title: "Night File 207 — Audio Reel / The old dispatch booth",
-    category: "ROSTER",
-    unlock: 103,
-    summary: "Recovered at The old dispatch booth. The audio reel records that the paper has a dry footprint beneath a fresh water stain. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The old dispatch booth): “I counted six knocks. The seventh came from inside the desk.”",
-    analysis: "The sound is not an echo. It contains a new word that was never spoken aloud. The original report describes a separate detail: the paper has a dry footprint beneath a fresh water stain.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: The old dispatch booth. Artifact type: Audio Reel.",
-  },
-  {
-    id: "night-file-208",
-    title: "Night File 208 — Radio Frequency Chart / The locked generator room",
-    category: "STATION",
-    unlock: 103,
-    summary: "Recovered at The locked generator room. The radio frequency chart records that the image shows a door that does not exist in the mapped floor plan. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The locked generator room): “The room was empty, but the chair was still slowly turning.”",
-    analysis: "The room layout is stable; the recorded route is what changes. The original report describes a separate detail: the image shows a door that does not exist in the mapped floor plan.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: The locked generator room. Artifact type: Radio Frequency Chart.",
-  },
-  {
-    id: "night-file-209",
-    title: "Night File 209 — Photographic Negative / Radio Relay Hut",
-    category: "ROSTER",
-    unlock: 104,
-    summary: "Recovered at Radio Relay Hut. The photographic negative records that the negative shows seven people but the print shows six. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Radio Relay Hut): “The visitor was polite. The reflection was not.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the negative shows seven people but the print shows six.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: Radio Relay Hut. Artifact type: Photographic Negative.",
-  },
-  {
-    id: "night-file-210",
-    title: "Night File 210 — Lost Property Card / North Culvert",
-    category: "BODYCAM",
-    unlock: 104,
-    summary: "Recovered at North Culvert. The lost property card records that the timestamp moves backward whenever the page is turned. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (North Culvert): “I heard someone praying in the chapel. The chapel’s microphone was unplugged.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the timestamp moves backward whenever the page is turned.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: North Culvert. Artifact type: Lost Property Card.",
-  },
-  {
-    id: "night-file-211",
-    title: "Night File 211 — Emergency Bulletin / The chapel basement",
-    category: "FORENSIC",
-    unlock: 105,
-    summary: "Recovered at The chapel basement. The emergency bulletin records that the shadow crosses the room in the opposite direction from its owner. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The chapel basement): “I heard the plane overhead, but the sky in the photograph was indoors.”",
-    analysis: "Do not use the timestamp alone. Two independent records repeat the same contradiction. The original report describes a separate detail: the shadow crosses the room in the opposite direction from its owner.",
-    followup: "Mark the anomaly, then continue the investigation without answering the voice. Source location: The chapel basement. Artifact type: Emergency Bulletin.",
-  },
-  {
-    id: "night-file-212",
-    title: "Night File 212 — Dispatch Transcript / The storage loft",
-    category: "BODYCAM",
-    unlock: 105,
-    summary: "Recovered at The storage loft. The dispatch transcript records that the camera frame contains the photographer standing behind themself. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The storage loft): “A whisper came through the speaker. The speaker was missing its cone.”",
-    analysis: "This anomaly becomes more consistent when the flashlight is turned away. The original report describes a separate detail: the camera frame contains the photographer standing behind themself.",
-    followup: "Keep the original evidence sealed and study another independent source. Source location: The storage loft. Artifact type: Dispatch Transcript.",
-  },
-  {
-    id: "night-file-213",
-    title: "Night File 213 — Flashlight Test Record / St. Mercy Chapel",
-    category: "FORENSIC",
-    unlock: 106,
-    summary: "Recovered at St. Mercy Chapel. The flashlight test record records that the photograph contains a person who was born years after it was taken. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (St. Mercy Chapel): “The person asked to be admitted. The roster showed they had already been admitted.”",
-    analysis: "The physical record appears authentic; the impossible part is the event it describes. The original report describes a separate detail: the photograph contains a person who was born years after it was taken.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: St. Mercy Chapel. Artifact type: Flashlight Test Record.",
-  },
-  {
-    id: "night-file-214",
-    title: "Night File 214 — Power Interruption Log / Road Maintenance Depot",
-    category: "BODYCAM",
-    unlock: 106,
-    summary: "Recovered at Road Maintenance Depot. The power interruption log records that the badge number belongs to a record marked deleted before it was created. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Road Maintenance Depot): “The officer entered alone. The microphone captured two sets of boots.”",
-    analysis: "Cross-reference this with the bodycam and the roster before making a decision. The original report describes a separate detail: the badge number belongs to a record marked deleted before it was created.",
-    followup: "Read the related note before attempting to submit your theory. Source location: Road Maintenance Depot. Artifact type: Power Interruption Log.",
-  },
-  {
-    id: "night-file-215",
-    title: "Night File 215 — Audio Reel / The flooded footpath",
-    category: "FORENSIC",
-    unlock: 107,
-    summary: "Recovered at The flooded footpath. The audio reel records that the ink remains warm despite the paper being soaked. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The flooded footpath): “The room was empty, but the chair was still slowly turning.”",
-    analysis: "Treat the record as evidence of sequence corruption, not a harmless clerical error. The original report describes a separate detail: the ink remains warm despite the paper being soaked.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: The flooded footpath. Artifact type: Audio Reel.",
-  },
-  {
-    id: "night-file-216",
-    title: "Night File 216 — Room Key Ledger / The infirmary",
-    category: "BODYCAM",
-    unlock: 107,
-    summary: "Recovered at The infirmary. The room key ledger records that the station map marks the same room on two separate floors. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The infirmary): “I wrote the report after the event. The report is dated before it.”",
-    analysis: "Treat the record as evidence of sequence corruption, not a harmless clerical error. The original report describes a separate detail: the station map marks the same room on two separate floors.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: The infirmary. Artifact type: Room Key Ledger.",
-  },
-  {
-    id: "night-file-217",
-    title: "Night File 217 — Graveyard Inventory / Pine Rest Motel",
-    category: "FORENSIC",
-    unlock: 108,
-    summary: "Recovered at Pine Rest Motel. The graveyard inventory records that a second signature appears beneath a single original signature. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Pine Rest Motel): “The badge was genuine. The officer wearing it was not on the roster.”",
-    analysis: "The absence of a witness does not mean the event did not occur. The original report describes a separate detail: a second signature appears beneath a single original signature.",
-    followup: "Read the related note before attempting to submit your theory. Source location: Pine Rest Motel. Artifact type: Graveyard Inventory.",
-  },
-  {
-    id: "night-file-218",
-    title: "Night File 218 — Lost Property Card / Last Stop Diner",
-    category: "BODYCAM",
-    unlock: 108,
-    summary: "Recovered at Last Stop Diner. The lost property card records that the door sensor reports a person leaving while the room is still occupied. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Last Stop Diner): “The car in the picture has no driver. Its shadow has someone at the wheel.”",
-    analysis: "Do not destroy the original. A later file may refer to this exact mark. The original report describes a separate detail: the door sensor reports a person leaving while the room is still occupied.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: Last Stop Diner. Artifact type: Lost Property Card.",
-  },
-  {
-    id: "night-file-219",
-    title: "Night File 219 — Duty Roster Copy / The east hallway",
-    category: "FORENSIC",
-    unlock: 109,
-    summary: "Recovered at The east hallway. The duty roster copy records that the witness remembers an event listed in a report not yet written. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The east hallway): “A whisper came through the speaker. The speaker was missing its cone.”",
-    analysis: "The safest working theory is an imitator altering the timeline and the records. The original report describes a separate detail: the witness remembers an event listed in a report not yet written.",
-    followup: "Verify the identity through the roster rather than through the voice. Source location: The east hallway. Artifact type: Duty Roster Copy.",
-  },
-  {
-    id: "night-file-220",
-    title: "Night File 220 — Photograph Envelope / The ranger trail",
-    category: "FIELD NOTE",
-    unlock: 109,
-    summary: "Recovered at The ranger trail. The photograph envelope records that the recorded voice has the same cadence as the listener. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The ranger trail): “I could hear rain on the roof. The weather station says there was no rain.”",
-    analysis: "The report’s conclusion was copied from a case file that was still sealed. The original report describes a separate detail: the recorded voice has the same cadence as the listener.",
-    followup: "Do not confuse the apparition with the real witness in your case file. Source location: The ranger trail. Artifact type: Photograph Envelope.",
-  },
-  {
-    id: "night-file-221",
-    title: "Night File 221 — Flashlight Test Record / Cypress Farmhouse",
-    category: "ARCHITECTURE",
-    unlock: 110,
-    summary: "Recovered at Cypress Farmhouse. The flashlight test record records that the dust outline shows an object still present in the current photograph. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Cypress Farmhouse): “Please file the negative separately. The print does not show everyone.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the dust outline shows an object still present in the current photograph.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: Cypress Farmhouse. Artifact type: Flashlight Test Record.",
-  },
-  {
-    id: "night-file-222",
-    title: "Night File 222 — Rain Gauge Sheet / County Clinic",
-    category: "FIELD NOTE",
-    unlock: 110,
-    summary: "Recovered at County Clinic. The rain gauge sheet records that the room count is larger than the building count. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (County Clinic): “A second flashlight moved beside mine. I was holding mine with both hands.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the room count is larger than the building count.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: County Clinic. Artifact type: Rain Gauge Sheet.",
-  },
-  {
-    id: "night-file-223",
-    title: "Night File 223 — Flood Map / Camera Four",
-    category: "ARCHITECTURE",
-    unlock: 111,
-    summary: "Recovered at Camera Four. The flood map records that the paper has a dry footprint beneath a fresh water stain. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Camera Four): “I wrote the report after the event. The report is dated before it.”",
-    analysis: "The consistent detail is the number of arrivals: one more than the official count. The original report describes a separate detail: the paper has a dry footprint beneath a fresh water stain.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: Camera Four. Artifact type: Flood Map.",
-  },
-  {
-    id: "night-file-224",
-    title: "Night File 224 — Room Key Ledger / The perimeter fence",
-    category: "FIELD NOTE",
-    unlock: 111,
-    summary: "Recovered at The perimeter fence. The room key ledger records that the audio contains a response before the question is spoken. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The perimeter fence): “The desk clerk asked me to sign the visitor log. My signature was already there.”",
-    analysis: "The camera is not merely failing to record. It is recording a different room. The original report describes a separate detail: the audio contains a response before the question is spoken.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: The perimeter fence. Artifact type: Room Key Ledger.",
-  },
-  {
-    id: "night-file-225",
-    title: "Night File 225 — Visitor Register / County Police Station",
-    category: "ARCHITECTURE",
-    unlock: 112,
-    summary: "Recovered at County Police Station. The visitor register records that the inventory count increases after every audit. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (County Police Station): “The tape ends when the voice says my name, not when the recorder stops.”",
-    analysis: "This record is linked to at least one earlier missing-item report. The original report describes a separate detail: the inventory count increases after every audit.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: County Police Station. Artifact type: Visitor Register.",
-  },
-  {
-    id: "night-file-226",
-    title: "Night File 226 — Evidence Seal / Leaning Cabin",
-    category: "FIELD NOTE",
-    unlock: 112,
-    summary: "Recovered at Leaning Cabin. The evidence seal records that the timestamp moves backward whenever the page is turned. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Leaning Cabin): “The seventh person waited patiently. The sixth person was the room itself.”",
-    analysis: "The discrepancy repeats after power is restored, which weakens the electrical-fault theory. The original report describes a separate detail: the timestamp moves backward whenever the page is turned.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: Leaning Cabin. Artifact type: Evidence Seal.",
-  },
-  {
-    id: "night-file-227",
-    title: "Night File 227 — Duty Roster Copy / Holding Room Two",
-    category: "ARCHITECTURE",
-    unlock: 113,
-    summary: "Recovered at Holding Room Two. The duty roster copy records that the shadow crosses the room in the opposite direction from its owner. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Holding Room Two): “I could hear rain on the roof. The weather station says there was no rain.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the shadow crosses the room in the opposite direction from its owner.",
-    followup: "Mark the anomaly, then continue the investigation without answering the voice. Source location: Holding Room Two. Artifact type: Duty Roster Copy.",
-  },
-  {
-    id: "night-file-228",
-    title: "Night File 228 — Badge Inspection Sheet / The upstairs landing",
-    category: "FIELD NOTE",
-    unlock: 113,
-    summary: "Recovered at The upstairs landing. The badge inspection sheet records that the camera frame contains the photographer standing behind themself. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The upstairs landing): “If the radio uses your own voice, do not answer in the same channel.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the camera frame contains the photographer standing behind themself.",
-    followup: "Keep the original evidence sealed and study another independent source. Source location: The upstairs landing. Artifact type: Badge Inspection Sheet.",
-  },
-  {
-    id: "night-file-229",
-    title: "Night File 229 — Handwritten Prayer / The evidence cage",
-    category: "ARCHITECTURE",
-    unlock: 114,
-    summary: "Recovered at The evidence cage. The handwritten prayer records that the photograph contains a person who was born years after it was taken. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The evidence cage): “The footprints stopped at the wall. The wall was wet on the other side.”",
-    analysis: "A duplicate identity is more likely than a second authorized unit. The original report describes a separate detail: the photograph contains a person who was born years after it was taken.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: The evidence cage. Artifact type: Handwritten Prayer.",
-  },
-  {
-    id: "night-file-230",
-    title: "Night File 230 — Rain Gauge Sheet / Swamp Gas Stop",
-    category: "AUDIO",
-    unlock: 114,
-    summary: "Recovered at Swamp Gas Stop. The rain gauge sheet records that the badge number belongs to a record marked deleted before it was created. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Swamp Gas Stop): “The lights went out. The person at the end of the hall kept casting a shadow.”",
-    analysis: "The object is real. Its provenance is impossible. The original report describes a separate detail: the badge number belongs to a record marked deleted before it was created.",
-    followup: "Read the related note before attempting to submit your theory. Source location: Swamp Gas Stop. Artifact type: Rain Gauge Sheet.",
-  },
-  {
-    id: "night-file-231",
-    title: "Night File 231 — Interview Notes / Mile Marker Nine",
-    category: "RADIO",
-    unlock: 115,
-    summary: "Recovered at Mile Marker Nine. The interview notes records that the reflected figure looks toward the camera after the camera has been removed. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Mile Marker Nine): “The desk clerk asked me to sign the visitor log. My signature was already there.”",
-    analysis: "The sound is not an echo. It contains a new word that was never spoken aloud. The original report describes a separate detail: the reflected figure looks toward the camera after the camera has been removed.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: Mile Marker Nine. Artifact type: Interview Notes.",
-  },
-  {
-    id: "night-file-232",
-    title: "Night File 232 — Witness Statement / The old dispatch booth",
-    category: "AUDIO",
-    unlock: 115,
-    summary: "Recovered at The old dispatch booth. The witness statement records that the radio records a transmission during a documented power outage. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The old dispatch booth): “The key fit the lock. The lock insisted it had never been installed.”",
-    analysis: "The room layout is stable; the recorded route is what changes. The original report describes a separate detail: the radio records a transmission during a documented power outage.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: The old dispatch booth. Artifact type: Witness Statement.",
-  },
-  {
-    id: "night-file-233",
-    title: "Night File 233 — Visitor Register / The locked generator room",
-    category: "RADIO",
-    unlock: 116,
-    summary: "Recovered at The locked generator room. The visitor register records that a second signature appears beneath a single original signature. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The locked generator room): “The file was sealed. Something had already read the last page.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: a second signature appears beneath a single original signature.",
-    followup: "Read the related note before attempting to submit your theory. Source location: The locked generator room. Artifact type: Visitor Register.",
-  },
-  {
-    id: "night-file-234",
-    title: "Night File 234 — Door Sensor Log / Radio Relay Hut",
-    category: "AUDIO",
-    unlock: 116,
-    summary: "Recovered at Radio Relay Hut. The door sensor log records that the door sensor reports a person leaving while the room is still occupied. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Radio Relay Hut): “I took one photograph. The envelope came back with three negatives.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the door sensor reports a person leaving while the room is still occupied.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: Radio Relay Hut. Artifact type: Door Sensor Log.",
-  },
-  {
-    id: "night-file-235",
-    title: "Night File 235 — Tape Index / North Culvert",
-    category: "RADIO",
-    unlock: 117,
-    summary: "Recovered at North Culvert. The tape index records that the witness remembers an event listed in a report not yet written. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (North Culvert): “If the radio uses your own voice, do not answer in the same channel.”",
-    analysis: "Do not use the timestamp alone. Two independent records repeat the same contradiction. The original report describes a separate detail: the witness remembers an event listed in a report not yet written.",
-    followup: "Verify the identity through the roster rather than through the voice. Source location: North Culvert. Artifact type: Tape Index.",
-  },
-  {
-    id: "night-file-236",
-    title: "Night File 236 — Badge Inspection Sheet / The chapel basement",
-    category: "AUDIO",
-    unlock: 117,
-    summary: "Recovered at The chapel basement. The badge inspection sheet records that the recorded voice has the same cadence as the listener. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The chapel basement): “Every clock was stopped at a different minute. The file listed them as synchronized.”",
-    analysis: "This anomaly becomes more consistent when the flashlight is turned away. The original report describes a separate detail: the recorded voice has the same cadence as the listener.",
-    followup: "Do not confuse the apparition with the real witness in your case file. Source location: The chapel basement. Artifact type: Badge Inspection Sheet.",
-  },
-  {
-    id: "night-file-237",
-    title: "Night File 237 — Camera Still / The storage loft",
-    category: "RADIO",
-    unlock: 118,
-    summary: "Recovered at The storage loft. The camera still records that the dust outline shows an object still present in the current photograph. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The storage loft): “There was a second name under mine. It was written in my handwriting.”",
-    analysis: "The physical record appears authentic; the impossible part is the event it describes. The original report describes a separate detail: the dust outline shows an object still present in the current photograph.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: The storage loft. Artifact type: Camera Still.",
-  },
-  {
-    id: "night-file-238",
-    title: "Night File 238 — Unknown Caller Slip / St. Mercy Chapel",
-    category: "AUDIO",
-    unlock: 118,
-    summary: "Recovered at St. Mercy Chapel. The unknown caller slip records that the call sign is valid but its owner has never been assigned to this county. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (St. Mercy Chapel): “I left the room before the alarm. The recording shows me still inside it.”",
-    analysis: "Cross-reference this with the bodycam and the roster before making a decision. The original report describes a separate detail: the call sign is valid but its owner has never been assigned to this county.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: St. Mercy Chapel. Artifact type: Unknown Caller Slip.",
-  },
-  {
-    id: "night-file-239",
-    title: "Night File 239 — Interview Notes / Road Maintenance Depot",
-    category: "RADIO",
-    unlock: 119,
-    summary: "Recovered at Road Maintenance Depot. The interview notes records that the employee photograph changes when viewed through the glass. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Road Maintenance Depot): “The key fit the lock. The lock insisted it had never been installed.”",
-    analysis: "Treat the record as evidence of sequence corruption, not a harmless clerical error. The original report describes a separate detail: the employee photograph changes when viewed through the glass.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: Road Maintenance Depot. Artifact type: Interview Notes.",
-  },
-  {
-    id: "night-file-240",
-    title: "Night File 240 — Fingerprint Sleeve / The flooded footpath",
-    category: "PHOTOGRAPH",
-    unlock: 119,
-    summary: "Recovered at The flooded footpath. The fingerprint sleeve records that the audio contains a response before the question is spoken. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The flooded footpath): “I counted six knocks. The seventh came from inside the desk.”",
-    analysis: "Treat the record as evidence of sequence corruption, not a harmless clerical error. The original report describes a separate detail: the audio contains a response before the question is spoken.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: The flooded footpath. Artifact type: Fingerprint Sleeve.",
-  },
-  {
-    id: "night-file-241",
-    title: "Night File 241 — Bodycam Cassette / The infirmary",
-    category: "MISSING OBJECT",
-    unlock: 120,
-    summary: "Recovered at The infirmary. The bodycam cassette records that the inventory count increases after every audit. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The infirmary): “The witness did not lie. The statement did.”",
-    analysis: "The absence of a witness does not mean the event did not occur. The original report describes a separate detail: the inventory count increases after every audit.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: The infirmary. Artifact type: Bodycam Cassette.",
-  },
-  {
-    id: "night-file-242",
-    title: "Night File 242 — Door Sensor Log / Pine Rest Motel",
-    category: "PHOTOGRAPH",
-    unlock: 120,
-    summary: "Recovered at Pine Rest Motel. The door sensor log records that the timestamp moves backward whenever the page is turned. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Pine Rest Motel): “I locked the room from the outside. The next frame shows me locking it from within.”",
-    analysis: "Do not destroy the original. A later file may refer to this exact mark. The original report describes a separate detail: the timestamp moves backward whenever the page is turned.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: Pine Rest Motel. Artifact type: Door Sensor Log.",
-  },
-  {
-    id: "night-file-243",
-    title: "Night File 243 — Medical Intake Form / Last Stop Diner",
-    category: "MISSING OBJECT",
-    unlock: 121,
-    summary: "Recovered at Last Stop Diner. The medical intake form records that the shadow crosses the room in the opposite direction from its owner. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Last Stop Diner): “Every clock was stopped at a different minute. The file listed them as synchronized.”",
-    analysis: "The safest working theory is an imitator altering the timeline and the records. The original report describes a separate detail: the shadow crosses the room in the opposite direction from its owner.",
-    followup: "Mark the anomaly, then continue the investigation without answering the voice. Source location: Last Stop Diner. Artifact type: Medical Intake Form.",
-  },
-  {
-    id: "night-file-244",
-    title: "Night File 244 — Night Roster / The east hallway",
-    category: "PHOTOGRAPH",
-    unlock: 121,
-    summary: "Recovered at The east hallway. The night roster records that the camera frame contains the photographer standing behind themself. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The east hallway): “I heard the plane overhead, but the sky in the photograph was indoors.”",
-    analysis: "The report’s conclusion was copied from a case file that was still sealed. The original report describes a separate detail: the camera frame contains the photographer standing behind themself.",
-    followup: "Keep the original evidence sealed and study another independent source. Source location: The east hallway. Artifact type: Night Roster.",
-  },
-  {
-    id: "night-file-245",
-    title: "Night File 245 — Camera Still / The ranger trail",
-    category: "MISSING OBJECT",
-    unlock: 122,
-    summary: "Recovered at The ranger trail. The camera still records that the page lists an exit before the corresponding entrance. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The ranger trail): “The photograph captured a face. The person had their back to the camera.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the page lists an exit before the corresponding entrance.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: The ranger trail. Artifact type: Camera Still.",
-  },
-  {
-    id: "night-file-246",
-    title: "Night File 246 — Photographic Negative / Cypress Farmhouse",
-    category: "PHOTOGRAPH",
-    unlock: 122,
-    summary: "Recovered at Cypress Farmhouse. The photographic negative records that the voice says the next word before the speaker moves their mouth. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Cypress Farmhouse): “We opened the file and found tomorrow’s evidence inside.”",
-    analysis: "A copied voice can imitate the caller but does not understand the surrounding context. The original report describes a separate detail: the voice says the next word before the speaker moves their mouth.",
-    followup: "Read the related note before attempting to submit your theory. Source location: Cypress Farmhouse. Artifact type: Photographic Negative.",
-  },
-  {
-    id: "night-file-247",
-    title: "Night File 247 — Maintenance Ticket / County Clinic",
-    category: "MISSING OBJECT",
-    unlock: 123,
-    summary: "Recovered at County Clinic. The maintenance ticket records that the reflected figure looks toward the camera after the camera has been removed. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (County Clinic): “I counted six knocks. The seventh came from inside the desk.”",
-    analysis: "The consistent detail is the number of arrivals: one more than the official count. The original report describes a separate detail: the reflected figure looks toward the camera after the camera has been removed.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: County Clinic. Artifact type: Maintenance Ticket.",
-  },
-  {
-    id: "night-file-248",
-    title: "Night File 248 — Fingerprint Sleeve / Camera Four",
-    category: "PHOTOGRAPH",
-    unlock: 123,
-    summary: "Recovered at Camera Four. The fingerprint sleeve records that the radio records a transmission during a documented power outage. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Camera Four): “The room was empty, but the chair was still slowly turning.”",
-    analysis: "The camera is not merely failing to record. It is recording a different room. The original report describes a separate detail: the radio records a transmission during a documented power outage.",
-    followup: "Listen during a silence pocket; the background may expose a second signal. Source location: Camera Four. Artifact type: Fingerprint Sleeve.",
-  },
-  {
-    id: "night-file-249",
-    title: "Night File 249 — Dispatch Transcript / The perimeter fence",
-    category: "MISSING OBJECT",
-    unlock: 124,
-    summary: "Recovered at The perimeter fence. The dispatch transcript records that a second signature appears beneath a single original signature. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The perimeter fence): “The visitor was polite. The reflection was not.”",
-    analysis: "This record is linked to at least one earlier missing-item report. The original report describes a separate detail: a second signature appears beneath a single original signature.",
-    followup: "Read the related note before attempting to submit your theory. Source location: The perimeter fence. Artifact type: Dispatch Transcript.",
-  },
-  {
-    id: "night-file-250",
-    title: "Night File 250 — Incident Ledger / County Police Station",
-    category: "ROSTER",
-    unlock: 124,
-    summary: "Recovered at County Police Station. The incident ledger records that the door sensor reports a person leaving while the room is still occupied. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (County Police Station): “I heard someone praying in the chapel. The chapel’s microphone was unplugged.”",
-    analysis: "The discrepancy repeats after power is restored, which weakens the electrical-fault theory. The original report describes a separate detail: the door sensor reports a person leaving while the room is still occupied.",
-    followup: "Ask the next visitor to describe what appears in the camera frame. Source location: County Police Station. Artifact type: Incident Ledger.",
-  },
-  {
-    id: "night-file-251",
-    title: "Night File 251 — Medical Intake Form / Leaning Cabin",
-    category: "STATION",
-    unlock: 125,
-    summary: "Recovered at Leaning Cabin. The medical intake form records that the witness remembers an event listed in a report not yet written. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Leaning Cabin): “I heard the plane overhead, but the sky in the photograph was indoors.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the witness remembers an event listed in a report not yet written.",
-    followup: "Verify the identity through the roster rather than through the voice. Source location: Leaning Cabin. Artifact type: Medical Intake Form.",
-  },
-  {
-    id: "night-file-252",
-    title: "Night File 252 — Audio Reel / Holding Room Two",
-    category: "ROSTER",
-    unlock: 125,
-    summary: "Recovered at Holding Room Two. The audio reel records that the filing date is tomorrow while the postmark is eleven years old. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Holding Room Two): “A whisper came through the speaker. The speaker was missing its cone.”",
-    analysis: "The record suggests the station is responding before it receives an instruction. The original report describes a separate detail: the filing date is tomorrow while the postmark is eleven years old.",
-    followup: "Do not confuse the apparition with the real witness in your case file. Source location: Holding Room Two. Artifact type: Audio Reel.",
-  },
-  {
-    id: "night-file-253",
-    title: "Night File 253 — Radio Frequency Chart / The upstairs landing",
-    category: "STATION",
-    unlock: 126,
-    summary: "Recovered at The upstairs landing. The radio frequency chart records that the call originated from the receiver that was physically disconnected. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The upstairs landing): “The person asked to be admitted. The roster showed they had already been admitted.”",
-    analysis: "A duplicate identity is more likely than a second authorized unit. The original report describes a separate detail: the call originated from the receiver that was physically disconnected.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: The upstairs landing. Artifact type: Radio Frequency Chart.",
-  },
-  {
-    id: "night-file-254",
-    title: "Night File 254 — Photographic Negative / The evidence cage",
-    category: "ROSTER",
-    unlock: 126,
-    summary: "Recovered at The evidence cage. The photographic negative records that the call sign is valid but its owner has never been assigned to this county. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The evidence cage): “The officer entered alone. The microphone captured two sets of boots.”",
-    analysis: "The object is real. Its provenance is impossible. The original report describes a separate detail: the call sign is valid but its owner has never been assigned to this county.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: The evidence cage. Artifact type: Photographic Negative.",
-  },
-  {
-    id: "night-file-255",
-    title: "Night File 255 — Lost Property Card / Swamp Gas Stop",
-    category: "STATION",
-    unlock: 127,
-    summary: "Recovered at Swamp Gas Stop. The lost property card records that the employee photograph changes when viewed through the glass. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Swamp Gas Stop): “The room was empty, but the chair was still slowly turning.”",
-    analysis: "The sound is not an echo. It contains a new word that was never spoken aloud. The original report describes a separate detail: the employee photograph changes when viewed through the glass.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: Swamp Gas Stop. Artifact type: Lost Property Card.",
-  },
-  {
-    id: "night-file-256",
-    title: "Night File 256 — Emergency Bulletin / Mile Marker Nine",
-    category: "ROSTER",
-    unlock: 127,
-    summary: "Recovered at Mile Marker Nine. The emergency bulletin records that the audio contains a response before the question is spoken. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Mile Marker Nine): “I wrote the report after the event. The report is dated before it.”",
-    analysis: "The room layout is stable; the recorded route is what changes. The original report describes a separate detail: the audio contains a response before the question is spoken.",
-    followup: "Inspect the nearest door log and compare the sequence of arrivals. Source location: Mile Marker Nine. Artifact type: Emergency Bulletin.",
-  },
-  {
-    id: "night-file-257",
-    title: "Night File 257 — Dispatch Transcript / The old dispatch booth",
-    category: "STATION",
-    unlock: 128,
-    summary: "Recovered at The old dispatch booth. The dispatch transcript records that the inventory count increases after every audit. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The old dispatch booth): “The badge was genuine. The officer wearing it was not on the roster.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the inventory count increases after every audit.",
-    followup: "Return to this location after leaving a different building; its state may change. Source location: The old dispatch booth. Artifact type: Dispatch Transcript.",
-  },
-  {
-    id: "night-file-258",
-    title: "Night File 258 — Flashlight Test Record / The locked generator room",
-    category: "ROSTER",
-    unlock: 128,
-    summary: "Recovered at The locked generator room. The flashlight test record records that the timestamp moves backward whenever the page is turned. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (The locked generator room): “The car in the picture has no driver. Its shadow has someone at the wheel.”",
-    analysis: "The witness may be sincere even though the information they remember cannot be true. The original report describes a separate detail: the timestamp moves backward whenever the page is turned.",
-    followup: "Check the Black Ledger again after your next cross-reference report. Source location: The locked generator room. Artifact type: Flashlight Test Record.",
-  },
-  {
-    id: "night-file-259",
-    title: "Night File 259 — Power Interruption Log / Radio Relay Hut",
-    category: "STATION",
-    unlock: 129,
-    summary: "Recovered at Radio Relay Hut. The power interruption log records that the handwriting matches an officer who has not yet joined the force. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (Radio Relay Hut): “A whisper came through the speaker. The speaker was missing its cone.”",
-    analysis: "Do not use the timestamp alone. Two independent records repeat the same contradiction. The original report describes a separate detail: the handwriting matches an officer who has not yet joined the force.",
-    followup: "Mark the anomaly, then continue the investigation without answering the voice. Source location: Radio Relay Hut. Artifact type: Power Interruption Log.",
-  },
-  {
-    id: "night-file-260",
-    title: "Night File 260 — Audio Reel / North Culvert",
-    category: "FORENSIC",
-    unlock: 129,
-    summary: "Recovered at North Culvert. The audio reel records that the map scale changes only around one house. The file is preserved as fictional case material under incident FS-07.",
-    transcript: "Source audio (North Culvert): “I could hear rain on the roof. The weather station says there was no rain.”",
-    analysis: "This anomaly becomes more consistent when the flashlight is turned away. The original report describes a separate detail: the map scale changes only around one house.",
-    followup: "Keep the original evidence sealed and study another independent source. Source location: North Culvert. Artifact type: Audio Reel.",
-  },
-];
-const achievementDefinitions=[
-  {id:'first_trace',title:'FIRST TRACE',description:'Collect your first physical clue.'},
-  {id:'forensic_six',title:'FORENSIC PATIENCE',description:'Study six physical clues.'},
-  {id:'contradiction_hunter',title:'CONTRADICTION HUNTER',description:'Create four distinct cross-reference reports.'},
-  {id:'station_auditor',title:'NIGHT AUDITOR',description:'Complete the six-visitor station audit.'},
-  {id:'kind_witness',title:'A WITNESS REMEMBERS',description:'Save a corroborated statement from Silas Venn.'},
-  {id:'two_survivors',title:'NO ONE LEFT BEHIND',description:'Rescue both missing people.'},
-  {id:'signal_breaker',title:'SIGNAL BREAKER',description:'Destroy all three signal anchors.'},
-  {id:'night_escape',title:'OUT OF THE MARSH',description:'Complete a successful extraction.'},
-  {id:'quiet_memorial',title:'A MOMENT OF PEACE',description:'Read the field memorial.'},
-  {id:'night_watch',title:'NIGHT WATCH',description:'Survive three adaptive hunts.'},
-  {id:'archive_keeper',title:'ARCHIVE KEEPER',description:'Unlock at least 80 Black Ledger files.'}
-];
-function makeCloudSnapshot(){
-  const safePlayer=player?{x:player.x,y:player.y,hp:player.hp,stamina:player.stamina,angle:player.angle}:null;
-  return {
-    schemaVersion:1,
-    selectedCharacter:state.selectedCharacter==='yumi'?'yumi':'hugo',
-    elapsed:Math.max(0,Math.floor(state.elapsed||0)),
-    floor:state.floor==='inside'?'inside':'outside',
-    roomId:state.room&&state.room.id?state.room.id:'',
-    player:safePlayer,
-    inventory:{ammo,reserve,medkits,batteryCells,flashlightBattery,flashlight},
-    objectsFound:objects.filter(o=>o.found&&o.id).map(o=>o.id).slice(0,100),
-    caseRecords:caseRecords.slice(-100).map(r=>({id:r.id,name:r.name,detail:r.detail,analysis:r.analysis,kind:r.kind,studied:!!r.studied})),
-    survivors:survivors.map(v=>({id:v.id,x:v.x,y:v.y,found:!!v.found,following:!!v.following,delivered:!!v.delivered})),
-    monster:monster?{active:!!monster.active,x:monster.x,y:monster.y,hidden:!!monster.hidden,vanishTimer:monster.vanishTimer||0,vanishCooldown:monster.vanishCooldown||4}:null,
-    progress:{
-      discovered:state.discovered||0,rescued:state.rescued||0,keysFound:!!state.keysFound,
-      witnessInterviewed:!!state.witnessInterviewed,witnessTrust:state.witnessTrust||0,
-      stationComplete:!!state.stationComplete,stationCorrect:state.stationCorrect||0,stationProcessed:state.stationProcessed||0,
-      stationDecisions:state.stationDecisions||{},stationChecks:state.stationChecks||{},stationQueue:state.stationQueue||[],stationQueuePosition:state.stationQueuePosition||0,
-      exploredRoomIds:state.exploredRoomIds||[],caseComparisons:state.caseComparisons||[],caseTheory:state.caseTheory||'',pendingTheory:state.pendingTheory||'',
-      exploredRooms:state.exploredRooms||0,roomItemStates:state.roomItemStates||{},missingIds:state.missingIds||[],disappearanceLog:state.disappearanceLog||[],
-      anchorsDestroyed:state.anchorsDestroyed||[],helpCount:state.helpCount||0,huntsSurvived:state.huntsSurvived||0,kills:state.kills||0,shots:state.shots||0,
-      memorialTributeViewed:!!state.memorialTributeViewed,personalScareCount:state.personalScareCount||0,
-      stationThreat:state.stationThreat||0,stationAuditTrail:state.stationAuditTrail||[],extractionStarted:!!state.extractionStarted,extractionHold:state.extractionHold||0,
-      extractionWave1:!!state.extractionWave1,extractionWave2:!!state.extractionWave2,extractionWave3:!!state.extractionWave3,extractionWave4:!!state.extractionWave4,
-      trueEnding:!!state.trueEnding,helpCalled:!!state.helpCount,won:!!state.won
-    }
-  };
-}
-async function cloudRequest(path,method='GET',body=null){
-  const options={method,credentials:'same-origin',headers:{'Accept':'application/json'}};
-  if(body!==null){options.headers['Content-Type']='application/json';options.body=JSON.stringify(body);}
-  let response;
-  try{response=await fetch(path,options);}catch(error){throw new Error('Could not reach the account service. Check the Render deployment and network.');}
-  let data={};
-  try{data=await response.json();}catch(error){data={error:'The server returned an unreadable response.'};}
-  if(!response.ok)throw new Error(data.error||data.message||('Request failed ('+response.status+').'));
-  return data;
-}
-function accountStatus(message,isError=false){
-  const el=$('accountStatus');
-  if(!el)return;
-  el.textContent=message;
-  el.classList.toggle('error',!!isError);
-}
-function showAccountRows(id,rows,empty){
-  const root=$(id);if(!root)return;
-  root.replaceChildren();
-  if(!rows||!rows.length){const row=document.createElement('div');row.className='account-row';row.textContent=empty;root.appendChild(row);return;}
-  for(const data of rows){
-    const row=document.createElement('div');row.className='account-row';
-    const left=document.createElement('span');left.textContent=data.left||'';
-    const right=document.createElement('b');right.textContent=data.right||'';
-    row.append(left,right);root.appendChild(row);
-  }
-}
-function renderAccountIdentity(){
-  const logged=!!currentAccount;
-  $('accountLogout').classList.toggle('hidden',!logged);
-  $('accountLogin').classList.toggle('hidden',logged);
-  $('accountRegister').classList.toggle('hidden',logged);
-  $('cloudSaveButton').disabled=!logged;
-  $('cloudLoadButton').disabled=!logged;
-  $('accountUsername').disabled=logged;
-  $('accountPassword').disabled=logged;
-  $('accountIdentity').classList.toggle('hidden',!logged);
-  $('staffConsole').classList.toggle('hidden',!logged||currentAccount.role!=='staff');
-  if(logged){
-    const badge=currentAccount.role==='staff'?'STAFF':'PLAYER';
-    $('accountIdentity').textContent='SIGNED IN AS '+currentAccount.username+' · '+badge+' · Passwords are never displayed here.';
-  }else $('accountIdentity').textContent='';
-}
-async function refreshAccountPanel(){
-  accountStatus('Checking account service…');
-  try{
-    const result=await cloudRequest('/api/auth/me');
-    currentAccount=result.authenticated?result.account:null;
-    renderAccountIdentity();
-    if(currentAccount){
-      accountStatus('Signed in. Cloud saves and achievements are available.');
-      await refreshAccountData();
-    }else{
-      accountStatus(result.databaseConfigured===false?'MongoDB is not configured yet. Set MONGODB_URI in Render, then redeploy.':'Sign in or create a player account. Staff access is controlled by the server environment.');
-      showAccountRows('cloudSaveList',[],'Sign in to view saved cases.');
-      showAccountRows('leaderboardList',[],'Leaderboard requires a configured MongoDB connection.');
-      showAccountRows('achievementList',[],'Achievements are awarded when you save a qualifying run.');
-    }
-  }catch(error){currentAccount=null;renderAccountIdentity();accountStatus(error.message,true);}
-}
-async function loginAccount(){
-  const username=$('accountUsername').value.trim();const password=$('accountPassword').value;
-  if(!username||!password){accountStatus('Enter both username and password.',true);return;}
-  try{
-    const result=await cloudRequest('/api/auth/login','POST',{username,password});
-    currentAccount=result.account;$('accountPassword').value='';renderAccountIdentity();accountStatus('Signed in successfully.');await refreshAccountData();
-  }catch(error){accountStatus(error.message,true);}
-}
-async function registerAccount(){
-  const username=$('accountUsername').value.trim();const password=$('accountPassword').value;
-  if(!username||!password){accountStatus('Choose a username and password first.',true);return;}
-  try{
-    const result=await cloudRequest('/api/auth/register','POST',{username,password});
-    currentAccount=result.account;$('accountPassword').value='';renderAccountIdentity();accountStatus('Player account created. Keep your password private.');await refreshAccountData();
-  }catch(error){accountStatus(error.message,true);}
-}
-async function logoutAccount(){
-  try{await cloudRequest('/api/auth/logout','POST',{});}catch(error){}
-  currentAccount=null;renderAccountIdentity();accountStatus('Signed out.');
-  showAccountRows('cloudSaveList',[],'Sign in to view saved cases.');
-  showAccountRows('achievementList',[],'Sign in to synchronize achievements.');
-  await loadLeaderboard();
-}
-function openAccountPanel(returnScreen='menu'){
-  accountReturnScreen=returnScreen;
-  if(state.running){state.running=false;state.paused=true;}
-  setScreen('account');
-  refreshAccountPanel();
-}
-function closeAccountPanel(){
-  if(accountReturnScreen==='pause'){
-    setScreen('pause');state.running=false;state.paused=true;
-  }else if(accountReturnScreen==='game'){
-    closeOverlay();
-  }else{
-    setScreen('menu');state.running=false;state.paused=false;
-  }
-}
-async function refreshAccountData(){
-  if(!currentAccount)return;
-  try{
-    const saves=await cloudRequest('/api/saves');
-    const rows=(saves.saves||[]).map(v=>({left:'SLOT '+v.slot+' · '+(v.updatedAt||'NO DATE')+' · '+v.summary,right:v.completed?'COMPLETED':'IN PROGRESS'}));
-    showAccountRows('cloudSaveList',rows,'No cloud saves yet. Start a patrol and save your progress here.');
-  }catch(error){showAccountRows('cloudSaveList',[],error.message);}
-  await Promise.all([loadLeaderboard(),loadAchievements()]);
-  if(currentAccount&&currentAccount.role==='staff')await loadStaffOverview();
-}
-async function saveCloudSlot(){
-  if(!currentAccount){accountStatus('Sign in before saving.',true);return;}
-  if(!player){accountStatus('Begin a patrol first so there is progress to save.',true);return;}
-  const slot=Number($('cloudSaveSlot').value)||1;
-  try{
-    const result=await cloudRequest('/api/saves','POST',{slot,save:makeCloudSnapshot()});
-    accountStatus('Cloud save stored in slot '+slot+'. '+(result.unlocked&&result.unlocked.length?'New achievements: '+result.unlocked.map(a=>a.title).join(', '):'Progress synchronized.'));
-    await refreshAccountData();
-  }catch(error){accountStatus(error.message,true);}
-}
-async function loadCloudSlot(){
-  if(!currentAccount){accountStatus('Sign in before loading.',true);return;}
-  const slot=Number($('cloudSaveSlot').value)||1;
-  try{
-    const result=await cloudRequest('/api/saves/'+slot);
-    if(!result.save){accountStatus('That save slot is empty.',true);return;}
-    applyCloudSnapshot(result.save);
-    accountReturnScreen='game';
-    accountStatus('Cloud save loaded. The patrol is resumed from the saved location.');
-  }catch(error){accountStatus(error.message,true);}
-}
-async function loadLeaderboard(){
-  try{
-    const data=await cloudRequest('/api/leaderboard');
-    showAccountRows('leaderboardList',(data.entries||[]).map((v,i)=>({left:'#'+(i+1)+' '+v.username+' · '+(v.completed?'ESCAPED':'FIELD FILE'),right:String(v.score||0)+' PTS'})),'No leaderboard runs have been saved yet.');
-  }catch(error){showAccountRows('leaderboardList',[],error.message);}
-}
-async function loadAchievements(){
-  if(!currentAccount){showAccountRows('achievementList',[],'Sign in to synchronize achievements.');return;}
-  try{
-    const data=await cloudRequest('/api/achievements');
-    showAccountRows('achievementList',(data.achievements||[]).map(v=>({left:(v.unlocked?'✓ ':'◇ ')+v.title+' · '+v.description,right:v.unlocked?'UNLOCKED':'LOCKED'})),'No achievements are available.');
-  }catch(error){showAccountRows('achievementList',[],error.message);}
-}
-async function loadStaffOverview(){
-  if(!currentAccount||currentAccount.role!=='staff')return;
-  try{
-    const result=await cloudRequest('/api/staff/overview');
-    const metrics=[
-      {left:'ACCOUNTS',right:String(result.counts.accounts||0)},
-      {left:'PLAYER SAVES',right:String(result.counts.saves||0)},
-      {left:'ACHIEVEMENTS UNLOCKED',right:String(result.counts.achievements||0)},
-      {left:'LEADERBOARD RUNS',right:String(result.counts.leaderboard||0)},
-      ...((result.recentAccounts||[]).map(a=>({left:a.username+' · '+a.role,right:a.createdAt||'ACCOUNT'})))
-    ];
-    showAccountRows('staffOverview',metrics,'No staff summary available.');
-  }catch(error){showAccountRows('staffOverview',[],error.message);}
-}
-function applyCloudSnapshot(snapshot){
-  if(!snapshot||snapshot.schemaVersion!==1)throw new Error('This save version is not supported.');
-  state.selectedCharacter=snapshot.selectedCharacter==='yumi'?'yumi':'hugo';
-  state.pendingCharacter=state.selectedCharacter;
-  resetGame();
-  const p=snapshot.progress||{};
-  if(Array.isArray(snapshot.objectsFound)){
-    const found=new Set(snapshot.objectsFound);
-    for(const o of objects)if(o.id)o.found=found.has(o.id);
-  }
-  caseRecords=Array.isArray(snapshot.caseRecords)?snapshot.caseRecords.slice(-100):[];
-  evidence=collectedClueCount();
-  state.selectedCharacter=snapshot.selectedCharacter==='yumi'?'yumi':'hugo';
-  state.discovered=Math.max(0,Number(p.discovered)||caseRecords.length);
-  state.rescued=Math.max(0,Number(p.rescued)||0);
-  state.keysFound=!!p.keysFound;
-  state.witnessInterviewed=!!p.witnessInterviewed;
-  state.witnessTrust=clamp(Number(p.witnessTrust)||0,0,5);
-  state.stationComplete=!!p.stationComplete;
-  state.stationCorrect=clamp(Number(p.stationCorrect)||0,0,6);
-  state.stationProcessed=clamp(Number(p.stationProcessed)||0,0,6);
-  state.stationDecisions=p.stationDecisions||{};state.stationChecks=p.stationChecks||{};
-  state.stationQueue=Array.isArray(p.stationQueue)?p.stationQueue:[];state.stationQueuePosition=clamp(Number(p.stationQueuePosition)||0,0,6);
-  state.stationThreat=clamp(Number(p.stationThreat)||0,0,8);state.stationAuditTrail=Array.isArray(p.stationAuditTrail)?p.stationAuditTrail:[];
-  state.exploredRoomIds=Array.isArray(p.exploredRoomIds)?p.exploredRoomIds.filter(v=>typeof v==='string').slice(0,40):[];
-  state.exploredRooms=Math.max(state.exploredRoomIds.length,Number(p.exploredRooms)||0);
-  state.caseComparisons=Array.isArray(p.caseComparisons)?p.caseComparisons.slice(0,30):[];
-  state.caseTheory=['mimic-timeline','storm-failure','staged-witness','duplicate-units'].includes(p.caseTheory)?p.caseTheory:'';
-  state.pendingTheory=state.caseTheory||'';
-  state.roomItemStates=p.roomItemStates||{};state.missingIds=Array.isArray(p.missingIds)?p.missingIds:[];
-  state.disappearanceLog=Array.isArray(p.disappearanceLog)?p.disappearanceLog.slice(0,100):[];
-  state.anchorsDestroyed=Array.isArray(p.anchorsDestroyed)?p.anchorsDestroyed.filter(v=>['station','motel','church'].includes(v)):[];
-  state.helpCount=clamp(Number(p.helpCount)||0,0,999);state.huntsSurvived=clamp(Number(p.huntsSurvived)||0,0,99);
-  state.kills=clamp(Number(p.kills)||0,0,9999);state.shots=clamp(Number(p.shots)||0,0,99999);
-  state.memorialTributeViewed=!!p.memorialTributeViewed;state.personalScareCount=clamp(Number(p.personalScareCount)||0,0,3);
-  state.extractionStarted=!!p.extractionStarted;state.extractionHold=clamp(Number(p.extractionHold)||0,0,30);
-  state.extractionWave1=!!p.extractionWave1;state.extractionWave2=!!p.extractionWave2;state.extractionWave3=!!p.extractionWave3;state.extractionWave4=!!p.extractionWave4;
-  state.trueEnding=!!p.trueEnding;
-  const inv=snapshot.inventory||{};
-  ammo=clamp(Number(inv.ammo)||0,0,60);reserve=clamp(Number(inv.reserve)||0,0,300);
-  medkits=clamp(Number(inv.medkits)||0,0,20);batteryCells=clamp(Number(inv.batteryCells)||0,0,20);
-  flashlightBattery=clamp(Number(inv.flashlightBattery)||0,0,100);flashlight=inv.flashlight!==false;
-  if(Array.isArray(snapshot.survivors)){
-    for(const target of survivors){const saved=snapshot.survivors.find(v=>v.id===target.id);if(saved){target.found=!!saved.found;target.following=!!saved.following;target.delivered=!!saved.delivered;}}
-  }
-  const pos=snapshot.player||{x:520,y:500,hp:75,stamina:80,angle:0};
-  player.x=clamp(Number(pos.x)||520,42,WORLD.w-42);player.y=clamp(Number(pos.y)||500,42,WORLD.h-42);
-  player.hp=clamp(Number(pos.hp)||player.maxHp,1,player.maxHp);health=player.hp;
-  player.stamina=clamp(Number(pos.stamina)||player.maxStamina,0,player.maxStamina);stamina=player.stamina;player.angle=Number(pos.angle)||0;player.hidden=false;
-  state.elapsed=clamp(Number(snapshot.elapsed)||0,0,7200);
-  const validRooms=new Set(['checkpoint','station','gas','cabin','tower','motel','diner','clinic','depot','church','warehouse','farmhouse','attic','basement']);
-  if(snapshot.floor==='inside'&&validRooms.has(snapshot.roomId)){state.floor='inside';state.room=makeRoom(snapshot.roomId);}else{state.floor='outside';state.room=null;}
-  state.prologueStage='swamp';state.prologueTimer=0;state.gameOver=false;state.won=false;state.paused=false;state.running=true;state.screen='game';
-  document.body.classList.add('game-active');document.body.classList.remove('prologue-mode','prologue-call','prologue-drive','prologue-arrival');
-  $('hud').style.display='block';
-  if(snapshot.monster&&monster){monster.active=!!snapshot.monster.active;monster.x=clamp(Number(snapshot.monster.x)||player.x+400,0,WORLD.w);monster.y=clamp(Number(snapshot.monster.y)||player.y+300,0,WORLD.h);monster.hidden=!!snapshot.monster.hidden;monster.vanishTimer=clamp(Number(snapshot.monster.vanishTimer)||0,0,8);monster.vanishCooldown=clamp(Number(snapshot.monster.vanishCooldown)||4,0,60);}
-  if(state.floor==='inside'){
-    const interior=makeRoom(snapshot.roomId);
-    state.room=interior;
-    const px=clamp(Number(pos.x)||interior.spawn.x,35,interior.w-35);
-    const py=clamp(Number(pos.y)||interior.spawn.y,35,interior.h-35);
-    player.x=px;player.y=py;
-    camera={x:clamp(player.x-W/2,0,Math.max(0,interior.w-W)),y:clamp(player.y-H/2,0,Math.max(0,interior.h-H))};
-  }else{
-    camera={x:clamp(player.x-W/2,0,WORLD.w-W),y:clamp(player.y-H/2,0,WORLD.h-H)};
-  }
-  lastSafe={x:player.x,y:player.y};lastMiniDraw=-999;lastMiniFloor=null;lastMiniRoom=null;interiorBaseCache={room:null,canvas:null};
-  updateCharacterSelection();updateHUD();updateObjectives();updateInventory();
-  $('accountPanel').classList.add('hidden');
-  state.lastFrame=performance.now();requestAnimationFrame(loop);
-}
-function archiveProgressScore(){
-  return Math.min(130,
-    collectedClueCount()*4+studyCount()*3+validCrossReferenceCount()*2+
-    (state.stationProcessed||0)*2+(state.exploredRoomIds||[]).length*3+
-    (state.anchorsDestroyed||[]).length*9+(state.huntsSurvived||0)*4+
-    (state.rescued||0)*4+(state.memorialTributeViewed?1:0)+Math.floor((state.elapsed||0)/90)
-  );
-}
-function openBlackLedger(returnScreen='game'){
-  archiveReturnScreen=returnScreen;
-  if(state.running){state.running=false;state.paused=true;}
-  setScreen('archives');
-  $('archiveSearch').value=currentArchiveQuery;
-  renderBlackLedger();
-}
-function closeBlackLedger(){
-  if(archiveReturnScreen==='objectives'){
-    setScreen('objectives');state.running=false;state.paused=true;
-  }else{
-    closeOverlay();
-  }
-}
-function renderBlackLedger(){
-  const root=$('archiveEntries');if(!root)return;
-  currentArchiveQuery=String($('archiveSearch').value||'').trim().toLowerCase();
-  const score=archiveProgressScore();
-  const unlocked=CLASSIFIED_ARCHIVE_ENTRIES.filter(item=>item.unlock<=score);
-  $('archiveProgressText').textContent='ARCHIVE ACCESS: '+unlocked.length+' / '+CLASSIFIED_ARCHIVE_ENTRIES.length+' FILES · FIELD CLEARANCE '+score+'/130';
-  const filtered=CLASSIFIED_ARCHIVE_ENTRIES.filter(item=>{
-    if(item.unlock>score)return false;
-    const searchText=(item.title+' '+item.category+' '+item.summary+' '+item.transcript+' '+item.analysis+' '+item.followup).toLowerCase();
-    return !currentArchiveQuery||searchText.includes(currentArchiveQuery);
-  }).slice(0,140);
-  root.replaceChildren();
-  if(!filtered.length){const p=document.createElement('div');p.className='account-row';p.textContent=unlocked.length?'No unlocked file matches that search.':'Files remain sealed. Recover clues, study evidence, complete station intake, and explore more buildings.';root.appendChild(p);return;}
-  for(const item of filtered){
-    const card=document.createElement('article');card.className='archive-entry';
-    const meta=document.createElement('small');meta.textContent=item.id.toUpperCase()+' · '+item.category.toUpperCase();
-    const title=document.createElement('h3');title.textContent=item.title;
-    const summary=document.createElement('p');summary.textContent=item.summary;
-    const transcript=document.createElement('p');transcript.textContent='RECOVERED TRANSCRIPT: '+item.transcript;
-    const analysis=document.createElement('p');analysis.textContent='ANALYST NOTE: '+item.analysis;
-    const follow=document.createElement('p');follow.textContent='FOLLOW-UP: '+item.followup;
-    card.append(meta,title,summary,transcript,analysis,follow);root.appendChild(card);
-  }
-}
-
 function boot(){
   initializeAssets();
   drawPortraits();
@@ -10652,595 +7664,87 @@ boot();
 </body>
 </html>'''
 
-def _utcnow():
-    return datetime.now(timezone.utc)
-
-
-def _normalize_username(value):
-    if not isinstance(value, str):
-        return ""
-    return value.strip().lower()
-
-
-def _database_required():
-    return bool(os.environ.get("MONGODB_URI", "").strip()) and MongoClient is not None
-
-
-def _seed_staff_account(database):
-    staff_username = _normalize_username(os.environ.get("STAFF_USERNAME", "26-0054"))
-    staff_password = os.environ.get("STAFF_PASSWORD", "")
-    if not staff_username or not staff_password:
-        return
-    if len(staff_password) < 10:
-        app.logger.warning("STAFF_PASSWORD is configured but shorter than the recommended 10 characters.")
-    password_hash = generate_password_hash(staff_password)
-    now = _utcnow()
-    database.accounts.update_one(
-        {"username": staff_username},
-        {
-            "$set": {
-                "username": staff_username,
-                "role": "staff",
-                "password_hash": password_hash,
-                "updated_at": now,
-            },
-            "$setOnInsert": {"created_at": now, "last_login_at": None},
-        },
-        upsert=True,
-    )
-
-
-def get_database():
-    global _mongo_client, _mongo_database, _mongo_schema_ready, _mongo_last_error
-    uri = os.environ.get("MONGODB_URI", "").strip()
-    if not uri:
-        _mongo_last_error = "MONGODB_URI is not configured."
+def _get_prayer_collection():
+    global _prayer_mongo_client, _prayer_mongo_uri
+    uri = os.environ.get('MONGODB_URI', '').strip()
+    if not uri or MongoClient is None:
         return None
-    if MongoClient is None:
-        _mongo_last_error = "pymongo is not installed."
-        return None
-    with _mongo_lock:
-        try:
-            if _mongo_client is None:
-                _mongo_client = MongoClient(
-                    uri,
-                    serverSelectionTimeoutMS=2200,
-                    connectTimeoutMS=2200,
-                    socketTimeoutMS=4000,
-                    retryWrites=True,
-                    appname="FloridaShadows",
-                )
-                _mongo_database = _mongo_client[os.environ.get("MONGODB_DB", "florida_shadows").strip() or "florida_shadows"]
-            _mongo_client.admin.command("ping")
-            if not _mongo_schema_ready:
-                _mongo_database.accounts.create_index([("username", ASCENDING)], unique=True)
-                _mongo_database.saves.create_index([("username", ASCENDING), ("slot", ASCENDING)], unique=True)
-                _mongo_database.achievements.create_index([("username", ASCENDING), ("achievement_id", ASCENDING)], unique=True)
-                _mongo_database.leaderboard.create_index([("username", ASCENDING)], unique=True)
-                _mongo_database.saves.create_index([("updated_at", DESCENDING)])
-                _mongo_database.leaderboard.create_index([("score", DESCENDING)])
-                _seed_staff_account(_mongo_database)
-                _mongo_schema_ready = True
-            _mongo_last_error = ""
-            return _mongo_database
-        except Exception as exc:
-            _mongo_last_error = type(exc).__name__
+    if _prayer_mongo_client is None or _prayer_mongo_uri != uri:
+        if _prayer_mongo_client is not None:
             try:
-                if _mongo_client is not None:
-                    _mongo_client.close()
+                _prayer_mongo_client.close()
             except Exception:
                 pass
-            _mongo_client = None
-            _mongo_database = None
-            _mongo_schema_ready = False
-            app.logger.warning("MongoDB is not currently available (%s). The browser game remains available.", _mongo_last_error)
-            return None
+        _prayer_mongo_client = MongoClient(uri, serverSelectionTimeoutMS=1800, connectTimeoutMS=1800, appname='FloridaShadows')
+        _prayer_mongo_uri = uri
+    db_name = os.environ.get('MONGODB_DB_NAME', 'florida_shadows').strip() or 'florida_shadows'
+    return _prayer_mongo_client[db_name]['memorial_prayers']
 
 
-def _json_error(message, status=400):
-    return jsonify({"ok": False, "error": message}), status
-
-
-def _public_account(document):
-    if not document:
-        return None
+def _public_prayer(document):
+    created = document.get('created_at')
+    if hasattr(created, 'isoformat'):
+        created = created.isoformat()
     return {
-        "username": document.get("username", ""),
-        "role": document.get("role", "player"),
-        "createdAt": document.get("created_at").isoformat() if document.get("created_at") else "",
+        'name': str(document.get('name') or 'Anonymous')[:32],
+        'message': str(document.get('message') or '')[:600],
+        'created_at': str(created or ''),
     }
 
 
-def _require_account(database):
-    username = _normalize_username(session.get("username", ""))
-    if not username:
-        return None
-    return database.accounts.find_one({"username": username})
-
-
-def _safe_text(value, limit=1200):
-    if not isinstance(value, str):
-        return ""
-    return value.strip()[:limit]
-
-
-def _safe_int(value, low=0, high=999999, default=0):
+@app.get('/api/prayers')
+def list_prayers():
     try:
-        number = int(float(value))
-    except (TypeError, ValueError, OverflowError):
-        return default
-    return max(low, min(high, number))
+        collection = _get_prayer_collection()
+        if collection is not None:
+            documents = list(collection.find({}, {'_id': 0, 'name': 1, 'message': 1, 'created_at': 1}).sort('created_at', -1).limit(20))
+            return jsonify(ok=True, persistent=True, prayers=[_public_prayer(document) for document in documents])
+    except Exception:
+        pass
+    with _prayer_lock:
+        recent = [_public_prayer(document) for document in _prayer_memory[:20]]
+    return jsonify(ok=True, persistent=False, prayers=recent)
 
 
-def _safe_number(value, low=0.0, high=100000.0, default=0.0):
+@app.post('/api/prayers')
+def submit_prayer_api():
+    data = request.get_json(silent=True) or request.form.to_dict()
+    if not isinstance(data, dict):
+        return jsonify(ok=False, error='Please send a prayer using the form.'), 400
+    if str(data.get('website', '')).strip():
+        return jsonify(ok=True, persistent=False, prayer={'name': 'Anonymous', 'message': '', 'created_at': ''}), 201
+    message = str(data.get('message', '')).strip()
+    name = str(data.get('name', '')).strip()
+    message = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', message)
+    name = re.sub(r'[\x00-\x1f\x7f]', ' ', name)
+    name = re.sub(r'\s+', ' ', name).strip()[:32] or 'Anonymous'
+    if len(message) < 3:
+        return jsonify(ok=False, error='Please write at least three characters so your prayer can be shared.'), 400
+    if len(message) > 600:
+        return jsonify(ok=False, error='Please keep your prayer to 600 characters or fewer.'), 400
+    prayer = {'name': name, 'message': message, 'created_at': datetime.now(timezone.utc)}
+    persistent = False
     try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return default
-    if number != number or number in (float("inf"), float("-inf")):
-        return default
-    return max(low, min(high, number))
+        collection = _get_prayer_collection()
+        if collection is not None:
+            collection.insert_one(dict(prayer))
+            persistent = True
+    except Exception:
+        persistent = False
+    with _prayer_lock:
+        _prayer_memory.insert(0, dict(prayer))
+        del _prayer_memory[100:]
+    response_prayer = _public_prayer(prayer)
+    return jsonify(ok=True, persistent=persistent, prayer=response_prayer), 201
 
 
-def _safe_bool(value):
-    return value is True or value == 1 or value == "true"
-
-
-def _safe_string_list(value, limit=100, item_limit=100):
-    if not isinstance(value, list):
-        return []
-    out = []
-    seen = set()
-    for item in value[:limit]:
-        if not isinstance(item, str):
-            continue
-        item = item.strip()[:item_limit]
-        if item and item not in seen:
-            seen.add(item)
-            out.append(item)
-    return out
-
-
-def _sanitize_case_records(value):
-    if not isinstance(value, list):
-        return []
-    allowed_kinds = {"evidence", "note", "anomaly", "absence", "loot", "interview", "system"}
-    records = []
-    for item in value[-100:]:
-        if not isinstance(item, dict):
-            continue
-        records.append({
-            "id": _safe_text(item.get("id"), 100),
-            "name": _safe_text(item.get("name"), 180),
-            "detail": _safe_text(item.get("detail"), 1200),
-            "analysis": _safe_text(item.get("analysis"), 1600),
-            "kind": item.get("kind") if item.get("kind") in allowed_kinds else "evidence",
-            "studied": _safe_bool(item.get("studied")),
-        })
-    return records
-
-
-def _sanitize_save_payload(raw):
-    if not isinstance(raw, dict):
-        raise ValueError("Save data must be an object.")
-    try:
-        raw_size = len(json.dumps(raw, ensure_ascii=False, separators=(",", ":")))
-    except (TypeError, ValueError):
-        raise ValueError("Save data must be valid JSON.")
-    if raw_size > 70000:
-        raise ValueError("This save is too large. Remove extra custom text and try again.")
-    allowed_rooms = {"checkpoint", "station", "gas", "cabin", "tower", "motel", "diner", "clinic", "depot", "church", "warehouse", "farmhouse", "attic", "basement"}
-    selected = raw.get("selectedCharacter")
-    selected = selected if selected in {"hugo", "yumi"} else "hugo"
-    floor = raw.get("floor") if raw.get("floor") in {"inside", "outside"} else "outside"
-    room_id = raw.get("roomId") if raw.get("roomId") in allowed_rooms else ""
-    player = raw.get("player") if isinstance(raw.get("player"), dict) else {}
-    inventory = raw.get("inventory") if isinstance(raw.get("inventory"), dict) else {}
-    progress = raw.get("progress") if isinstance(raw.get("progress"), dict) else {}
-    safe_room_item_states = {}
-    room_item_states = progress.get("roomItemStates", {})
-    if isinstance(room_item_states, dict):
-        for key, val in list(room_item_states.items())[:120]:
-            if not isinstance(key, str) or not isinstance(val, dict):
-                continue
-            safe_room_item_states[key[:100]] = {"found": _safe_bool(val.get("found")), "missing": _safe_bool(val.get("missing"))}
-    decisions = {}
-    station_decisions = progress.get("stationDecisions", {})
-    if isinstance(station_decisions, dict):
-        for key, val in list(station_decisions.items())[:6]:
-            if str(key) in {"0", "1", "2", "3", "4", "5"} and val in {"admit", "detain"}:
-                decisions[str(key)] = val
-    checks = {}
-    station_checks = progress.get("stationChecks", {})
-    if isinstance(station_checks, dict):
-        for key, val in list(station_checks.items())[:6]:
-            if str(key) not in {"0", "1", "2", "3", "4", "5"} or not isinstance(val, dict):
-                continue
-            checks[str(key)] = {k: _safe_bool(val.get(k)) for k in ("identity", "purpose", "records")}
-    comparisons = []
-    if isinstance(progress.get("caseComparisons"), list):
-        for val in progress["caseComparisons"][-30:]:
-            if isinstance(val, dict):
-                comparisons.append({"id": _safe_text(val.get("id"), 100), "title": _safe_text(val.get("title"), 180), "text": _safe_text(val.get("text"), 1200)})
-    disappearance_log = []
-    if isinstance(progress.get("disappearanceLog"), list):
-        for val in progress["disappearanceLog"][-100:]:
-            if isinstance(val, dict):
-                disappearance_log.append({"title": _safe_text(val.get("title"), 180), "detail": _safe_text(val.get("detail"), 800)})
-            elif isinstance(val, str):
-                disappearance_log.append({"title": "MISSING ITEM", "detail": val[:800]})
-    safe_survivors = []
-    survivors_raw = raw.get("survivors") if isinstance(raw.get("survivors"), list) else []
-    for item in survivors_raw[:2]:
-        if not isinstance(item, dict) or item.get("id") not in {"ana", "wade"}:
-            continue
-        safe_survivors.append({
-            "id": item.get("id"),
-            "x": _safe_number(item.get("x"), 0, 4000),
-            "y": _safe_number(item.get("y"), 0, 3200),
-            "found": _safe_bool(item.get("found")),
-            "following": _safe_bool(item.get("following")),
-            "delivered": _safe_bool(item.get("delivered")),
-        })
-    monster_raw = raw.get("monster") if isinstance(raw.get("monster"), dict) else {}
-    monster = {
-        "active": _safe_bool(monster_raw.get("active")),
-        "x": _safe_number(monster_raw.get("x"), 0, 4000),
-        "y": _safe_number(monster_raw.get("y"), 0, 3200),
-        "hidden": _safe_bool(monster_raw.get("hidden")),
-        "vanishTimer": _safe_number(monster_raw.get("vanishTimer"), 0, 10),
-        "vanishCooldown": _safe_number(monster_raw.get("vanishCooldown"), 0, 120),
-    }
-    case_theory = progress.get("caseTheory", "")
-    if case_theory not in {"mimic-timeline", "storm-failure", "staged-witness", "duplicate-units"}:
-        case_theory = ""
-    return {
-        "schemaVersion": 1,
-        "selectedCharacter": selected,
-        "elapsed": _safe_int(raw.get("elapsed"), 0, 7200),
-        "floor": floor,
-        "roomId": room_id,
-        "player": {
-            "x": _safe_number(player.get("x"), 0, 4000, 520),
-            "y": _safe_number(player.get("y"), 0, 3200, 500),
-            "hp": _safe_number(player.get("hp"), 1, 200, 100),
-            "stamina": _safe_number(player.get("stamina"), 0, 200, 100),
-            "angle": _safe_number(player.get("angle"), -100, 100),
-        },
-        "inventory": {
-            "ammo": _safe_int(inventory.get("ammo"), 0, 90),
-            "reserve": _safe_int(inventory.get("reserve"), 0, 400),
-            "medkits": _safe_int(inventory.get("medkits"), 0, 30),
-            "batteryCells": _safe_int(inventory.get("batteryCells"), 0, 30),
-            "flashlightBattery": _safe_number(inventory.get("flashlightBattery"), 0, 100, 100),
-            "flashlight": inventory.get("flashlight") is not False,
-        },
-        "objectsFound": _safe_string_list(raw.get("objectsFound"), 120, 100),
-        "caseRecords": _sanitize_case_records(raw.get("caseRecords")),
-        "survivors": safe_survivors,
-        "monster": monster,
-        "progress": {
-            "discovered": _safe_int(progress.get("discovered"), 0, 500),
-            "rescued": _safe_int(progress.get("rescued"), 0, 2),
-            "keysFound": _safe_bool(progress.get("keysFound")),
-            "witnessInterviewed": _safe_bool(progress.get("witnessInterviewed")),
-            "witnessTrust": _safe_int(progress.get("witnessTrust"), 0, 5),
-            "stationComplete": _safe_bool(progress.get("stationComplete")),
-            "stationCorrect": _safe_int(progress.get("stationCorrect"), 0, 6),
-            "stationProcessed": _safe_int(progress.get("stationProcessed"), 0, 6),
-            "stationDecisions": decisions,
-            "stationChecks": checks,
-            "stationQueue": [_safe_int(v, 0, 5) for v in progress.get("stationQueue", [])[:6]] if isinstance(progress.get("stationQueue"), list) else [],
-            "stationQueuePosition": _safe_int(progress.get("stationQueuePosition"), 0, 6),
-            "exploredRoomIds": _safe_string_list(progress.get("exploredRoomIds"), 40, 80),
-            "caseComparisons": comparisons,
-            "caseTheory": case_theory,
-            "pendingTheory": _safe_text(progress.get("pendingTheory"), 50),
-            "exploredRooms": _safe_int(progress.get("exploredRooms"), 0, 200),
-            "roomItemStates": safe_room_item_states,
-            "missingIds": _safe_string_list(progress.get("missingIds"), 120, 100),
-            "disappearanceLog": disappearance_log,
-            "anchorsDestroyed": [v for v in _safe_string_list(progress.get("anchorsDestroyed"), 3, 40) if v in {"station", "motel", "church"}],
-            "helpCount": _safe_int(progress.get("helpCount"), 0, 999),
-            "huntsSurvived": _safe_int(progress.get("huntsSurvived"), 0, 99),
-            "kills": _safe_int(progress.get("kills"), 0, 9999),
-            "shots": _safe_int(progress.get("shots"), 0, 99999),
-            "memorialTributeViewed": _safe_bool(progress.get("memorialTributeViewed")),
-            "personalScareCount": _safe_int(progress.get("personalScareCount"), 0, 3),
-            "stationThreat": _safe_int(progress.get("stationThreat"), 0, 8),
-            "stationAuditTrail": _safe_string_list(progress.get("stationAuditTrail"), 100, 300),
-            "extractionStarted": _safe_bool(progress.get("extractionStarted")),
-            "extractionHold": _safe_number(progress.get("extractionHold"), 0, 30),
-            "extractionWave1": _safe_bool(progress.get("extractionWave1")),
-            "extractionWave2": _safe_bool(progress.get("extractionWave2")),
-            "extractionWave3": _safe_bool(progress.get("extractionWave3")),
-            "extractionWave4": _safe_bool(progress.get("extractionWave4")),
-            "trueEnding": _safe_bool(progress.get("trueEnding")),
-            "won": _safe_bool(progress.get("won")),
-        },
-        "saved_at": _utcnow(),
-    }
-
-
-ACHIEVEMENTS = {
-    "first_trace": {"title": "FIRST TRACE", "description": "Collect your first physical clue."},
-    "forensic_six": {"title": "FORENSIC PATIENCE", "description": "Study six physical clues."},
-    "contradiction_hunter": {"title": "CONTRADICTION HUNTER", "description": "Create four distinct cross-reference reports."},
-    "station_auditor": {"title": "NIGHT AUDITOR", "description": "Complete the six-visitor station audit."},
-    "kind_witness": {"title": "A WITNESS REMEMBERS", "description": "Save a corroborated statement from Silas Venn."},
-    "two_survivors": {"title": "NO ONE LEFT BEHIND", "description": "Rescue both missing people."},
-    "signal_breaker": {"title": "SIGNAL BREAKER", "description": "Destroy all three signal anchors."},
-    "night_escape": {"title": "OUT OF THE MARSH", "description": "Complete a successful extraction."},
-    "quiet_memorial": {"title": "A MOMENT OF PEACE", "description": "Read the field memorial."},
-    "night_watch": {"title": "NIGHT WATCH", "description": "Survive three adaptive hunts."},
-    "archive_keeper": {"title": "ARCHIVE KEEPER", "description": "Unlock at least 80 Black Ledger files."},
-}
-
-
-def _eligible_achievements(save_data):
-    p = save_data.get("progress", {})
-    records = save_data.get("caseRecords", [])
-    collected = sum(1 for row in records if row.get("kind") in {"evidence", "note"})
-    studied = sum(1 for row in records if row.get("kind") in {"evidence", "note"} and row.get("studied"))
-    comparisons = len([row for row in p.get("caseComparisons", []) if not str(row.get("id", "")).startswith(("review-", "general-"))])
-    score = min(130,
-        collected * 4 + studied * 3 + comparisons * 2 + p.get("stationProcessed", 0) * 2 +
-        len(p.get("exploredRoomIds", [])) * 3 + len(p.get("anchorsDestroyed", [])) * 9 +
-        p.get("huntsSurvived", 0) * 4 + p.get("rescued", 0) * 4 +
-        (1 if p.get("memorialTributeViewed") else 0) + save_data.get("elapsed", 0) // 90
-    )
-    earned = []
-    if collected >= 1: earned.append("first_trace")
-    if studied >= 6: earned.append("forensic_six")
-    if comparisons >= 4: earned.append("contradiction_hunter")
-    if p.get("stationComplete") and p.get("stationCorrect", 0) >= 5: earned.append("station_auditor")
-    if p.get("witnessInterviewed") and p.get("witnessTrust", 0) >= 2: earned.append("kind_witness")
-    if p.get("rescued", 0) >= 2: earned.append("two_survivors")
-    if len(p.get("anchorsDestroyed", [])) >= 3: earned.append("signal_breaker")
-    if p.get("won"): earned.append("night_escape")
-    if p.get("memorialTributeViewed"): earned.append("quiet_memorial")
-    if p.get("huntsSurvived", 0) >= 3: earned.append("night_watch")
-    if score >= 80: earned.append("archive_keeper")
-    return earned, score, collected, studied, comparisons
-
-
-@app.get("/")
+@app.get('/')
 def index():
-    return Response(HTML, mimetype="text/html")
+    return Response(HTML, mimetype='text/html')
 
-
-@app.get("/health")
+@app.get('/health')
 def health():
-    return jsonify({
-        "status": "ok",
-        "game": "Florida Shadows: The Living Nightmare",
-        "version": "MongoDB Accounts and Cloud Saves",
-        "mongodb_configured": _database_required(),
-        "mongodb_available": bool(_mongo_database is not None and not _mongo_last_error),
-    })
-
-
-@app.get("/api/auth/me")
-def auth_me():
-    database = get_database()
-    if database is None:
-        return jsonify({"authenticated": False, "databaseConfigured": _database_required(), "error": "MongoDB is unavailable. Configure MONGODB_URI and install the requirements."})
-    account = _require_account(database)
-    if not account:
-        return jsonify({"authenticated": False, "databaseConfigured": True})
-    return jsonify({"authenticated": True, "account": _public_account(account), "databaseConfigured": True})
-
-
-@app.post("/api/auth/register")
-def auth_register():
-    database = get_database()
-    if database is None:
-        return _json_error("Account storage is unavailable. Configure MONGODB_URI in Render and redeploy.", 503)
-    payload = request.get_json(silent=True) or {}
-    username = _normalize_username(payload.get("username"))
-    password = payload.get("password")
-    if not re.fullmatch(r"[a-z0-9_.-]{3,24}", username):
-        return _json_error("Username must be 3–24 characters and use letters, numbers, dots, underscores, or hyphens.")
-    reserved = _normalize_username(os.environ.get("STAFF_USERNAME", "26-0054"))
-    if username == reserved:
-        return _json_error("That username is reserved for the staff account.", 403)
-    if not isinstance(password, str) or not 10 <= len(password) <= 128:
-        return _json_error("Password must be 10–128 characters long.")
-    now = _utcnow()
-    try:
-        database.accounts.insert_one({
-            "username": username,
-            "password_hash": generate_password_hash(password),
-            "role": "player",
-            "created_at": now,
-            "updated_at": now,
-            "last_login_at": now,
-        })
-    except DuplicateKeyError:
-        return _json_error("That username is already registered.", 409)
-    session.clear()
-    session.permanent = True
-    session["username"] = username
-    return jsonify({"ok": True, "account": {"username": username, "role": "player", "createdAt": now.isoformat()}}), 201
-
-
-@app.post("/api/auth/login")
-def auth_login():
-    database = get_database()
-    if database is None:
-        return _json_error("Account storage is unavailable. Configure MONGODB_URI in Render and redeploy.", 503)
-    payload = request.get_json(silent=True) or {}
-    username = _normalize_username(payload.get("username"))
-    password = payload.get("password")
-    if not username or not isinstance(password, str) or len(password) > 128:
-        return _json_error("Invalid username or password.", 401)
-    account = database.accounts.find_one({"username": username})
-    if not account or not check_password_hash(account.get("password_hash", ""), password):
-        return _json_error("Invalid username or password.", 401)
-    database.accounts.update_one({"username": username}, {"$set": {"last_login_at": _utcnow()}})
-    session.clear()
-    session.permanent = True
-    session["username"] = username
-    return jsonify({"ok": True, "account": _public_account(account)})
-
-
-@app.post("/api/auth/logout")
-def auth_logout():
-    session.clear()
-    return jsonify({"ok": True})
-
-
-@app.get("/api/saves")
-def list_saves():
-    database = get_database()
-    if database is None:
-        return _json_error("Cloud saves are unavailable because MongoDB is not configured or reachable.", 503)
-    account = _require_account(database)
-    if not account:
-        return _json_error("Sign in before viewing cloud saves.", 401)
-    docs = database.saves.find({"username": account["username"]}, {"_id": 0, "data": 0}).sort("slot", ASCENDING)
-    saves = []
-    for doc in docs:
-        p = doc.get("summary", {})
-        saves.append({
-            "slot": doc.get("slot", 1),
-            "updatedAt": doc.get("updated_at").astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if doc.get("updated_at") else "",
-            "summary": "CLUES " + str(p.get("studied", 0)) + "/6 · ROOMS " + str(p.get("rooms", 0)) + "/5",
-            "completed": bool(p.get("completed")),
-        })
-    return jsonify({"saves": saves})
-
-
-@app.post("/api/saves")
-def write_save():
-    database = get_database()
-    if database is None:
-        return _json_error("Cloud saves are unavailable because MongoDB is not configured or reachable.", 503)
-    account = _require_account(database)
-    if not account:
-        return _json_error("Sign in before saving your case.", 401)
-    payload = request.get_json(silent=True) or {}
-    slot = _safe_int(payload.get("slot"), 1, 3, 1)
-    try:
-        save_data = _sanitize_save_payload(payload.get("save"))
-    except ValueError as exc:
-        return _json_error(str(exc), 400)
-    now = _utcnow()
-    _unlocked, score, collected, studied, comparisons = _eligible_achievements(save_data)
-    progress = save_data.get("progress", {})
-    summary = {
-        "score": score,
-        "collected": collected,
-        "studied": studied,
-        "comparisons": comparisons,
-        "rooms": len(progress.get("exploredRoomIds", [])),
-        "completed": bool(progress.get("won")),
-        "rescued": progress.get("rescued", 0),
-    }
-    database.saves.update_one(
-        {"username": account["username"], "slot": slot},
-        {"$set": {"data": save_data, "updated_at": now, "summary": summary}, "$setOnInsert": {"created_at": now}},
-        upsert=True,
-    )
-    database.leaderboard.update_one(
-        {"username": account["username"]},
-        {
-            "$max": {"score": score},
-            "$set": {"username": account["username"], "completed": bool(progress.get("won")), "best_studied": studied, "best_collected": collected, "rooms": summary["rooms"], "updated_at": now},
-            "$setOnInsert": {"created_at": now},
-        },
-        upsert=True,
-    )
-    newly_unlocked = []
-    for achievement_id in _unlocked:
-        if achievement_id not in ACHIEVEMENTS:
-            continue
-        result = database.achievements.update_one(
-            {"username": account["username"], "achievement_id": achievement_id},
-            {"$setOnInsert": {"username": account["username"], "achievement_id": achievement_id, "unlocked_at": now}},
-            upsert=True,
-        )
-        if result.upserted_id is not None:
-            newly_unlocked.append({"id": achievement_id, **ACHIEVEMENTS[achievement_id]})
-    return jsonify({"ok": True, "slot": slot, "summary": summary, "unlocked": newly_unlocked})
-
-
-@app.get("/api/saves/<int:slot>")
-def read_save(slot):
-    database = get_database()
-    if database is None:
-        return _json_error("Cloud saves are unavailable because MongoDB is not configured or reachable.", 503)
-    account = _require_account(database)
-    if not account:
-        return _json_error("Sign in before loading a case.", 401)
-    if slot not in {1, 2, 3}:
-        return _json_error("Save slot must be 1, 2, or 3.")
-    doc = database.saves.find_one({"username": account["username"], "slot": slot}, {"_id": 0})
-    if not doc:
-        return jsonify({"save": None, "slot": slot})
-    return jsonify({"save": doc.get("data"), "slot": slot, "updatedAt": doc.get("updated_at").isoformat() if doc.get("updated_at") else ""})
-
-
-@app.get("/api/leaderboard")
-def leaderboard():
-    database = get_database()
-    if database is None:
-        return _json_error("Leaderboard storage is unavailable. Configure MongoDB to enable cloud scores.", 503)
-    entries = []
-    cursor = database.leaderboard.find({}, {"_id": 0, "username": 1, "score": 1, "completed": 1, "best_studied": 1, "best_collected": 1}).sort([("score", DESCENDING), ("best_studied", DESCENDING)]).limit(20)
-    for doc in cursor:
-        entries.append({
-            "username": doc.get("username", "Unknown"),
-            "score": _safe_int(doc.get("score"), 0, 10000000),
-            "completed": bool(doc.get("completed")),
-            "studied": _safe_int(doc.get("best_studied"), 0, 1000),
-            "collected": _safe_int(doc.get("best_collected"), 0, 1000),
-        })
-    return jsonify({"entries": entries})
-
-
-@app.get("/api/achievements")
-def get_achievements():
-    database = get_database()
-    if database is None:
-        return _json_error("Achievement storage is unavailable. Configure MongoDB to synchronize unlocks.", 503)
-    account = _require_account(database)
-    if not account:
-        return _json_error("Sign in before viewing synchronized achievements.", 401)
-    unlocked_docs = database.achievements.find({"username": account["username"]}, {"_id": 0, "achievement_id": 1, "unlocked_at": 1})
-    unlocked = {doc.get("achievement_id") for doc in unlocked_docs}
-    rows = []
-    for achievement_id, item in ACHIEVEMENTS.items():
-        rows.append({"id": achievement_id, "title": item["title"], "description": item["description"], "unlocked": achievement_id in unlocked})
-    return jsonify({"achievements": rows})
-
-
-@app.get("/api/staff/overview")
-def staff_overview():
-    database = get_database()
-    if database is None:
-        return _json_error("Staff data is unavailable because MongoDB is not configured or reachable.", 503)
-    account = _require_account(database)
-    if not account or account.get("role") != "staff":
-        return _json_error("Staff authorization is required.", 403)
-    recent = []
-    for doc in database.accounts.find({}, {"_id": 0, "username": 1, "role": 1, "created_at": 1}).sort("created_at", DESCENDING).limit(12):
-        recent.append({"username": doc.get("username", "Unknown"), "role": doc.get("role", "player"), "createdAt": doc.get("created_at").strftime("%Y-%m-%d") if doc.get("created_at") else ""})
-    return jsonify({
-        "counts": {
-            "accounts": database.accounts.count_documents({}),
-            "saves": database.saves.count_documents({}),
-            "achievements": database.achievements.count_documents({}),
-            "leaderboard": database.leaderboard.count_documents({}),
-        },
-        "recentAccounts": recent,
-    })
-
-
-@app.errorhandler(413)
-def oversized_request(_error):
-    return jsonify({"ok": False, "error": "Request body is too large."}), 413
-
+    return jsonify(status='ok', game='Florida Shadows: The Living Nightmare', version='The Definitive Nightmare Edition', prayer_storage='mongodb' if os.environ.get('MONGODB_URI') and MongoClient is not None else 'temporary')
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '5000'))
