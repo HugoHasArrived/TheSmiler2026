@@ -5,6 +5,9 @@ import json
 import os
 import re
 import secrets
+import time
+import uuid
+from threading import Lock
 
 try:
     from pymongo import MongoClient, DESCENDING
@@ -23,6 +26,9 @@ app.config.update(
 _mongo_client = None
 _mongo_database = None
 _mongo_indexes_ready = False
+_memory_prayers = []
+_memory_prayer_lock = Lock()
+_prayer_rate = {}
 
 
 def utc_now():
@@ -49,6 +55,7 @@ def get_database():
     if not _mongo_indexes_ready:
         _mongo_database['leaderboard'].create_index([('score', DESCENDING), ('wins', DESCENDING), ('updated_at', DESCENDING)])
         _mongo_database['achievements'].create_index([('username_key', 1), ('unlocked_at', DESCENDING)])
+        _mongo_database['prayers'].create_index([('created_at', DESCENDING)])
         _mongo_indexes_ready = True
     return _mongo_database
 
@@ -1372,6 +1379,19 @@ body.hunting #survivorLocator{opacity:0}
 @media(max-width:650px){#huntBanner{top:8px;font-size:9px;padding:8px 9px;max-width:94vw}#huntBanner small{font-size:8px}.radio-breach-choices{grid-template-columns:1fr}.radio-breach-choices button{min-height:56px}}
 
 
+.prayer-wall-panel { width:min(860px,96vw); max-height:92vh; overflow:auto; }
+.prayer-intro { color:#c8c6b5; line-height:1.8; font-size:12px; }
+.prayer-compose { display:grid; gap:10px; margin:15px 0 18px; padding:14px; border:1px solid #61563d; background:linear-gradient(135deg,#17170f,#080b08); }
+.prayer-compose input,.prayer-compose textarea { width:100%; box-sizing:border-box; border:1px solid #4e5b48; background:#020503; color:#e9e6d6; padding:12px; font:12px/1.6 Consolas,monospace; border-radius:3px; text-transform:none; letter-spacing:0; }
+.prayer-compose textarea { min-height:110px; resize:vertical; }
+.prayer-compose input:focus,.prayer-compose textarea:focus { outline:1px solid #d4bc80; border-color:#d4bc80; }
+.prayer-status { padding:9px 11px; margin:8px 0; border:1px solid #394436; background:#070b08; color:#b7c3ae; font-size:11px; line-height:1.65; overflow-wrap:anywhere; }
+.prayer-wall-list { display:flex; flex-direction:column; gap:9px; margin:12px 0 18px; }
+.prayer-entry { padding:12px 14px; border:1px solid #3f4a39; border-left:3px solid #b8a06c; background:linear-gradient(120deg,#10150f,#050706); }
+.prayer-entry-header { display:flex; flex-wrap:wrap; justify-content:space-between; gap:8px; margin-bottom:7px; color:#dfd0a6; font-size:10px; letter-spacing:.6px; }
+.prayer-entry-date { color:#778170; font-size:9px; }
+.prayer-entry-text { white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; line-height:1.75; color:#d2d6c8; }
+.prayer-empty { padding:16px; border:1px dashed #414a3c; color:#9aa38f; font-size:11px; line-height:1.7; text-align:center; }
 .account-panel { width:min(760px,96vw); }
 .account-form { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:16px 0; }
 .account-field { display:flex; flex-direction:column; gap:6px; color:#c4cebf; font-size:10px; letter-spacing:.8px; }
@@ -1505,7 +1525,8 @@ body.hunting #survivorLocator{opacity:0}
           <button id="controlsBtn">Control mode</button>
           <button id="howBtn">How to play</button>
           <button id="creditsBtn">Credits</button>
-          <button id="accountBtn">Login / Account</button>
+          <button id="prayerBtn">✦ Send a Prayer</button>
+          <button id="accountBtn">Regular Player Login / Account</button>
           <button id="leaderboardBtn">Leaderboard</button>
           <button id="disclaimerBtn">Horror & privacy disclaimer</button>
         </div>
@@ -1618,18 +1639,18 @@ body.hunting #survivorLocator{opacity:0}
 
 <div id="accountPanel" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="accountTitle">
   <div class="panel account-panel">
-    <div class="kicker">Persistent records · MongoDB account</div>
-    <h2 id="accountTitle" class="section-title">Login / Game Account</h2>
-    <p class="intro">Create an account to keep your case saves, achievements, and leaderboard score across sessions. Passwords are stored as secure hashes; credentials are never written into the source code.</p>
+    <div class="kicker">REGULAR PLAYER ACCOUNT · NOT STAFF LOGIN</div>
+    <h2 id="accountTitle" class="section-title">Regular Player Login / Cloud Save</h2>
+    <p class="intro">This is the normal player account area for anyone playing Florida Shadows. Use a game username and password you registered here. Do NOT enter your MongoDB Atlas database username or password here. First time playing with an account? Choose “Create account”. Existing accounts from older versions will be checked and migrated automatically when possible.</p>
     <div id="accountStatus" class="account-status" role="status">Checking account service…</div>
     <div id="accountSignedOut">
       <form id="accountForm" class="account-form" autocomplete="on">
-        <label class="account-field">USERNAME<input id="accountUsername" name="username" minlength="3" maxlength="20" pattern="[A-Za-z0-9_]+" autocomplete="username" required></label>
+        <label class="account-field">USERNAME<input id="accountUsername" name="username" minlength="3" maxlength="20" pattern="[A-Za-z0-9_-]+" autocomplete="username" required></label>
         <label class="account-field">PASSWORD<input id="accountPassword" name="password" type="password" minlength="8" maxlength="128" autocomplete="current-password" required></label>
         <label class="account-field full">DISPLAY NAME (OPTIONAL)<input id="accountDisplayName" name="display_name" maxlength="24" autocomplete="nickname" placeholder="How your name appears on the leaderboard"></label>
         <div class="page-buttons account-field full"><button type="button" id="accountLogin">Log in</button><button type="button" id="accountRegister">Create account</button></div>
       </form>
-      <p class="memorial-note">Account access requires MongoDB configuration in the server environment. Add <b>MONGODB_URI</b> and a stable <b>SECRET_KEY</b> in Render’s Environment settings. Never paste database credentials into game chat or source code.</p>
+      <p class="memorial-note">Player credentials are created with the Create account button below. MongoDB credentials belong only in Render’s private Environment settings as <b>MONGODB_URI</b>; they are not your player login. If MongoDB is unavailable, cloud login and saves will not work, but the game remains playable.</p>
     </div>
     <div id="accountSignedIn" class="hidden">
       <div class="account-signed"><div class="micro">SIGNED IN AS</div><strong id="accountIdentity">PLAYER</strong><div class="memorial-note" id="accountStatsLine">Cloud account connected.</div></div>
@@ -1639,6 +1660,22 @@ body.hunting #survivorLocator{opacity:0}
       <div id="achievementGrid" class="achievement-grid"></div>
     </div>
     <div class="page-buttons"><button type="button" id="backAccount">Return to menu</button></div>
+  </div>
+</div>
+<div id="prayerPanel" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="prayerTitle">
+  <div class="panel prayer-wall-panel">
+    <div class="kicker">A community of kindness</div>
+    <h2 id="prayerTitle" class="section-title">Send a Prayer · Prayer Wall</h2>
+    <p class="prayer-intro">Leave a prayer, a hopeful thought, or a few kind words for Yumi and her family as they remember her lolo. You may use your display name or remain anonymous. Please keep every message respectful and do not include private information.</p>
+    <div class="prayer-verse">“May he rest in peace, and may the people who love him find patient support, gentle memories, and comfort in the days ahead.”</div>
+    <form id="prayerForm" class="prayer-compose" autocomplete="off">
+      <label class="account-field">DISPLAY NAME (OPTIONAL)<input id="prayerName" type="text" maxlength="30" placeholder="Anonymous" autocomplete="nickname"></label>
+      <label class="account-field">YOUR PRAYER OR MESSAGE<textarea id="prayerText" maxlength="600" minlength="4" required placeholder="Write a prayer or a few kind words for Yumi and her family…"></textarea></label>
+      <div class="page-buttons"><button id="submitPrayer" type="submit">Send Prayer</button><button id="refreshPrayers" type="button">Refresh Prayer Wall</button></div>
+    </form>
+    <div id="prayerStatus" class="prayer-status" role="status" aria-live="polite">Loading community prayers…</div>
+    <div id="prayerWall" class="prayer-wall-list" aria-live="polite"><div class="prayer-empty">Connecting to the prayer wall…</div></div>
+    <div class="page-buttons"><button id="closePrayers" type="button">Return to menu</button></div>
   </div>
 </div>
 <div id="leaderboardPanel" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="leaderboardTitle">
@@ -2104,6 +2141,7 @@ function setScreen(name){
     how:'howPanel',
     credits:'creditsPanel',
     account:'accountPanel',
+    prayers:'prayerPanel',
     leaderboard:'leaderboardPanel',
     objectives:'objectivePanel',
     memorial:'memorialPanel',
@@ -2117,7 +2155,7 @@ function setScreen(name){
   for(const id of Object.values(mapping))$(id).classList.add('hidden');
   const suspectZoom=$('suspectZoomPanel');if(suspectZoom)suspectZoom.classList.add('hidden');
   if(mapping[name])$(mapping[name]).classList.remove('hidden');
-  if(name==='menu'||name==='character'||name==='controls'||name==='how'||name==='credits'||name==='account'||name==='leaderboard'){
+  if(name==='menu'||name==='character'||name==='controls'||name==='how'||name==='credits'||name==='account'||name==='prayers'||name==='leaderboard'){
     state.running=false;
     document.body.classList.remove('game-active');
   }
@@ -4414,7 +4452,7 @@ function closeOverlay(){
   state.paused=false;
   state.running=true;
   state.screen='game';
-  for(const id of ['objectivePanel','inventoryPanel','pausePanel','radioPanel','interviewPanel','stationIntakePanel','suspectZoomPanel','memorialPanel','accountPanel','leaderboardPanel'])$(id).classList.add('hidden');
+  for(const id of ['objectivePanel','inventoryPanel','pausePanel','radioPanel','interviewPanel','stationIntakePanel','suspectZoomPanel','memorialPanel','accountPanel','prayerPanel','leaderboardPanel'])$(id).classList.add('hidden');
   $('hud').style.display='block';
   document.body.classList.add('game-active');
   state.lastFrame=performance.now();
@@ -7538,7 +7576,7 @@ async function refreshAccountState(){
       await checkCloudSave();
     }else{
       $('achievementGrid').replaceChildren();
-      setAccountStatus(result.databaseConfigured?'You are signed out. Log in or create an account.':'MongoDB is not configured on the server. Set MONGODB_URI and SECRET_KEY in Render Environment settings.',''+(result.databaseConfigured?'':'error'));
+      setAccountStatus(result.databaseConfigured?'REGULAR PLAYER AREA: use the Florida Shadows account you created here. Do not use MongoDB Atlas credentials. If you are new, choose Create account.':'MongoDB is not configured on the server. Set MONGODB_URI and SECRET_KEY in Render Environment settings.',''+(result.databaseConfigured?'':'error'));
     }
   }catch(error){
     currentAccount=null;
@@ -7551,8 +7589,8 @@ async function accountAction(action){
   const username=$('accountUsername').value.trim();
   const password=$('accountPassword').value;
   const displayName=$('accountDisplayName').value.trim();
-  if(!/^[A-Za-z0-9_]{3,20}$/.test(username)){setAccountStatus('Username must be 3–20 characters and use only letters, numbers, or underscores.','error');return;}
-  if(password.length<8||password.length>128){setAccountStatus('Password must be 8–128 characters.','error');return;}
+  if(!/^[A-Za-z0-9_-]{3,20}$/.test(username)){setAccountStatus('Regular player usernames must be 3–20 characters using letters, numbers, underscores, or hyphens.','error');return;}
+  if(!password||password.length>128||(action==='register'&&password.length<8)){setAccountStatus(action==='register'?'New player passwords must be 8–128 characters.':'Enter the password for your regular player account.','error');return;}
   setAccountStatus(action==='register'?'Creating account…':'Signing in…');
   try{
     const result=await apiJson('/api/auth/'+action,{method:'POST',body:JSON.stringify({username,password,displayName})});
@@ -7688,6 +7726,70 @@ async function refreshAchievements(){
     }
   }catch(error){$('achievementGrid').textContent=error.message;}
 }
+let prayerReturnScreen='menu';
+function openPrayerWall(returnScreen='menu'){
+  prayerReturnScreen=returnScreen;
+  setScreen('prayers');
+  loadPrayerWall();
+}
+function closePrayerWall(){
+  $('prayerPanel').classList.add('hidden');
+  setScreen(prayerReturnScreen||'menu');
+}
+function setPrayerStatus(message,isError=false){
+  const node=$('prayerStatus');
+  if(!node)return;
+  node.textContent=message;
+  node.style.borderColor=isError?'#813b3d':'#394436';
+  node.style.color=isError?'#f0aaa1':'#b7c3ae';
+}
+function renderPrayerWall(prayers){
+  const wall=$('prayerWall');
+  wall.replaceChildren();
+  if(!Array.isArray(prayers)||!prayers.length){
+    const empty=document.createElement('div');empty.className='prayer-empty';
+    empty.textContent='No community prayers have been posted yet. You can leave the first message.';
+    wall.appendChild(empty);return;
+  }
+  for(const prayer of prayers){
+    const card=document.createElement('article');card.className='prayer-entry';
+    const header=document.createElement('div');header.className='prayer-entry-header';
+    const name=document.createElement('strong');name.textContent=String(prayer.name||'Anonymous').slice(0,30);
+    const date=document.createElement('span');date.className='prayer-entry-date';
+    let dateText='Community prayer';
+    try{const parsed=new Date(prayer.created_at||'');if(!Number.isNaN(parsed.getTime()))dateText=parsed.toLocaleString();}catch(_error){}
+    date.textContent=dateText;header.append(name,date);
+    const text=document.createElement('div');text.className='prayer-entry-text';text.textContent=String(prayer.prayer||'').slice(0,600);
+    card.append(header,text);wall.appendChild(card);
+  }
+}
+async function loadPrayerWall(){
+  if(!$('prayerWall'))return;
+  setPrayerStatus('Loading community prayers…');
+  try{
+    const data=await apiJson('/api/prayers?limit=150');
+    renderPrayerWall(data.prayers||[]);
+    setPrayerStatus(data.persistent?'Prayers are saved in MongoDB and shared with other players.':'The prayer wall is working in temporary mode. Set MONGODB_URI in Render to keep prayers after a server restart.');
+  }catch(error){
+    renderPrayerWall([]);
+    setPrayerStatus(error.message+' The game itself can still be played.',true);
+  }
+}
+async function sendPrayer(event){
+  event.preventDefault();
+  const name=$('prayerName').value.trim();
+  const prayer=$('prayerText').value.trim();
+  if(prayer.length<4){setPrayerStatus('Please write at least a few words before sending your prayer.',true);return;}
+  const button=$('submitPrayer');button.disabled=true;setPrayerStatus('Sending your prayer…');
+  try{
+    const data=await apiJson('/api/prayers',{method:'POST',body:JSON.stringify({name,prayer})});
+    $('prayerText').value='';
+    await loadPrayerWall();
+    setPrayerStatus(data.persistent?'Your prayer has been added to the shared prayer wall. Thank you for sending kindness.':'Your prayer has been added to the temporary prayer wall. Set MONGODB_URI on Render to make it persistent.');
+  }catch(error){setPrayerStatus(error.message||'Could not send your prayer. Please try again.',true);}
+  finally{button.disabled=false;}
+}
+
 async function renderLeaderboard(){
   const list=$('leaderboardList');list.replaceChildren();
   $('leaderboardStatus').textContent='Loading leaderboard…';
@@ -7751,6 +7853,10 @@ function bindEvents(){
   });
   $('howBtn').addEventListener('click',()=>setScreen('how'));
   $('creditsBtn').addEventListener('click',()=>setScreen('credits'));
+  $('prayerBtn').addEventListener('click',()=>openPrayerWall('menu'));
+  $('prayerForm').addEventListener('submit',sendPrayer);
+  $('refreshPrayers').addEventListener('click',loadPrayerWall);
+  $('closePrayers').addEventListener('click',closePrayerWall);
   $('backCharacter').addEventListener('click',()=>setScreen('menu'));
   $('confirmCharacter').addEventListener('click',()=>{
     state.selectedCharacter=state.pendingCharacter;
@@ -8050,16 +8156,17 @@ def api_auth_register():
     username = str(data.get('username', '')).strip()
     password = data.get('password', '')
     display_name = str(data.get('displayName') or username).strip()
-    if not re.fullmatch(r'[A-Za-z0-9_]{3,20}', username):
-        return jsonify(ok=False, error='Username must be 3–20 characters and use only letters, numbers, or underscores.'), 400
+    if not re.fullmatch(r'[A-Za-z0-9_-]{3,20}', username):
+        return jsonify(ok=False, error='Username must be 3–20 characters and use only letters, numbers, underscores, or hyphens.'), 400
     if not isinstance(password, str) or len(password) < 8 or len(password) > 128:
         return jsonify(ok=False, error='Password must be 8–128 characters.'), 400
     display_name = re.sub(r'\s+', ' ', display_name)[:24] or username
     key = username.lower()
     try:
         db = get_database()
-        if db['accounts'].find_one({'_id': key}):
-            return jsonify(ok=False, error='That username is already registered. Try logging in instead.'), 409
+        existing, _source = _find_account_compatible(db, username, key)
+        if existing:
+            return jsonify(ok=False, error='That regular player username already exists. Sign in instead; older player accounts are migrated when possible.'), 409
         document = {
             '_id': key,
             'username': username,
@@ -8079,31 +8186,154 @@ def api_auth_register():
         return api_database_error(exc)
 
 
+def _find_account_compatible(db, username, key):
+    """Find current or legacy player accounts without accepting plaintext passwords."""
+    pattern = '^' + re.escape(username) + '$'
+    collections = [('accounts', [('_id', key), ('username_key', key), ('username_regex', pattern)]),
+                   ('users', [('_id', key), ('username_key', key), ('username_regex', pattern)])]
+    for collection_name, queries in collections:
+        collection = db[collection_name]
+        for kind, value in queries:
+            try:
+                query = {'_id': value} if kind == '_id' else {'username_key': value} if kind == 'username_key' else {'username': {'$regex': value, '$options': 'i'}}
+                found = collection.find_one(query)
+            except Exception:
+                found = None
+            if found:
+                return found, collection_name
+    return None, None
+
+
+def _record_password_hash(record):
+    for field in ('password_hash', 'passwordHash', 'password_digest', 'pass_hash'):
+        value = record.get(field)
+        if isinstance(value, str) and value:
+            return value
+    return ''
+
+
+def _migrate_player_account(db, legacy, source_collection, username, key, password):
+    """Move a previously registered player from older collection layouts into accounts."""
+    existing = db['accounts'].find_one({'_id': key})
+    if existing:
+        return existing
+    old_id = legacy.get('_id')
+    display_name = re.sub(r'\s+', ' ', str(legacy.get('display_name') or legacy.get('displayName') or legacy.get('username') or username).strip())[:24] or username
+    created_at = legacy.get('created_at') or utc_now()
+    doc = {
+        '_id': key,
+        'username': str(legacy.get('username') or username)[:20],
+        'display_name': display_name,
+        'password_hash': generate_password_hash(password, method='scrypt'),
+        'created_at': created_at,
+        'runs': safe_number(legacy.get('runs', legacy.get('games_played', 0)), 0, 0, 1000000),
+        'wins': safe_number(legacy.get('wins', 0), 0, 0, 1000000),
+        'best_score': safe_number(legacy.get('best_score', 0), 0, 0, 100000000),
+        'migrated_from': source_collection,
+    }
+    db['accounts'].update_one({'_id': key}, {'$setOnInsert': doc}, upsert=True)
+    canonical = db['accounts'].find_one({'_id': key})
+    if source_collection == 'users' and old_id is not None:
+        try:
+            old_achievements = db['achievements']
+            old_achievements.update_many({'user_id': old_id}, {'$set': {'username_key': key, 'username': doc['username']}})
+        except Exception:
+            pass
+        try:
+            old_board = db['leaderboard'].find_one({'user_id': old_id})
+            if old_board:
+                migrated_score = safe_number(old_board.get('best_score', old_board.get('score', 0)), 0, 0, 100000000)
+                db['leaderboard'].update_one({'_id': key}, {'$setOnInsert': {'username': doc['username'], 'display_name': display_name, 'score': migrated_score, 'wins': doc['wins'], 'runs': doc['runs'], 'true_ending_wins': 0, 'updated_at': utc_now()}}, upsert=True)
+        except Exception:
+            pass
+    return canonical
+
+
 @app.post('/api/auth/login')
 def api_auth_login():
     data = request.get_json(silent=True) or {}
     username = str(data.get('username', '')).strip()
     password = data.get('password', '')
-    if not re.fullmatch(r'[A-Za-z0-9_]{3,20}', username) or not isinstance(password, str) or not password:
-        return jsonify(ok=False, error='Enter your username and password.'), 400
+    if not re.fullmatch(r'[A-Za-z0-9_-]{3,20}', username) or not isinstance(password, str) or not password:
+        return jsonify(ok=False, error='Enter your regular player username and password. MongoDB Atlas credentials are not used on this screen.'), 400
+    key = username.lower()
     try:
         db = get_database()
-        account = db['accounts'].find_one({'_id': username.lower()})
-        if not account or not check_password_hash(account.get('password_hash', ''), password):
-            return jsonify(ok=False, error='Username or password is incorrect.'), 401
+        account, source_collection = _find_account_compatible(db, username, key)
+        stored_hash = _record_password_hash(account) if account else ''
+        if not account or not stored_hash or not check_password_hash(stored_hash, password):
+            return jsonify(ok=False, error='Username or password is incorrect for the regular player account. Use the game account you registered here (not your MongoDB Atlas login). If you never created a player account, choose Create account.'), 401
+        if source_collection == 'users' or str(account.get('_id')) != key:
+            account = _migrate_player_account(db, account, source_collection, username, key, password)
         session.clear()
-        session['account_key'] = account['_id']
+        session['account_key'] = str(account['_id'])
         session.permanent = True
         leaderboard = db['leaderboard'].find_one({'_id': account['_id']}) or {}
-        return jsonify(ok=True, message='Welcome back. Your account is connected.', account={'username': account.get('username', username), 'displayName': account.get('display_name') or account.get('username', username), 'runs': int(account.get('runs', leaderboard.get('runs', 0)) or 0), 'wins': int(account.get('wins', leaderboard.get('wins', 0)) or 0), 'bestScore': int(leaderboard.get('score', 0) or 0)})
+        return jsonify(ok=True, message='Welcome back. Your regular player account is connected.', account={'username': account.get('username', username), 'displayName': account.get('display_name') or account.get('username', username), 'runs': int(account.get('runs', leaderboard.get('runs', 0)) or 0), 'wins': int(account.get('wins', leaderboard.get('wins', 0)) or 0), 'bestScore': int(leaderboard.get('score', account.get('best_score', 0)) or 0), 'migrated': bool(account.get('migrated_from'))})
     except Exception as exc:
         return api_database_error(exc)
-
 
 @app.post('/api/auth/logout')
 def api_auth_logout():
     session.clear()
     return jsonify(ok=True, message='Logged out.')
+
+
+def _clean_public_text(value, limit):
+    text = str(value or '')
+    text = ''.join(ch for ch in text if ch in '\n\r\t' or ord(ch) >= 32)
+    return text.strip()[:limit]
+
+
+@app.get('/api/prayers')
+def api_get_prayers():
+    try:
+        limit = max(1, min(150, int(request.args.get('limit', '80'))))
+    except (TypeError, ValueError):
+        limit = 80
+    try:
+        db = get_database()
+        cursor = db['prayers'].find({}, {'_id': 0, 'name': 1, 'prayer': 1, 'created_at': 1}).sort('created_at', DESCENDING).limit(limit)
+        rows = []
+        for item in cursor:
+            created = item.get('created_at')
+            if hasattr(created, 'isoformat'):
+                created = created.isoformat()
+            rows.append({'name': _clean_public_text(item.get('name') or 'Anonymous', 30) or 'Anonymous', 'prayer': _clean_public_text(item.get('prayer'), 600), 'created_at': str(created or '')})
+        return jsonify(ok=True, prayers=rows, persistent=True)
+    except Exception:
+        with _memory_prayer_lock:
+            rows = list(reversed(_memory_prayers[-limit:]))
+        return jsonify(ok=True, prayers=rows, persistent=False)
+
+
+@app.post('/api/prayers')
+def api_post_prayer():
+    now = time.time()
+    ip = (request.remote_addr or 'unknown')[:80]
+    with _memory_prayer_lock:
+        recent = [stamp for stamp in _prayer_rate.get(ip, []) if now - stamp < 60]
+        if len(recent) >= 5:
+            return jsonify(ok=False, error='Please wait a minute before sending another prayer.'), 429
+        recent.append(now)
+        _prayer_rate[ip] = recent
+    body = request.get_json(silent=True) or {}
+    name = _clean_public_text(body.get('name') or 'Anonymous', 30) or 'Anonymous'
+    prayer = _clean_public_text(body.get('prayer'), 600)
+    if len(prayer) < 4 or not any(ch.isalpha() for ch in prayer):
+        return jsonify(ok=False, error='Write at least four readable characters for your prayer or supportive message.'), 400
+    doc = {'name': name, 'prayer': prayer, 'created_at': utc_now().isoformat()}
+    persistent = False
+    try:
+        db = get_database()
+        db['prayers'].insert_one({'name': name, 'prayer': prayer, 'created_at': utc_now()})
+        persistent = True
+    except Exception:
+        with _memory_prayer_lock:
+            _memory_prayers.append(doc)
+            if len(_memory_prayers) > 1000:
+                del _memory_prayers[:-1000]
+    return jsonify(ok=True, prayer=doc, persistent=persistent, message='Thank you for sending kindness.'), 201
 
 
 @app.get('/api/leaderboard')
