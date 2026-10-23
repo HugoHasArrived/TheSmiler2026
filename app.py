@@ -845,23 +845,6 @@ body.prologue-mode.prologue-drive.mobile-mode #touchControls { display: block; }
   font-size: 9px;
   letter-spacing: 1px;
 }
-.memorial-home {
-  margin-top: 17px;
-  padding: 13px 15px 12px;
-  border: 1px solid #827554;
-  border-left: 3px solid #c9b783;
-  background: linear-gradient(120deg, rgba(45,39,26,.8), rgba(12,16,12,.96) 72%);
-  color: #d2c9b1;
-  box-shadow: inset 0 0 22px rgba(184,159,102,.045);
-}
-.memorial-home-head { display:flex; gap:10px; align-items:center; margin-bottom:6px; }
-.memorial-mark { display:grid; place-items:center; flex:0 0 32px; width:32px; height:32px; border:1px solid #8f805d; color:#ead9ab; font-size:18px; background:#171a13; }
-.memorial-home-title { color:#e6d5ac; display:block; font-size:10px; letter-spacing:2.2px; }
-.memorial-home-date { display:block; color:#a79b7c; font-size:9px; margin-top:4px; letter-spacing:.5px; }
-.memorial-icons { display:flex; gap:6px; flex-wrap:wrap; margin:8px 0; }
-.memorial-icons span { padding:4px 7px; color:#d8c99e; background:#171b13; border:1px solid #484533; font-size:9px; letter-spacing:.6px; }
-.memorial-home p { margin:8px 0 0; font-size:11px; line-height:1.7; color:#c3c8b9; }
-.memorial-home .memorial-signoff { display:block; margin-top:8px; color:#e0d1a9; font-size:10px; letter-spacing:.4px; }
 .memorial-panel { width:min(760px,96vw); border-color:#8b7d5b; background:linear-gradient(145deg,rgba(21,23,17,.99),rgba(5,7,6,.99)); }
 .memorial-panel .section-title { color:#efe3c5; letter-spacing:.5px; }
 .memorial-letter { margin:18px 0; padding:20px clamp(16px,4vw,30px); border-top:1px solid #827554; border-bottom:1px solid #827554; background:linear-gradient(120deg,rgba(49,44,30,.47),rgba(8,11,8,.75)); color:#d3cbb8; font-size:13px; line-height:1.95; }
@@ -908,7 +891,7 @@ body.game-active #saveQuickButton { display:block; }
 @media(max-width:760px) { .community-grid { grid-template-columns:1fr; } .leaderboard-row { grid-template-columns:25px minmax(0,1fr) auto; } .leaderboard-row .leaderboard-cases { display:none; } #saveQuickButton { right:8px; bottom:132px; } }
 /* The earlier request was to remove the on-screen chat box. Keep the underlying radio scripting hidden for story events. */
 #partnerChat, body.game-active:not(.prologue-mode) #partnerChat { display:none !important; }
-@media(max-width:760px) { .memorial-photo-row { gap:5px; } .memorial-photo { min-height:73px; font-size:8px; } .memorial-photo strong { font-size:20px; } .memorial-home p { font-size:10px; } }
+@media(max-width:760px) { .memorial-photo-row { gap:5px; } .memorial-photo { min-height:73px; font-size:8px; } .memorial-photo strong { font-size:20px; } }
 .section-title {
   margin: 7px 0 12px;
   color: #e8e2ce;
@@ -1766,12 +1749,6 @@ body.hunting #survivorLocator{opacity:0}
           <button id="accountBtn">Login / Create Account</button>
           <button id="leaderboardBtn">Leaderboard</button>
         </div>
-        <section class="memorial-home" aria-label="In loving memory of Yumi's grandfather">
-          <div class="memorial-home-head"><span class="memorial-mark" aria-hidden="true">✦</span><div><strong class="memorial-home-title">IN LOVING MEMORY</strong><small class="memorial-home-date">Yumi’s grandfather · October 16, 2026</small></div></div>
-          <div class="memorial-icons" aria-label="His loves"><span>✈ PLANES</span><span>▰ CARS</span><span>▣ PHOTOGRAPHY</span></div>
-          <p>He was a great man who lived a long, full life. His passing came suddenly in the early morning, but the things he loved and the memories he leaves behind will continue to matter. May the journeys he admired, the photographs he treasured, and the stories he shared bring comfort to everyone who loves him.</p>
-          <span class="memorial-signoff">With heartfelt sympathy to Yumi and her family. May he rest in peace.</span>
-        </section>
         <div class="community-grid">
           <section class="community-card" aria-label="Player account and database status">
             <h3>PLAYER ACCOUNT</h3>
